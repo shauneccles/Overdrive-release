@@ -19,6 +19,33 @@ public class MotionPipelineV2 {
     public static final int GRID_COLS = 10;
     public static final int GRID_ROWS = 7;
     public static final int TOTAL_BLOCKS = GRID_COLS * GRID_ROWS;  // 70
+    /**
+     * Block edge length in quadrant pixels. MUST match {@code V2_BLOCK_SIZE} in
+     * motion_pipeline_v2.h — the native side owns the grid geometry; this is the
+     * Java mirror. Consumers that map a pixel-space bbox onto the block grid
+     * (the engine's motion-overlap detection filter, ThumbnailBuffer's hero
+     * staticness test) previously hard-coded 32 in three places, so the claim
+     * that they "agree by construction" was not actually enforced by construction.
+     *
+     * <p>Note the grid does NOT cover the full quadrant height: GRID_ROWS(7) × 32
+     * = 224 of 240 px, because 240/32 truncates. The bottom 16 px — the strip
+     * nearest the car — has no blocks and can never report motion. Any consumer
+     * inferring "no motion here" from the mask must treat that band as unknown
+     * rather than still.
+     */
+    public static final int BLOCK_SIZE = 32;
+    /**
+     * Per-block confidence at or above which a block counts as motion for
+     * bbox-overlap tests. Shared so the detection-side filter and the hero-side
+     * staticness test cannot drift apart.
+     *
+     * <p>Deliberately BELOW the {@code confidenceThreshold} (0.6–0.8) that gates
+     * {@code confirmedBlocks}: a block in the 0.5–0.7 band counts as motion for
+     * overlap purposes but not as "confirmed". That asymmetry is intentional and
+     * safe — it makes the overlap test more motion-biased, i.e. more likely to
+     * judge an actor LIVE.
+     */
+    public static final float BLOCK_MOTION_MIN_CONF = 0.5f;
     
     // Quadrant names for logging.
     // Grid layout (from GpuDownscaler shader): TL=Front, TR=Right, BL=Rear, BR=Left
@@ -52,8 +79,26 @@ public class MotionPipelineV2 {
     // size/offset mismatch.
     private boolean nativeHasCoherence = false;
 
-    // Pre-allocated direct ByteBuffers for JNI (zero GC)
-    private ByteBuffer configBuffer;
+    // True when the loaded native library has the salience probe (the flash-filter
+    // rescue for large close objects). Detected from the config struct growing by
+    // the 3 salience params (12 bytes) past the coherence layout. When false,
+    // processFrame leaves componentCount/salienceState at 0 and the Java salience
+    // trigger channel is inert — an older .so degrades to the pre-salience
+    // behaviour rather than mis-parsing the result struct.
+    private boolean nativeHasSalience = false;
+
+    // CONFIG BUFFER — IMMUTABLE-SWAP (audit R13-1b / ExtE-7). applyConfig
+    // used to rewrite this direct buffer IN PLACE on the control thread
+    // while the engine thread's native processFrameV2 memcpys it — a torn
+    // config (half old, half new floats/ints) for one frame. Now applyConfig
+    // builds a FRESH direct buffer and publishes it with a single volatile
+    // write; processFrame reads the reference once per frame. A published
+    // buffer is never written again, so the native memcpy always sees a
+    // complete, coherent config. Allocation is ~76 bytes per config change
+    // (rare user action) — no hot-path GC impact. resultBuffer stays
+    // pre-allocated: it is only ever touched on the engine thread.
+    private volatile ByteBuffer configBuffer;
+    private int configStructSizeBytes;
     private ByteBuffer resultBuffer;
     
     // Parsed results (reused across frames)
@@ -89,6 +134,19 @@ public class MotionPipelineV2 {
         // when {@link #isNativeCoherenceSupported()} is true.
         public float flowCoherence = -1f;
         public float netDriftBlocks = -1f;
+        // Number of distinct connected components among the confirmed blocks.
+        // 1 = one object (2-3 when a subject fragments around an occluder);
+        // many = a diffuse response (rain, wipers, scene-wide light change).
+        // 0 = "native did not report this" (pre-salience .so). Treat as UNKNOWN,
+        // which for the salience channel means FAILING the compactness test: that
+        // channel only ever ADDS a trigger, so absent evidence must read as "do not
+        // trigger" (invariant I9). Do NOT "fail open" here — on a pre-salience .so
+        // that would manufacture a trigger on every high-mass frame.
+        public int componentCount = 0;
+        // Flash-filter salience probe outcome: 0 = did not run, 1 = probed and
+        // suppressed (lighting event), 2 = probed and RESCUED (large close
+        // object that the >25% mass filter would otherwise have erased).
+        public int salienceState = 0;
         public float[] blockConfidence = new float[TOTAL_BLOCKS];
     }
     
@@ -171,6 +229,19 @@ public class MotionPipelineV2 {
         public float coherenceRatioMin = 0.35f;
         public float coherenceNetMin = 1.5f;
         public int coherenceMinFrames = 8;
+
+        // ---- Motion salience: rescue a LARGE close object from the flash filter ----
+        // The native >25%-of-blocks "global flash" filter uses motion MASS as
+        // evidence of a lighting event, but mass also grows with object size and
+        // closeness — a person at ~1.5m is ~18/70 blocks. When enabled, such a
+        // frame is probed (is it ONE compact, rigidly-translating blob?) instead of
+        // discarded outright. A failed probe restores state and suppresses exactly
+        // as before, so with salienceEnabled=false this is byte-identical.
+        // Only consumed by a salience-capable native build
+        // ({@link #isNativeSalienceSupported()}); ignored by older .so.
+        public boolean salienceEnabled = false;
+        public int salienceMinBlocks = 10;          // ~14% of the 70-block grid
+        public float salienceDominanceFrac = 0.60f;
 
         /**
          * Java-side gate values for a sensitivity level. Used by per-quadrant
@@ -468,30 +539,67 @@ public class MotionPipelineV2 {
             final int BASE_CONFIG_SIZE = 60;
             final int SHADOW_FIELDS_SIZE = 16;  // 4 fields × 4 bytes each
             final int COHERENCE_FIELDS_SIZE = 12;  // coherenceRatioMin + coherenceNetMin + coherenceMinFrames
+            final int SALIENCE_FIELDS_SIZE = 12;   // salienceEnabled + salienceMinBlocks + salienceDominanceFrac
             nativeHasShadowFilter = (configStructSize >= BASE_CONFIG_SIZE + SHADOW_FIELDS_SIZE);
             // Phase 2 coherence stage: config struct grew by the 3 coherence
             // params past the shadow layout. Mirrors the shadow-fields probe.
             nativeHasCoherence = (configStructSize >= BASE_CONFIG_SIZE + SHADOW_FIELDS_SIZE + COHERENCE_FIELDS_SIZE);
+            // Salience probe: 3 more params past the coherence layout.
+            nativeHasSalience = (configStructSize
+                    >= BASE_CONFIG_SIZE + SHADOW_FIELDS_SIZE + COHERENCE_FIELDS_SIZE + SALIENCE_FIELDS_SIZE);
 
             // Result-struct sanity: the deserializer reads a fixed field layout
             // then TOTAL_BLOCKS floats. If the native result size doesn't match
             // what we expect for the detected capability tier, disable coherence
             // parsing so we never read past / short of the struct (torn floats).
             int expectedResultBase = resultStructSize - TOTAL_BLOCKS * 4;
-            if (nativeHasCoherence && expectedResultBase < 0) {
+            // The coherence layout needs a base of at least 44 (36 bytes of fields
+            // before the two coherence floats + 8). The old test was `< 0`, which a
+            // 36-byte base (a .so whose result struct LACKS the coherence floats)
+            // passes — Java would then read the first 8 bytes of blockConfidence[] as
+            // flowCoherence/netDriftBlocks and under-read every quadrant by 8. Tight
+            // threshold, same fail-closed stance as the salience check below.
+            final int COHERENCE_RESULT_BASE_MIN = 44;
+            if (nativeHasCoherence && expectedResultBase < COHERENCE_RESULT_BASE_MIN) {
                 logger.warn("V2 result struct too small for coherence layout (result=" + resultStructSize
-                        + ", blocks=" + (TOTAL_BLOCKS * 4) + ") — disabling coherence parse");
+                        + ", base=" + expectedResultBase + " < " + COHERENCE_RESULT_BASE_MIN
+                        + ") — disabling coherence parse");
                 nativeHasCoherence = false;
             }
+            // The salience RESULT fields (componentCount + salienceState) sit
+            // between the coherence floats and blockConfidence[], so parsing them
+            // shifts every subsequent read. Verify the result struct actually grew
+            // by those 8 bytes before trusting the config-side probe: a mismatched
+            // .so pair would otherwise tear the whole 70-float block array.
+            // Layout: 4(bool+pad) + 6*4 (threat/active/confirmed/component/cx/cy)
+            // + 4(meanLuma) + 4(2 bools + 2 pad) + 8(coherence) = 44, then +8.
+            // EXACT match, not >=. A >= test only catches a struct that SHRANK; if a
+            // future field is inserted before blockConfidence[] the base becomes 56,
+            // >= would still pass, and every one of the 70 floats would be read at
+            // the wrong offset. Equality fails closed on drift in either direction.
+            if (nativeHasSalience) {
+                final int SALIENCE_RESULT_BASE = 52;
+                if (!nativeHasCoherence || expectedResultBase != SALIENCE_RESULT_BASE) {
+                    logger.warn("V2 result struct layout does not match the salience layout (base="
+                            + expectedResultBase + ", expected " + SALIENCE_RESULT_BASE
+                            + ", coherence=" + nativeHasCoherence + ") — disabling salience parse");
+                    nativeHasSalience = false;
+                }
+            }
 
-            logger.info(String.format("V2 struct sizes: config=%d, result=%d (total result=%d), shadowFilter=%s, coherence=%s",
+            logger.info(String.format("V2 struct sizes: config=%d, result=%d (total result=%d), shadowFilter=%s, coherence=%s, salience=%s",
                     configStructSize, resultStructSize, resultStructSize * NUM_QUADRANTS,
                     nativeHasShadowFilter ? "supported" : "NOT supported (old native)",
-                    nativeHasCoherence ? "supported" : "NOT supported (Phase-1 native)"));
+                    nativeHasCoherence ? "supported" : "NOT supported (Phase-1 native)",
+                    nativeHasSalience ? "supported" : "NOT supported (pre-salience native)"));
             
-            // Allocate direct ByteBuffers
-            configBuffer = ByteBuffer.allocateDirect(configStructSize);
-            configBuffer.order(ByteOrder.nativeOrder());
+            // Allocate direct ByteBuffers. The config buffer here is only
+            // the pre-applyConfig default; applyConfig publishes fresh
+            // immutable buffers (audit R13-1b).
+            configStructSizeBytes = configStructSize;
+            ByteBuffer initialConfig = ByteBuffer.allocateDirect(configStructSize);
+            initialConfig.order(ByteOrder.nativeOrder());
+            configBuffer = initialConfig;
             
             resultBuffer = ByteBuffer.allocateDirect(resultStructSize * NUM_QUADRANTS);
             resultBuffer.order(ByteOrder.nativeOrder());
@@ -515,68 +623,76 @@ public class MotionPipelineV2 {
     public void applyConfig(Config config) {
         if (!initialized) return;
 
-        configBuffer.clear();
-        // Zero-fill the buffer before writing fields. ByteBuffer.clear() only
-        // resets position/limit — not the underlying bytes. If the native
-        // struct grows in a future build (e.g. partial shadow-fields support
-        // between BASE_CONFIG_SIZE and BASE_CONFIG_SIZE+SHADOW_FIELDS_SIZE),
-        // any bytes we don't explicitly write would carry stale values from
-        // the previous applyConfig call. Costs ~60-76 byte writes — negligible.
-        for (int i = 0; i < configBuffer.capacity(); i++) {
-            configBuffer.put((byte) 0);
-        }
-        configBuffer.position(0);
+        // IMMUTABLE-SWAP (audit R13-1b / ExtE-7): serialize into a FRESH
+        // direct buffer and publish it with one volatile write at the end.
+        // Never mutate the currently-published buffer — the engine thread's
+        // native memcpy may be reading it right now. allocateDirect zero-fills
+        // (JLS-guaranteed for direct buffers), so any bytes we don't
+        // explicitly write are 0 rather than stale — preserving the old
+        // zero-fill loop's forward-compat guarantee for free.
+        ByteBuffer buf = ByteBuffer.allocateDirect(configStructSizeBytes);
+        buf.order(ByteOrder.nativeOrder());
 
         // Stage 1
-        configBuffer.putFloat(config.brightnessShiftThreshold);
-        configBuffer.putInt(config.brightnessSuppressionFrames);
+        buf.putFloat(config.brightnessShiftThreshold);
+        buf.putInt(config.brightnessSuppressionFrames);
         
         // Stage 2
-        configBuffer.putInt(config.shadowThreshold);
-        configBuffer.putFloat(config.lumaRatioThreshold);
-        configBuffer.putInt(config.edgeDiffThreshold);
-        configBuffer.putInt(config.densityThreshold);
+        buf.putInt(config.shadowThreshold);
+        buf.putFloat(config.lumaRatioThreshold);
+        buf.putInt(config.edgeDiffThreshold);
+        buf.putInt(config.densityThreshold);
         
         // Stage 3
-        configBuffer.putFloat(config.confidenceIncrement);
-        configBuffer.putFloat(config.confidenceDecay);
-        configBuffer.putFloat(config.confidenceThreshold);
+        buf.putFloat(config.confidenceIncrement);
+        buf.putFloat(config.confidenceDecay);
+        buf.putFloat(config.confidenceThreshold);
         
         // Stage 4
-        configBuffer.putInt(config.minComponentSize);
+        buf.putInt(config.minComponentSize);
         
         // Stage 5
-        configBuffer.putFloat(config.loiteringRadiusBlocks);
-        configBuffer.putInt(config.loiteringFrames);
+        buf.putFloat(config.loiteringRadiusBlocks);
+        buf.putInt(config.loiteringFrames);
         
         // Per-quadrant enable (4 bools → 4 bytes with padding)
         for (int i = 0; i < NUM_QUADRANTS; i++) {
-            configBuffer.put((byte)(config.quadrantEnabled[i] ? 1 : 0));
+            buf.put((byte)(config.quadrantEnabled[i] ? 1 : 0));
         }
         
         // Alarm threshold
-        configBuffer.putInt(config.alarmBlockThreshold);
+        buf.putInt(config.alarmBlockThreshold);
         
         // Detection zone: max centroid row for distance filtering
-        configBuffer.putInt(config.maxDistanceRow);
+        buf.putInt(config.maxDistanceRow);
         
         // Shadow discrimination parameters (only if native supports them)
         if (nativeHasShadowFilter) {
-            configBuffer.putInt(config.shadowFilterMode);
-            configBuffer.putFloat(config.chromaRatioTolerance);
-            configBuffer.putFloat(config.shadowPixelFraction);
-            configBuffer.putInt(config.oscillationThreshold);
+            buf.putInt(config.shadowFilterMode);
+            buf.putFloat(config.chromaRatioTolerance);
+            buf.putFloat(config.shadowPixelFraction);
+            buf.putInt(config.oscillationThreshold);
         }
 
         // Flow-coherence parameters (only if native supports them — Phase 2).
         // Must come AFTER the shadow fields to match the C struct layout.
         if (nativeHasCoherence) {
-            configBuffer.putFloat(config.coherenceRatioMin);
-            configBuffer.putFloat(config.coherenceNetMin);
-            configBuffer.putInt(config.coherenceMinFrames);
+            buf.putFloat(config.coherenceRatioMin);
+            buf.putFloat(config.coherenceNetMin);
+            buf.putInt(config.coherenceMinFrames);
         }
 
-        configBuffer.flip();
+        // Salience-probe parameters. Must come AFTER the coherence fields to match
+        // the C struct layout. salienceEnabled is an int in C (not bool) so the
+        // 4-byte write is exact with no padding ambiguity.
+        if (nativeHasSalience) {
+            buf.putInt(config.salienceEnabled ? 1 : 0);
+            buf.putInt(config.salienceMinBlocks);
+            buf.putFloat(config.salienceDominanceFrac);
+        }
+
+        buf.flip();
+        configBuffer = buf; // single volatile publish (audit R13-1b)
     }
     
     /**
@@ -592,7 +708,11 @@ public class MotionPipelineV2 {
         
         resultBuffer.clear();
         
-        NativeMotion.processFrameV2(frameBuffer, width, height, configBuffer, resultBuffer);
+        // One volatile read pins this frame's config buffer; a concurrent
+        // applyConfig publishes a NEW buffer and never touches this one
+        // (audit R13-1b / ExtE-7).
+        final ByteBuffer cfg = configBuffer;
+        NativeMotion.processFrameV2(frameBuffer, width, height, cfg, resultBuffer);
         
         // Deserialize results
         resultBuffer.rewind();
@@ -641,6 +761,18 @@ public class MotionPipelineV2 {
         } else {
             result.flowCoherence = -1f;
             result.netDriftBlocks = -1f;
+        }
+
+        // Salience result fields (componentCount + salienceState). Declared in the
+        // C struct AFTER the coherence floats and BEFORE blockConfidence[], so they
+        // MUST be read here — reading them out of order (or on a .so that lacks
+        // them) shifts every one of the 70 floats below.
+        if (nativeHasSalience) {
+            result.componentCount = buf.getInt();
+            result.salienceState = buf.getInt();
+        } else {
+            result.componentCount = 0;
+            result.salienceState = 0;
         }
 
         // Block confidence array (70 floats) — always the trailing field.
@@ -722,6 +854,16 @@ public class MotionPipelineV2 {
      */
     public boolean isNativeCoherenceSupported() {
         return nativeHasCoherence;
+    }
+
+    /**
+     * Check if the loaded native library has the flash-filter salience probe.
+     * When false, {@link QuadrantResult#componentCount} and
+     * {@link QuadrantResult#salienceState} stay 0 and the Java salience trigger
+     * channel must treat the signal as unavailable (no trigger, no suppression).
+     */
+    public boolean isNativeSalienceSupported() {
+        return nativeHasSalience;
     }
     
     public QuadrantResult[] getResults() {

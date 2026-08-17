@@ -70,7 +70,7 @@ public class FoveatedCropper {
     // map and flip flags. 0 = no crop (default / legacy). On dilink4 the
     // pipeline pushes the producer-UV inset (e.g. 240/2560 = 0.09375).
     private volatile float apaCenterInset = 0.0f;
-    // 0 = legacy 4-strip (default); 3 = esco-parity 2x2 passthrough.
+    // 0 = legacy 4-strip (default); 3 = oem-parity 2x2 passthrough.
     // Volatile because the GL thread reads it inside crop() and the camera
     // thread (or pipeline init) writes it via setCameraLayout.
     private volatile int cameraLayout = 0;
@@ -109,6 +109,13 @@ public class FoveatedCropper {
     // not recomputed from the current call's centroid. Mirrors fenceSyncs[] /
     // pboQuadrant[] exactly (same head/tail lifecycle).
     private final float[][] ringCropAffine = new float[RING_SIZE][4];
+    // CAPTURE timestamp (System.nanoTime at QUEUE time) per slot (audit R4
+    // ExtB-8): the ring lag (1-2 service intervals ≈ 150-300ms+) was
+    // invisible to consumers because the slot's freshness stamp was taken
+    // at PUBLISH time — total pixel age could reach ~0.8s while passing a
+    // 500ms staleness check. Stamped/cleared with the same head/tail
+    // lifecycle as ringCropAffine.
+    private final long[] ringCaptureNanos = new long[RING_SIZE];
     private static final int PBO_BYTES = CROP_SIZE * CROP_SIZE * 4;
     // Head = next slot to render+queue into; tail = next slot to attempt
     // readback from. The ring is empty when head == tail and slots in
@@ -259,16 +266,21 @@ public class FoveatedCropper {
         public final float mapBx;
         public final float mapAy;
         public final float mapBy;
+        // CAPTURE time (System.nanoTime at queue/render time — audit R4
+        // ExtB-8). 0 = unknown (legacy ctor); consumers fall back to
+        // publish-time aging.
+        public final long captureNanos;
         public Result(byte[] rgb, int quadrant, int w, int h) {
             this(rgb, quadrant, w, h,
                  // Identity-ish fallback (only reached if a legacy caller uses
                  // the old ctor). 0.5 scale + no origin ≈ the OLD broken math,
                  // but the consumer FAILS SAFE (keep detection) when it detects
                  // an un-populated affine via the hasAffine() sentinel below.
-                 0f, 0f, 0f, 0f);
+                 0f, 0f, 0f, 0f, 0L);
         }
         public Result(byte[] rgb, int quadrant, int w, int h,
-                      float mapAx, float mapBx, float mapAy, float mapBy) {
+                      float mapAx, float mapBx, float mapAy, float mapBy,
+                      long captureNanos) {
             this.rgb = rgb;
             this.quadrant = quadrant;
             this.width = w;
@@ -277,13 +289,28 @@ public class FoveatedCropper {
             this.mapBx = mapBx;
             this.mapAy = mapAy;
             this.mapBy = mapBy;
+            this.captureNanos = captureNanos;
         }
         /** True iff a real foveated→block-grid affine was populated. A zero
          *  X-scale (mapAx==0) can never be a legitimate crop mapping (the
          *  window always covers non-zero width), so it doubles as the
-         *  "no rect data" sentinel the consumer fail-safes on. */
+         *  "no rect data" sentinel the consumer fail-safes on.
+         *
+         *  <p>NaN must be rejected explicitly: in IEEE-754 {@code NaN != 0f} is
+         *  TRUE, so a NaN-poisoned affine would report VALID and send the
+         *  consumer down the strict branch — where every comparison against a
+         *  NaN-derived bbox corner is false, no block ever matches, and the
+         *  detection is DROPPED. That is the exact failure this sentinel exists
+         *  to prevent, reached via NaN instead of zero. NaN is reachable from a
+         *  malformed apaCenterInset in JSON config, because
+         *  {@code Math.max(0, Math.min(0.20, NaN))} returns NaN in Java and the
+         *  poison then propagates through xScale → cropWidthNorm → mX → mapAx.
+         *  All four coefficients are checked: the consumer uses every one, and a
+         *  NaN in any of them corrupts the mapping identically. */
         public boolean hasAffine() {
-            return mapAx != 0f;
+            return mapAx != 0f
+                    && !Float.isNaN(mapAx) && !Float.isNaN(mapBx)
+                    && !Float.isNaN(mapAy) && !Float.isNaN(mapBy);
         }
     }
 
@@ -450,7 +477,7 @@ public class FoveatedCropper {
             yFlipOut = yFlip;
             centerX = quadLeft + localX * 0.5f;
             centerY = quadTop  + localY * 0.5f;
-            // APA center inset (esco APACropFilter parity, mirror of
+            // APA center inset (oem APACropFilter parity, mirror of
             // GlUtil.APA_CENTER_INSET_GLSL): horizontal-only remap of the
             // FULL producer x: [0, 1] -> [inset, 1 - inset]. Apply to
             // both centerX and the role's x-bounds so the crop window and
@@ -525,11 +552,24 @@ public class FoveatedCropper {
             mapAy =  240.0f * mY;
             mapBy =  240.0f * cY;
         }
-        // Guard against a degenerate zero X-scale (would collide with the
-        // Result.hasAffine() sentinel and make the consumer fail-safe). mX is
-        // cropWidthNorm/(640*qWidth) which is structurally > 0 for any real
-        // window, so this only trips on corrupt inputs — keep a tiny epsilon.
-        if (mapAx == 0f) mapAx = 1e-6f;
+        // A degenerate zero X-scale means the window geometry is corrupt
+        // (cropWidthNorm collapsed, or a NaN propagated out of stripWidth /
+        // apaCenterInset). mX is cropWidthNorm/(640*qWidth), structurally > 0
+        // for any real window, so reaching here means the coefficients cannot
+        // be trusted.
+        //
+        // Leave mapAx AT ZERO so Result.hasAffine() reports false and the
+        // consumer FAILS SAFE (keeps the detection). The previous code nudged
+        // it to 1e-6f specifically to dodge that sentinel — which inverted the
+        // intent: a 1e-6f scale collapses every bbox in the crop onto block
+        // column 0, so the motion-overlap filter tested the wrong blocks,
+        // found no overlap, and DROPPED the detection. Reporting "no affine"
+        // is the whole point of the sentinel; a missed person is worse than an
+        // over-inclusive recording.
+        if (mapAx == 0f && logger != null) {
+            logger.warn("Foveated affine degenerate (mapAx=0, q=" + quadrant
+                    + ") — publishing without affine so the consumer fails safe");
+        }
 
         int[] savedViewport = new int[4];
         GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, savedViewport, 0);
@@ -584,9 +624,9 @@ public class FoveatedCropper {
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
             GLES20.glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
             // Synchronous path: the bytes ARE this call's window, so the affine
-            // computed above is the exact match.
+            // computed above is the exact match (and the capture time is now).
             return new Result(dst, quadrant, CROP_SIZE, CROP_SIZE,
-                    mapAx, mapBx, mapAy, mapBy);
+                    mapAx, mapBx, mapAy, mapBy, System.nanoTime());
         }
 
         // ---- 2. Queue an async readback into the next PBO slot ----
@@ -617,6 +657,7 @@ public class FoveatedCropper {
             ringCropAffine[ringHead][1] = mapBx;
             ringCropAffine[ringHead][2] = mapAy;
             ringCropAffine[ringHead][3] = mapBy;
+            ringCaptureNanos[ringHead] = System.nanoTime();  // R4 ExtB-8
             ringHead = nextHead;
         } else {
             // Saturated ring — only attempt drain below.
@@ -673,7 +714,7 @@ public class FoveatedCropper {
                         }
                     }
                     result = new Result(dst, q, CROP_SIZE, CROP_SIZE,
-                            rAx, rBx, rAy, rBy);
+                            rAx, rBx, rAy, rBy, ringCaptureNanos[ringTail]);
                 } else {
                     GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER);
                     GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
@@ -688,6 +729,7 @@ public class FoveatedCropper {
                 ringCropAffine[ringTail][1] = 0f;
                 ringCropAffine[ringTail][2] = 0f;
                 ringCropAffine[ringTail][3] = 0f;
+                ringCaptureNanos[ringTail] = 0L;
                 ringTail = (ringTail + 1) % RING_SIZE;
             }
             // If sig == GL_TIMEOUT_EXPIRED we just leave the fence in
@@ -709,16 +751,26 @@ public class FoveatedCropper {
     /**
      * Selects between layouts:
      *   0 = legacy 4-strip (default — Seal/Atto/Dolphin).
-     *   3 = esco-parity 2x2 mosaic (DiLink 4 / byd_apa cars).
+     *   3 = oem-parity 2x2 mosaic (DiLink 4 / byd_apa cars).
      * Other values fall through to layout 0 in the math.
      * Volatile read/write — set once at pipeline init, no per-frame churn.
      */
     public void setCameraLayout(int layout) { this.cameraLayout = layout; }
 
     /** Enables the GL red-overlay suppression on AI thumbnails. Off by default. */
-    /** APA center inset (esco APACropFilter parity). See {@link
+    /** APA center inset (oem APACropFilter parity). See {@link
      *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
     public void setApaCenterInset(float inset) {
+        // Reject NaN explicitly: the clamp does NOT filter it
+        // (Math.max(0, Math.min(0.20, NaN)) == NaN in Java), and a NaN inset
+        // propagates through xScale → cropWidthNorm → mX → the whole
+        // foveated→block-grid affine, where it silently drops every detection
+        // in the crop. A malformed config double must leave the last good
+        // value in place rather than poison the mapping.
+        if (Float.isNaN(inset)) {
+            if (logger != null) logger.warn("Ignoring NaN apaCenterInset");
+            return;
+        }
         this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));
     }
 
@@ -782,6 +834,7 @@ public class FoveatedCropper {
             ringCropAffine[i][1] = 0f;
             ringCropAffine[i][2] = 0f;
             ringCropAffine[i][3] = 0f;
+            ringCaptureNanos[i] = 0L;
         }
         if (pboIds[0] != 0) {
             GLES30.glDeleteBuffers(RING_SIZE, pboIds, 0);

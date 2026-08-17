@@ -1,6 +1,7 @@
 package com.overdrive.app.automation.action;
 
 import com.overdrive.app.automation.AutomationAction;
+import com.overdrive.app.automation.TextInterpolator;
 import com.overdrive.app.automation.type.Type;
 import com.overdrive.app.automation.value.Label;
 import com.overdrive.app.daemon.CameraDaemon;
@@ -122,6 +123,11 @@ public class ApiAction extends BaseAction {
      * @param automationAction The AutomationAction with the variables needed to trigger this action
      */
     public void trigger(AutomationAction automationAction) {
+        triggerWithResult(automationAction);
+    }
+
+    @Override
+    public boolean triggerWithResult(AutomationAction automationAction) {
         // Path substitution is NOT JSON-escaped (it's a URL, and existing values are
         // simple tokens/ints); body substitution IS JSON-escaped so a free-text value
         // (e.g. the Speak message with a quote/backslash/newline) can't break the JSON.
@@ -129,10 +135,79 @@ public class ApiAction extends BaseAction {
         String body = replaceVariables(getBody(), automationAction.getVariables(), true);
         HttpServer server = CameraDaemon.getHttpServer();
         if (server != null && path != null && body != null) {
-            // Ignoring the response for now but it contains the full HTTP response
-            server.automationApiRequest(getMethod(), path, body);
+            String response = server.automationApiRequest(getMethod(), path, body);
+            boolean success = responseSucceeded(response);
+            logFailure(path, response, success);
+            return success;
         } else {
             logger.error("Could not trigger API action (" + getMethod() + "," + path + "," + body + ")");
+            return false;
+        }
+    }
+
+    /**
+     * Interpret the in-process HTTP response for queue/result semantics. A routed 2xx response is
+     * successful unless its JSON body explicitly says otherwise. Async {@code starting:true}
+     * responses are accepted because the command was admitted and intentionally completes later.
+     */
+    static boolean responseSucceeded(String response) {
+        if (response == null) return false;
+        String trimmed = response.trim();
+        if (trimmed.startsWith("HTTP/")) {
+            int firstSpace = trimmed.indexOf(' ');
+            if (firstSpace < 0 || trimmed.length() < firstSpace + 4) return false;
+            try {
+                int status = Integer.parseInt(trimmed.substring(firstSpace + 1, firstSpace + 4));
+                if (status < 200 || status >= 300) return false;
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+        int start = response.indexOf('{');
+        if (start < 0) return true;
+        try {
+            org.json.JSONObject json = new org.json.JSONObject(response.substring(start));
+            if (json.optBoolean("starting", false)) return true;
+            if (json.has("success") && !json.optBoolean("success", false)) return false;
+            String status = json.optString("status", "");
+            return !"error".equalsIgnoreCase(status)
+                    && !"failed".equalsIgnoreCase(status)
+                    && !"failure".equalsIgnoreCase(status);
+        } catch (Exception e) {
+            // A 2xx handler is allowed to return a non-JSON body.
+            return true;
+        }
+    }
+
+    /**
+     * Log an API action that did not succeed. A null response means it never ran (see below); a
+     * {@code "success":false} body means the endpoint ran and declined. Anything else — a
+     * non-JSON body, no {@code success} key, or an async {@code "starting":true} — is left
+     * alone, so this never turns a working action into a scary log line.
+     */
+    private void logFailure(String path, String response, boolean success) {
+        if (success) return;
+        if (response == null) {
+            // null covers three cases in automationApiRequest — allowlist refusal, no handler
+            // matched the path, and a handler that threw — so don't name just one of them.
+            logger.warn("API action " + getMethod() + " " + path + " was not executed"
+                    + " (allowlist refusal, unrouted path, or handler error)");
+            return;
+        }
+        try {
+            // The in-process call returns the body only, but be tolerant of a leading
+            // preamble by starting at the first brace.
+            int start = response.indexOf('{');
+            if (start < 0) {
+                logger.warn("API action " + getMethod() + " " + path + " failed");
+                return;
+            }
+            org.json.JSONObject json = new org.json.JSONObject(response.substring(start));
+            logger.warn("API action " + getMethod() + " " + path + " failed: "
+                    + json.optString("error",
+                    json.optString("message", json.optString("status", "(no reason given)"))));
+        } catch (Exception e) {
+            logger.warn("API action " + getMethod() + " " + path + " failed");
         }
     }
 
@@ -157,14 +232,18 @@ public class ApiAction extends BaseAction {
                 String key = m.group(1);
                 String value;
                 if (variables.containsKey(key)) {
-                    // This action's own parameter (the normal case).
-                    value = variables.get(key).toString();
+                    // This action's own parameter (the normal case). Its VALUE may itself
+                    // carry references — a user typing "SOC ${signal:batteryLevel}%" into
+                    // the toast/dialog/speak message field — so resolve those too. The
+                    // action's own template placeholders are already consumed by this pass,
+                    // so a substituted value can never re-enter it.
+                    value = TextInterpolator.interpolate(variables.get(key).toString());
                 } else {
-                    // Fall back to a user VARIABLE of this name from the shared automation
-                    // state, so a message/body can interpolate a counter or flag set by
-                    // another action (e.g. "Door opened ${door_count} times"). Absent →
-                    // keep the literal ${name} placeholder (unchanged legacy behaviour).
-                    String stateVal = lookupStateVariable(key);
+                    // Not one of this action's parameters: resolve it as a state reference —
+                    // ${var:NAME}, ${signal:TYPE[:k=v]}, or the bare ${NAME} variable
+                    // shorthand this path has always accepted. Absent → keep the literal
+                    // placeholder (unchanged legacy behaviour).
+                    String stateVal = TextInterpolator.resolve(m.group(0));
                     value = (stateVal != null) ? stateVal : m.group(0);
                 }
                 if (jsonEscape) value = jsonEscape(value);
@@ -175,23 +254,6 @@ public class ApiAction extends BaseAction {
             return result.toString();
         } catch (Exception e) {
             logger.error("Failed to replace variables for automation", e);
-            return null;
-        }
-    }
-
-    /**
-     * Look up a user VARIABLE's current value from the shared automation state, or null
-     * if it isn't set. Lets an ApiAction body/path interpolate {@code ${name}} against a
-     * variable another action set. Best-effort: any lookup error yields null (the caller
-     * then keeps the literal placeholder), so this can never break action execution.
-     */
-    private static String lookupStateVariable(String name) {
-        try {
-            com.overdrive.app.automation.value.Value v =
-                    com.overdrive.app.automation.Automations.getStateValue(
-                            SetVariableAction.variableEvent(name));
-            return v == null ? null : v.toString();
-        } catch (Throwable t) {
             return null;
         }
     }

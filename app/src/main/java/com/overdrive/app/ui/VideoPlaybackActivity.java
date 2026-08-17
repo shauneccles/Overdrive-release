@@ -6,8 +6,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.graphics.Color;
-import android.media.AudioAttributes;
-import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Bundle;
 import android.util.Log;
@@ -16,6 +14,8 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 
+import com.overdrive.app.services.MediaPlaybackService;
+import com.overdrive.app.services.PlaybackDuckCoordinator;
 import com.overdrive.app.ui.view.ZoomableVideoView;
 
 /**
@@ -38,10 +38,12 @@ import com.overdrive.app.ui.view.ZoomableVideoView;
  * here fixes the blank video with the same setVideoURI/listener/start surface.
  *
  * <p>Launched by the daemon via {@code am start -n .../VideoPlaybackActivity} with
- * extras: {@code libName} OR {@code filePath}, {@code channel}, {@code loop}. A library
- * file streams from the daemon's authenticated {@code /api/audio/library/raw} (the app
- * can't read {@code /data/local/tmp}); an external path is opened directly. Tapping the
- * screen, back, or the {@link #ACTION_STOP} broadcast (from Stop Audio) finishes it.
+ * extras: {@code libName} OR {@code filePath}, {@code loop}. Video audio intentionally uses
+ * the player's default Media attributes: reassigning a channel can stall video frames on this
+ * DiLink build. A library file streams from the daemon's authenticated
+ * {@code /api/audio/library/raw} (the app can't read {@code /data/local/tmp}); an external
+ * path is opened directly. Tapping the screen, back, or the {@link #ACTION_STOP} broadcast
+ * (from Stop Audio) finishes it.
  */
 public final class VideoPlaybackActivity extends Activity {
 
@@ -52,6 +54,12 @@ public final class VideoPlaybackActivity extends Activity {
 
     private ZoomableVideoView videoView;
     private boolean stopReceiverRegistered;
+    private boolean hasAcceptedPlayback;
+    private volatile boolean roadSenseDucked;
+    private final PlaybackDuckCoordinator.Target roadSenseDuckTarget = ducked -> {
+        roadSenseDucked = ducked;
+        runOnUiThread(this::applyRoadSenseDuck);
+    };
 
     private final BroadcastReceiver stopReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) { finish(); }
@@ -61,8 +69,7 @@ public final class VideoPlaybackActivity extends Activity {
         super.onCreate(savedInstanceState);
         // Diagnostic: proves whether the activity was actually created (vs the launch being
         // dropped before onCreate — the real question behind "Play Video does nothing").
-        Log.i(TAG, "onCreate reached; intent extras libName=" + getIntent().getStringExtra("libName")
-                + " filePath=" + getIntent().getStringExtra("filePath"));
+        Log.i(TAG, "onCreate reached");
 
         getWindow().addFlags(
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
@@ -82,6 +89,12 @@ public final class VideoPlaybackActivity extends Activity {
         videoView.setLayoutParams(lp);
         root.addView(videoView);
         setContentView(root);
+        try {
+            MediaPlaybackService.attachRoadSenseDuckTarget(roadSenseDuckTarget);
+        } catch (Throwable t) {
+            Log.w(TAG, "RoadSense duck coordinator attach failed: " + t.getMessage());
+        }
+        applyRoadSenseDuck();
 
         // Tap anywhere to dismiss (a played video shouldn't trap the user).
         root.setOnClickListener(v -> finish());
@@ -95,47 +108,55 @@ public final class VideoPlaybackActivity extends Activity {
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        setIntent(intent);
-        startFromIntent(intent); // a new play replaces the current one
+        // Keep the last accepted Intent when a malformed replacement arrives, so a
+        // later Activity recreation cannot resurrect the rejected command.
+        if (startFromIntent(intent)) setIntent(intent);
     }
 
-    private void startFromIntent(Intent intent) {
-        if (intent == null) { finish(); return; }
-        final boolean loop = intent.getBooleanExtra("loop", false);
-        final String channel = intent.getStringExtra("channel");
-        String libName = intent.getStringExtra("libName");
-        String filePath = intent.getStringExtra("filePath");
+    private boolean startFromIntent(Intent intent) {
+        if (intent == null) {
+            finish();
+            return false;
+        }
+        StartRequest request = readStartRequest(intent);
+        if (request == null) {
+            Log.w(TAG, "rejected malformed video start");
+            if (!hasAcceptedPlayback) finish();
+            return false;
+        }
+        final boolean loop = request.loop;
+        String libName = request.libName;
+        String filePath = request.filePath;
 
         Uri uri;
-        if (libName != null && !libName.isEmpty()) {
+        if (libName != null && !libName.trim().isEmpty()) {
             // Library file streams from the daemon over LOOPBACK (127.0.0.1); the auth
             // middleware's loopback safety net trusts 127.0.0.1 with no tunnel headers, so
             // no auth cookie is needed (ZoomableVideoView.setVideoURI has no header overload,
             // and the raw endpoint is Range-aware so the MediaPlayer can seek the moov atom).
             uri = Uri.parse(DAEMON_BASE + "/api/audio/library/raw?name=" + Uri.encode(libName));
-        } else if (filePath != null && !filePath.isEmpty()) {
+        } else if (filePath != null && !filePath.trim().isEmpty()) {
             uri = Uri.fromFile(new java.io.File(filePath));
         } else {
             Log.w(TAG, "no libName/filePath — nothing to play");
-            finish();
-            return;
+            if (!hasAcceptedPlayback) finish();
+            return false;
         }
 
         try {
             videoView.setOnPreparedListener(mp -> {
-                try {
-                    mp.setLooping(loop);
-                    // Route the audio to the chosen channel. ZoomableVideoView otherwise
-                    // uses MediaPlayer defaults (USAGE_MEDIA); overriding here after prepare
-                    // keeps the picture path (which the TextureView owns) untouched. The OEM
-                    // routes by legacy stream, so setLegacyStreamType is the lever (nav/voice
-                    // are approximated to media for the picture-carrying video path).
-                    mp.setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(usageForChannel(channel))
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                            .setLegacyStreamType(streamForChannel(channel))
-                            .build());
-                } catch (Throwable ignored) {}
+                // Do NOT call setAudioAttributes()/setAudioStreamType() here. Reassigning
+                // the audio stream on the MediaPlayer in its PREPARED state stalls the
+                // codec on this BYD/DiLink stack — "reassignAudioAttributes streamType=3
+                // → streamType=1" — so the audio system registers but NO video frames are
+                // ever delivered (audio plays, screen stays black). ZoomableVideoView.
+                // startPreparing() documents this exact failure, and the working recordings
+                // player (VideoPlayerFragment) never touches audio attributes for the same
+                // reason — it relies on the view's default USAGE_MEDIA + CONTENT_TYPE_MOVIE.
+                // Play Video is intentionally Media-only. Per-channel video-audio routing, if
+                // ever revisited, must be applied BEFORE prepareAsync (in startPreparing), not
+                // in this Prepared-state callback.
+                try { mp.setLooping(loop); } catch (Throwable ignored) {}
                 videoView.start();
             });
             // One-shot finishes when the clip ends; a looping clip never completes.
@@ -147,39 +168,60 @@ public final class VideoPlaybackActivity extends Activity {
             });
             Log.i(TAG, "setVideoURI " + uri);
             videoView.setVideoURI(uri);
+            hasAcceptedPlayback = true;
             videoView.requestFocus();
+            return true;
         } catch (Throwable t) {
             Log.w(TAG, "setup failed: " + t.getMessage());
             finish();
+            return false;
         }
     }
 
-    private static int usageForChannel(String channel) {
-        if (channel == null) return AudioAttributes.USAGE_MEDIA;
-        switch (channel.trim().toLowerCase()) {
-            case "navigation": return AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE;
-            case "voice":      return AudioAttributes.USAGE_ASSISTANT;
-            case "alarm":      return AudioAttributes.USAGE_ALARM;
-            case "media":
-            default:           return AudioAttributes.USAGE_MEDIA;
+    private static StartRequest readStartRequest(Intent intent) {
+        try {
+            Bundle extras = intent.getExtras();
+            if (extras == null) return new StartRequest(null, null, false);
+
+            boolean hasLibName = extras.containsKey("libName");
+            boolean hasFilePath = extras.containsKey("filePath");
+            boolean hasLoop = extras.containsKey("loop");
+            String libName = parseStringExtra(extras.get("libName"), hasLibName);
+            String filePath = parseStringExtra(extras.get("filePath"), hasFilePath);
+            Boolean loop = parseBooleanExtra(extras.get("loop"), hasLoop);
+            if ((hasLibName && libName == null)
+                    || (hasFilePath && filePath == null)
+                    || loop == null) {
+                return null;
+            }
+            return new StartRequest(libName, filePath, loop);
+        } catch (Throwable t) {
+            // This Activity is exported to the shell UID. Reject unparcelable or
+            // adversarial extras instead of letting them terminate the app process.
+            Log.w(TAG, "could not parse video extras: " + t.getClass().getSimpleName());
+            return null;
         }
     }
 
-    /** Legacy stream type for a channel — this head unit routes audio by stream, not by
-     *  usage (see MediaPlaybackService). Public streams only; nav/voice ride STREAM_MUSIC
-     *  (STREAM_NOTIFICATION is not an audible path on this HU — matches MediaPlaybackService). */
-    private static int streamForChannel(String channel) {
-        if (channel == null) return android.media.AudioManager.STREAM_MUSIC;
-        switch (channel.trim().toLowerCase()) {
-            case "phone":
-            case "call":       return android.media.AudioManager.STREAM_VOICE_CALL;
-            case "alarm":      return android.media.AudioManager.STREAM_ALARM;
-            case "system":     return android.media.AudioManager.STREAM_SYSTEM;
-            case "ring":       return android.media.AudioManager.STREAM_RING;
-            case "navigation":
-            case "voice":
-            case "assistant":  return android.media.AudioManager.STREAM_MUSIC;
-            default:           return android.media.AudioManager.STREAM_MUSIC;
+    static String parseStringExtra(Object raw, boolean present) {
+        if (!present) return null;
+        return raw instanceof String ? (String) raw : null;
+    }
+
+    static Boolean parseBooleanExtra(Object raw, boolean present) {
+        if (!present) return Boolean.FALSE;
+        return raw instanceof Boolean ? (Boolean) raw : null;
+    }
+
+    private static final class StartRequest {
+        final String libName;
+        final String filePath;
+        final boolean loop;
+
+        StartRequest(String libName, String filePath, boolean loop) {
+            this.libName = libName;
+            this.filePath = filePath;
+            this.loop = loop;
         }
     }
 
@@ -193,7 +235,17 @@ public final class VideoPlaybackActivity extends Activity {
                 | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
     }
 
+    private void applyRoadSenseDuck() {
+        ZoomableVideoView target = videoView;
+        if (target == null) return;
+        target.setPlaybackVolume(roadSenseDucked ? 0.25f : 1.0f);
+    }
+
     @Override protected void onDestroy() {
+        try {
+            MediaPlaybackService.detachRoadSenseDuckTarget(roadSenseDuckTarget);
+        } catch (Throwable ignored) {
+        }
         super.onDestroy();
         if (stopReceiverRegistered) {
             try { unregisterReceiver(stopReceiver); } catch (Throwable ignored) {}

@@ -1,10 +1,13 @@
 package com.overdrive.app.byd;
 
 import android.content.Context;
+import android.content.ContextWrapper;
+import android.content.pm.PackageManager;
 
 import com.overdrive.app.logging.DaemonLogger;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
 /**
@@ -14,6 +17,8 @@ import java.lang.reflect.Method;
 public final class BydDeviceHelper {
 
     private static final DaemonLogger logger = DaemonLogger.getInstance("BydDeviceHelper");
+    private static final java.util.Map<Object, Object> safetyBeltListeners =
+            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
 
     /**
      * Get a BYD device singleton via reflection.
@@ -33,9 +38,138 @@ public final class BydDeviceHelper {
         } catch (ClassNotFoundException e) {
             logger.debug("Device class not found: " + className);
         } catch (Exception e) {
-            logger.debug("Device init failed: " + className + " — " + e.getMessage());
+            Throwable cause = e instanceof InvocationTargetException && e.getCause() != null
+                    ? e.getCause() : e;
+            logger.debug("Device init failed: " + className + " — "
+                    + cause.getClass().getSimpleName() + ": " + cause.getMessage());
         }
         return null;
+    }
+
+    /**
+     * Wrap an app context so BYD's SDK-side permission checks see the BYD permissions as granted.
+     *
+     * <p>Some OEM SDK clients use a custom {@code Application}: BYD device
+     * {@code getInstance(Context)} methods enforce signature permissions directly on the supplied
+     * Context before they create their singleton. OverDrive is not platform-signed, so a raw app
+     * context fails before any Binder/HAL call is attempted. The wrapper is opt-in and grants only
+     * {@code android.permission.BYD*}; every unrelated Android permission still delegates to the
+     * real context. Returning the wrapper from {@link Context#getApplicationContext()} prevents
+     * the SDK from normalizing back to the unwrapped context before a later permission check.
+     */
+    public static Context withBydPermissionBypass(Context context) {
+        if (context == null || context instanceof BydPermissionContext) return context;
+        return new BydPermissionContext(context);
+    }
+
+    static boolean isBydPermissionName(String permission) {
+        return permission != null && permission.startsWith("android.permission.BYD");
+    }
+
+    private static final class BydPermissionContext extends ContextWrapper {
+        BydPermissionContext(Context base) {
+            super(base);
+        }
+
+        @Override
+        public Context getApplicationContext() {
+            return this;
+        }
+
+        @Override
+        public int checkPermission(String permission, int pid, int uid) {
+            return isBydPermissionName(permission)
+                    ? PackageManager.PERMISSION_GRANTED
+                    : super.checkPermission(permission, pid, uid);
+        }
+
+        @Override
+        public int checkCallingPermission(String permission) {
+            return isBydPermissionName(permission)
+                    ? PackageManager.PERMISSION_GRANTED
+                    : super.checkCallingPermission(permission);
+        }
+
+        @Override
+        public int checkCallingOrSelfPermission(String permission) {
+            return isBydPermissionName(permission)
+                    ? PackageManager.PERMISSION_GRANTED
+                    : super.checkCallingOrSelfPermission(permission);
+        }
+
+        @Override
+        public int checkSelfPermission(String permission) {
+            return isBydPermissionName(permission)
+                    ? PackageManager.PERMISSION_GRANTED
+                    : super.checkSelfPermission(permission);
+        }
+
+        @Override
+        public void enforcePermission(
+                String permission, int pid, int uid, String message) {
+            if (!isBydPermissionName(permission)) {
+                super.enforcePermission(permission, pid, uid, message);
+            }
+        }
+
+        @Override
+        public void enforceCallingPermission(String permission, String message) {
+            if (!isBydPermissionName(permission)) {
+                super.enforceCallingPermission(permission, message);
+            }
+        }
+
+        @Override
+        public void enforceCallingOrSelfPermission(String permission, String message) {
+            if (!isBydPermissionName(permission)) {
+                super.enforceCallingOrSelfPermission(permission, message);
+            }
+        }
+    }
+
+    /**
+     * Invoke the manager-level integer setter without requiring a per-device singleton.
+     *
+     * <p>The connected framework's protected
+     * {@code AbsBYDAutoDevice.set(deviceType, featureId, value)} implementation is exactly this:
+     * {@code BYDAutoDeviceManager.setInt(...)}. This fallback is therefore useful when a device's
+     * constructor fails before returning a handle, while preserving the same HAL command.
+     */
+    public static int callManagerSetInt(
+            Context context, int deviceType, int featureId, int value) {
+        if (context == null) return Integer.MIN_VALUE;
+        try {
+            Class<?> managerClass =
+                    Class.forName("android.hardware.bydauto.BYDAutoDeviceManager");
+            Method getInstance = managerClass.getMethod("getInstance", Context.class);
+            Object manager = getInstance.invoke(null, context);
+            if (manager == null) {
+                logger.debug("callManagerSetInt: BYDAutoDeviceManager unavailable");
+                return Integer.MIN_VALUE;
+            }
+            Method setInt = findMethodCached(
+                    manager,
+                    "setInt",
+                    managerSetIntMethodCache,
+                    int.class,
+                    int.class,
+                    int.class);
+            if (setInt == null) {
+                logger.debug("callManagerSetInt: setInt(int,int,int) unavailable");
+                return Integer.MIN_VALUE;
+            }
+            Object result = setInt.invoke(manager, deviceType, featureId, value);
+            return result instanceof Number
+                    ? ((Number) result).intValue() : Integer.MIN_VALUE;
+        } catch (Exception e) {
+            Throwable cause = e instanceof InvocationTargetException && e.getCause() != null
+                    ? e.getCause() : e;
+            logger.debug("callManagerSetInt failed for device=" + deviceType
+                    + ", feature=0x" + Integer.toHexString(featureId)
+                    + ", value=" + value + " — " + cause.getClass().getSimpleName()
+                    + ": " + cause.getMessage());
+            return Integer.MIN_VALUE;
+        }
     }
 
     /**
@@ -134,6 +268,22 @@ public final class BydDeviceHelper {
      * Used for SDK methods like setAcTemperature(int zone, int temp, int, int),
      * setAllWindowState(int lf, int rf, int lr, int rr).
      */
+    public static Object callMethod(Object device, String methodName, int p1, int p2, int p3) {
+        if (device == null) return null;
+        Method m = lookupPublicMethodCached(device.getClass(), methodName,
+                publicInt3MethodCache, INT3_PARAMS);
+        if (m == null) return null;
+        try {
+            return m.invoke(device, p1, p2, p3);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            logger.debug(methodName + "(" + p1 + ", " + p2 + ", " + p3 + ") threw: " +
+                (cause != null ? cause.getClass().getSimpleName() + ": " + cause.getMessage() : "unknown"));
+        } catch (Exception e) {
+            logger.debug(methodName + "(" + p1 + ", " + p2 + ", " + p3 + ") failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        return null;
+    }
     public static Object callMethod(Object device, String methodName, int p1, int p2, int p3, int p4) {
         if (device == null) return null;
         Method m = lookupPublicMethodCached(device.getClass(), methodName,
@@ -171,6 +321,18 @@ public final class BydDeviceHelper {
      * Call the generic get(int[], Class) method on a BYD device.
      * This is the correct SDK signature for reading feature ID values.
      * Falls back to get(int, int) if the array signature isn't found.
+     *
+     * <p><b>Primitive vs wrapper Class.</b> The HAL dispatches on the EXACT {@code Class}
+     * object passed as the second argument, and it recognises the PRIMITIVE ones
+     * ({@code Double.TYPE}) — not the wrappers ({@code Double.class}), which are a different
+     * {@code Class} instance entirely. The OEM reference app proves this: its feature reader
+     * probes {@code {Double.TYPE, Float.TYPE, Integer.TYPE, Long.TYPE}} in a loop and catches
+     * {@code IllegalArgumentException} to advance to the next — you only write that if the
+     * HAL rejects a type it doesn't match. Callers here have historically passed the wrapper,
+     * so reads that should have worked returned null (the "PHEV charging power never reads"
+     * bug). {@link #normalizePrimitive} maps a wrapper to its primitive so every existing
+     * call site is fixed without touching it, and {@link #callGetProbing} tries the OEM's
+     * full ladder when one type isn't enough.
      */
     public static Object callGet(Object device, int featureId, Class<?> returnType) {
         if (device == null) return null;
@@ -179,13 +341,117 @@ public final class BydDeviceHelper {
             if (m != null) {
                 Class<?>[] params = m.getParameterTypes();
                 if (params.length == 2 && params[0] == int[].class) {
-                    return m.invoke(device, new int[]{featureId}, returnType);
+                    return m.invoke(device, new int[]{featureId}, normalizePrimitive(returnType));
                 } else if (params.length == 2 && params[0] == int.class) {
                     return m.invoke(device, featureId, 0);
                 }
             }
         } catch (Exception e) {
             logger.debug("callGet failed for id=" + featureId + " — " + e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Read a feature ID through the {@code get(int deviceType, int featureId)} overload with
+     * an EXPLICIT device type, rather than letting {@link #callGet} pick a signature.
+     *
+     * <p>Needed because {@link #callGet} prefers the {@code get(int[], Class)} form and only
+     * falls back to {@code (int,int)} when the array form is absent entirely — so on a device
+     * exposing both, the {@code (int,int)} pairing is never attempted. The OEM app reads its
+     * battery-health index exactly this way (device type 1014 for the STATISTIC family) as its
+     * second-tier attempt, so some trims answer here and nowhere else.
+     *
+     * @return the raw returned object (usually a boxed number), or null when unavailable.
+     */
+    public static Object callGetWithDeviceType(Object device, int deviceType, int featureId) {
+        if (device == null) return null;
+        try {
+            Method m = lookupPublicMethodCached(device.getClass(), "get",
+                    publicIntIntMethodCache, INT_INT_PARAMS);
+            if (m == null) return null;
+            return m.invoke(device, deviceType, featureId);
+        } catch (Exception e) {
+            logger.debug("callGetWithDeviceType(" + deviceType + ", 0x"
+                    + Integer.toHexString(featureId) + ") failed: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Map a boxed wrapper Class to its primitive {@code TYPE}, leaving anything else
+     * untouched. The BYD HAL's {@code get(int[], Class)} matches primitives only (see
+     * {@link #callGet}), so this makes a wrapper argument work instead of silently reading
+     * nothing.
+     */
+    private static Class<?> normalizePrimitive(Class<?> t) {
+        if (t == Double.class)  return Double.TYPE;
+        if (t == Integer.class) return Integer.TYPE;
+        if (t == Float.class)   return Float.TYPE;
+        if (t == Long.class)    return Long.TYPE;
+        if (t == Short.class)   return Short.TYPE;
+        if (t == Boolean.class) return Boolean.TYPE;
+        return t;
+    }
+
+    /**
+     * Read a feature ID trying each primitive type in turn until one yields a usable value —
+     * the OEM reference app's own strategy ({@code {Double.TYPE, Float.TYPE, Integer.TYPE,
+     * Long.TYPE}} with an {@code IllegalArgumentException} catch per attempt).
+     *
+     * <p>Use this for values whose HAL-side width is not known for the trim in hand: the same
+     * feature ID is a double on one firmware and an int on another, and guessing wrong reads
+     * nothing. Returns the first non-null result (which may be a {@code BYDAutoEventValue} —
+     * pass it through {@link #getDoubleValue} / {@link #getIntValue} as usual), or null when
+     * no type worked.
+     */
+    public static Object callGetProbing(Object device, int featureId) {
+        return callGetProbing(device, featureId, false);
+    }
+
+    /**
+     * Integer-first variant of {@link #callGetProbing(Object, int)}, for callers that extract
+     * the result with {@link #getIntValue}.
+     *
+     * <p><b>Why the order is not cosmetic.</b> {@code BYDAutoEventValue} carries INDEPENDENT
+     * {@code intValue} / {@code doubleValue} fields, and the HAL fills only the one matching the
+     * requested type. {@code getIntValue} always reads {@code intValue}. So if a Double-first
+     * ladder wins on a feature the caller then reads as an int, {@code intValue} is still at its
+     * default 0 — and 0 is IN BAND for some scales (a raw cell-temp code of 0 means -40 °C),
+     * so it is not rejected and a plausible-looking wrong number is published. Asking for the
+     * width you intend to read keeps the two in agreement.
+     *
+     * @param intFirst true → try {@code Integer.TYPE} before the wider types.
+     */
+    public static Object callGetProbing(Object device, int featureId, boolean intFirst) {
+        if (device == null) return null;
+        Method m = findGetMethod(device);
+        if (m == null) return null;
+        Class<?>[] params = m.getParameterTypes();
+        // Only the (int[], Class) form takes a type argument; the (int,int) form has nothing
+        // to probe, so a single call is all there is.
+        if (!(params.length == 2 && params[0] == int[].class)) {
+            try {
+                if (params.length == 2 && params[0] == int.class) return m.invoke(device, featureId, 0);
+            } catch (Exception e) {
+                logger.debug("callGetProbing(int,int) failed id=0x" + Integer.toHexString(featureId)
+                        + " — " + e.getMessage());
+            }
+            return null;
+        }
+        Class<?>[] ladder = intFirst
+                ? new Class<?>[]{ Integer.TYPE, Long.TYPE, Double.TYPE, Float.TYPE }
+                : new Class<?>[]{ Double.TYPE, Float.TYPE, Integer.TYPE, Long.TYPE };
+        for (Class<?> t : ladder) {
+            try {
+                Object r = m.invoke(device, new int[]{featureId}, t);
+                if (r != null) return r;
+            } catch (IllegalArgumentException iae) {
+                // HAL refused this width — try the next, exactly as the OEM reader does.
+            } catch (Exception e) {
+                logger.debug("callGetProbing id=0x" + Integer.toHexString(featureId)
+                        + " type=" + t.getSimpleName() + " failed: " + e.getMessage());
+            }
         }
         return null;
     }
@@ -219,6 +485,13 @@ public final class BydDeviceHelper {
             if (eventValue instanceof Double) return (Double) eventValue;
             if (eventValue instanceof Number) return ((Number) eventValue).doubleValue();
         }
+        // Some feature ids are carried as a 32-bit float rather than a double. Without this the
+        // read returned NaN and the channel looked absent on those trims — indistinguishable from
+        // a dead getter, which is exactly the ambiguity that makes a missing value hard to diagnose.
+        try {
+            Field ff = eventValue.getClass().getField("floatValue");
+            return ff.getFloat(eventValue);
+        } catch (Exception ignored) { /* not a float-carrying event */ }
         return Double.NaN;
     }
 
@@ -795,6 +1068,77 @@ public final class BydDeviceHelper {
     }
 
     /**
+     * Register the typed safety-belt listener. Passenger occupancy is delivered through
+     * {@code onPassengerStatusChanged}, which is not a method on the generic
+     * {@code IBYDAutoListener} marker interface.
+     */
+    public static boolean registerSafetyBeltListener(Object device, ListenerCallback callback) {
+        if (device == null) return false;
+        synchronized (safetyBeltListeners) {
+            // The caller should already avoid duplicate registration, but retaining only one
+            // listener makes a second helper-level registration a leak: the first callback can
+            // no longer be unregistered. Treat the existing typed listener as success.
+            if (safetyBeltListeners.containsKey(device)) return true;
+            try {
+                android.hardware.bydauto.safetybelt.AbsBYDAutoSafetyBeltListener listener =
+                        new android.hardware.bydauto.safetybelt.AbsBYDAutoSafetyBeltListener() {
+                            @Override
+                            public void onSafetyBeltStatusChanged(int seat, int state) {
+                                invokeCallback(callback, "onSafetyBeltStatusChanged",
+                                        new Object[]{seat, state});
+                            }
+
+                            @Override
+                            public void onPassengerStatusChanged(int area, int state) {
+                                invokeCallback(callback, "onPassengerStatusChanged",
+                                        new Object[]{area, state});
+                            }
+                        };
+                Method register = findRegisterMethod(device.getClass(),
+                        android.hardware.bydauto.safetybelt.AbsBYDAutoSafetyBeltListener.class);
+                if (register != null) {
+                    register.invoke(device, listener);
+                    safetyBeltListeners.put(device, listener);
+                    return true;
+                }
+                logger.debug("registerSafetyBeltListener: no registerListener method on "
+                        + device.getClass().getName());
+            } catch (LinkageError e) {
+                logger.debug("registerSafetyBeltListener: class not available on this firmware");
+            } catch (Exception e) {
+                logger.debug("registerSafetyBeltListener failed: " + e.getMessage());
+            }
+        }
+        return false;
+    }
+
+    /** Unregister and release the retained typed safety-belt listener for one device handle. */
+    public static boolean unregisterSafetyBeltListener(Object device) {
+        if (device == null) return false;
+        synchronized (safetyBeltListeners) {
+            Object listener = safetyBeltListeners.get(device);
+            if (listener == null) return false;
+            try {
+                Method unregister = findUnregisterMethod(device.getClass(),
+                        android.hardware.bydauto.safetybelt.AbsBYDAutoSafetyBeltListener.class);
+                if (unregister == null) {
+                    logger.debug("unregisterSafetyBeltListener: no unregisterListener method on "
+                            + device.getClass().getName());
+                    return false;
+                }
+                unregister.invoke(device, listener);
+                safetyBeltListeners.remove(device);
+                return true;
+            } catch (LinkageError e) {
+                logger.debug("unregisterSafetyBeltListener: class not available on this firmware");
+            } catch (Exception e) {
+                logger.debug("unregisterSafetyBeltListener failed: " + e.getMessage());
+            }
+        }
+        return false;
+    }
+
+    /**
      * Register a typed statistic listener. onElecPercentageChanged(double) — the
      * DECIMAL display SoC — is a concrete method on AbsBYDAutoStatisticListener, NOT
      * on the bare IBYDAutoListener marker interface, so the generic Proxy path can
@@ -1017,8 +1361,29 @@ public final class BydDeviceHelper {
     }
 
     /**
-     * Call set(int deviceType, int featureId, int value) on a BYD device.
-     * Returns the SDK result code, or -1 on any failure.
+     * OEM-strict variant for commands whose contract requires an actual Integer result.
+     * Returns null when the invocation did not produce one; unlike {@link #sendSetCommandRaw},
+     * a void, Boolean, or other non-Integer result is never manufactured into success.
+     */
+    public static Integer sendSetCommandIntegerResult(Object device, int featureId, int value) {
+        if (device == null) return null;
+        try {
+            Class<?> eventValueClass = Class.forName("android.hardware.bydauto.BYDAutoEventValue");
+            Object eventValue = eventValueClass.getConstructor(new Class[0]).newInstance(new Object[0]);
+            eventValueClass.getField("intValue").setInt(eventValue, value);
+            Method setMethod = device.getClass().getMethod("set", int[].class, eventValueClass);
+            Object result = setMethod.invoke(device, new int[]{featureId}, eventValue);
+            return result instanceof Integer ? (Integer) result : null;
+        } catch (Exception e) {
+            logger.debug("sendSetCommandIntegerResult failed for featureId=0x"
+                    + Integer.toHexString(featureId) + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Call set(int deviceType, int featureId, int value) on a BYD device, including a protected
+     * declaration inherited from an OEM base class. Returns the SDK result code, or -1 on failure.
      */
     public static int callSetSingle(Object device, int featureId, int value) {
         if (device == null) return -1;
@@ -1087,16 +1452,44 @@ public final class BydDeviceHelper {
 
     // ==================== INTERNAL HELPERS ====================
 
-    private static final java.util.Map<Class<?>, Method> getMethodCache = new java.util.HashMap<>();
-    private static final java.util.Map<Class<?>, Method> getSingleMethodCache = new java.util.HashMap<>();
-    private static final java.util.Map<Class<?>, Method> getDoubleMethodCache = new java.util.HashMap<>();
-    private static final java.util.Map<Class<?>, Method> getIntArrayMethodCache = new java.util.HashMap<>();
-    private static final java.util.Map<Class<?>, Method> getDoubleArrayMethodCache = new java.util.HashMap<>();
-    private static final java.util.Map<Class<?>, Method> getBufferMethodCache = new java.util.HashMap<>();
-    private static final java.util.Map<Class<?>, Method> setSingleMethodCache = new java.util.HashMap<>();
-    private static final java.util.Map<Class<?>, Method> setBatchMethodCache = new java.util.HashMap<>();
-    private static final java.util.Map<Class<?>, Method> setBufferMethodCache = new java.util.HashMap<>();
-    private static final java.util.Map<Class<?>, Integer> deviceTypeCache = new java.util.HashMap<>();
+    private static final java.util.Map<Class<?>, Method> getMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> getSingleMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> getDoubleMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> getIntArrayMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> getDoubleArrayMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> getBufferMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> setSingleMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> managerSetIntMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> setBatchMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> setBufferMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * className → HAL device type. {@code ConcurrentHashMap}, not {@code HashMap}: this is written
+     * from the collector poll thread, the HTTP {@code collectAllFull} thread and HAL/init worker
+     * threads with no external lock, and a plain HashMap under concurrent {@code put} can corrupt
+     * its table (classically, an endless loop inside {@code get}).
+     */
+    private static final java.util.Map<Class<?>, Integer> deviceTypeCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Classes whose type-probe recently FAILED, and the wall-clock ms after which to retry.
+     * Separate from {@link #deviceTypeCache} so a failure can never be mistaken for a resolved
+     * type, and so {@code ConcurrentHashMap}'s no-null-values rule is respected.
+     */
+    private static final java.util.Map<Class<?>, Long> deviceTypeMissUntil =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * How long a failed device-type probe is remembered before being retried. Sized near the
+     * 5 s ACC-on poll cadence rather than a minute: a binder that recovers in 2 s should not blank
+     * every manager-level read for 12 further cycles.
+     *
+     * <p>Measured with {@link android.os.SystemClock#elapsedRealtime()}, NOT wall clock. These head
+     * units boot with an unset RTC and then jump the clock when NTP/GPS lands — a BACKWARD jump
+     * would hold a wall-clock deadline in the future for hours, re-creating the process-lifetime
+     * outage this TTL exists to prevent, and doing it precisely while handles are being acquired.
+     */
+    private static final long TYPE_MISS_TTL_MS = 10_000L;
 
     // ----- per-name reflection caches for callGetter / callMethod -----
     //
@@ -1125,6 +1518,7 @@ public final class BydDeviceHelper {
     private static final Class<?>[] NO_PARAMS = new Class<?>[0];
     private static final Class<?>[] INT_PARAMS = new Class<?>[]{int.class};
     private static final Class<?>[] INT_INT_PARAMS = new Class<?>[]{int.class, int.class};
+    private static final Class<?>[] INT3_PARAMS = new Class<?>[]{int.class, int.class, int.class};
     private static final Class<?>[] INT4_PARAMS = new Class<?>[]{int.class, int.class, int.class, int.class};
 
     private static final java.util.concurrent.ConcurrentMap<Class<?>, java.util.concurrent.ConcurrentMap<String, Method>>
@@ -1133,6 +1527,8 @@ public final class BydDeviceHelper {
             publicIntMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.ConcurrentMap<Class<?>, java.util.concurrent.ConcurrentMap<String, Method>>
             publicIntIntMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentMap<Class<?>, java.util.concurrent.ConcurrentMap<String, Method>>
+            publicInt3MethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.ConcurrentMap<Class<?>, java.util.concurrent.ConcurrentMap<String, Method>>
             publicInt4MethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.ConcurrentMap<Class<?>, java.util.concurrent.ConcurrentMap<String, Method>>
@@ -1200,7 +1596,8 @@ public final class BydDeviceHelper {
 
     private static Method findGetMethod(Object device) {
         Class<?> cls = device.getClass();
-        if (getMethodCache.containsKey(cls)) return getMethodCache.get(cls);
+        Method ghit = getMethodCache.get(cls);
+        if (ghit != null) return ghit == NEGATIVE_CACHE_SENTINEL ? null : ghit;
 
         Class<?> walk = cls;
         while (walk != null && walk != Object.class) {
@@ -1218,21 +1615,48 @@ public final class BydDeviceHelper {
             } catch (NoSuchMethodException ignored) {}
             walk = walk.getSuperclass();
         }
-        getMethodCache.put(cls, null);
+        // Sentinel, not null: these caches are ConcurrentHashMap now (they are hit from the poll
+        // thread, the HTTP collectAllFull thread and web/Telegram setter threads, and a plain
+        // HashMap can corrupt its table under concurrent put) — and CHM forbids null VALUES.
+        getMethodCache.put(cls, NEGATIVE_CACHE_SENTINEL);
         return null;
     }
 
     /**
-     * Resolve the deviceType from a BYD device object via getDevicetype() or getType().
-     * Caches the result per device class. Returns Integer.MIN_VALUE on failure.
+     * Public accessor for a device's numeric HAL type, or {@code Integer.MIN_VALUE} when it cannot
+     * be resolved. Exposed for {@link BydManagerChannel}, whose manager-level reads are keyed by
+     * {@code (deviceType, featureId)} — it must not duplicate this lookup, because the result is
+     * cached per class here and a second cache could disagree.
      */
+    public static int deviceTypeOf(Object device) {
+        if (device == null) return Integer.MIN_VALUE;
+        return resolveDeviceType(device);
+    }
+
     private static int resolveDeviceType(Object device) {
         Class<?> cls = device.getClass();
-        if (deviceTypeCache.containsKey(cls)) return deviceTypeCache.get(cls);
+        Integer hit = deviceTypeCache.get(cls);
+        if (hit != null) return hit;   // get()-once, not containsKey+get: no unboxing NPE window
+        // NEGATIVE CACHE WITH A TTL. Not caching failures at all (the previous revision) meant a
+        // device that can never report its type re-ran two failing reflective probes on EVERY call —
+        // up to ~34k probe pairs/day at the 5 s ACC-on cadence. Caching them forever (the revision
+        // before that) turned one transient failure into a process-lifetime outage that no re-init
+        // could clear. A short TTL has both properties: steady-state cost is one probe pair per
+        // class per window, and a genuine recovery is picked up within one window.
+        Long until = deviceTypeMissUntil.get(cls);
+        if (until != null) {
+            if (android.os.SystemClock.elapsedRealtime() < until) return Integer.MIN_VALUE;
+            deviceTypeMissUntil.remove(cls);   // window elapsed → probe again
+        }
 
-        // Try getDevicetype() first (AbsBYDAutoDevice)
+        // Try getDevicetype() first (AbsBYDAutoDevice). The METHOD LOOKUP is cached permanently
+        // (a Method is Class-bound, so its absence never changes) while only the VALUE is under the
+        // TTL — otherwise every TTL window re-threw NoSuchMethodException for both accessors, with
+        // full stack-trace fill-in, on the 5 s poll thread and once per unresolvable class.
         try {
-            Method m = cls.getMethod("getDevicetype");
+            Method m = lookupPublicMethodCached(cls, "getDevicetype",
+                    publicNoArgMethodCache, NO_PARAMS);
+            if (m == null) throw new NoSuchMethodException("getDevicetype");
             Object result = m.invoke(device);
             if (result instanceof Number) {
                 int type = ((Number) result).intValue();
@@ -1241,9 +1665,11 @@ public final class BydDeviceHelper {
             }
         } catch (Exception ignored) {}
 
-        // Fallback to getType()
+        // Fallback to getType() — same cached-lookup treatment.
         try {
-            Method m = cls.getMethod("getType");
+            Method m = lookupPublicMethodCached(cls, "getType",
+                    publicNoArgMethodCache, NO_PARAMS);
+            if (m == null) throw new NoSuchMethodException("getType");
             Object result = m.invoke(device);
             if (result instanceof Number) {
                 int type = ((Number) result).intValue();
@@ -1252,9 +1678,26 @@ public final class BydDeviceHelper {
             }
         } catch (Exception ignored) {}
 
-        logger.debug("Could not resolve deviceType for " + cls.getSimpleName());
-        deviceTypeCache.put(cls, Integer.MIN_VALUE);
+        // Failure is remembered only for TYPE_MISS_TTL_MS (see the negative-cache note above), so a
+        // transient cause — a dead binder mid-restart, or a handle obtained under the broken
+        // synthetic Context before ACC-ON replaces it — cannot become a permanent outage, while a
+        // genuinely type-less device is not re-probed on every poll. Logged at DEBUG because with a
+        // TTL this repeats once per window; the INFO-level version was itself a slow log leak.
+        deviceTypeMissUntil.put(cls, android.os.SystemClock.elapsedRealtime() + TYPE_MISS_TTL_MS);
+        logger.debug("Could not resolve deviceType for " + cls.getSimpleName()
+                + " — retrying in " + (TYPE_MISS_TTL_MS / 1000) + "s");
         return Integer.MIN_VALUE;
+    }
+
+    /**
+     * Drop cached device types so the next call re-probes. Intended for
+     * {@link BydManagerChannel#invalidate()} — a dead binder can make {@code getDevicetype()} throw,
+     * and although failures are no longer cached, a type resolved from a stale handle should not
+     * outlive it.
+     */
+    static void invalidateDeviceTypeCache() {
+        deviceTypeCache.clear();
+        deviceTypeMissUntil.clear();   // a new handle deserves an immediate retry, not a stale TTL
     }
 
     /**
@@ -1264,7 +1707,8 @@ public final class BydDeviceHelper {
     private static Method findMethodCached(Object device, String methodName,
             java.util.Map<Class<?>, Method> cache, Class<?>... paramTypes) {
         Class<?> cls = device.getClass();
-        if (cache.containsKey(cls)) return cache.get(cls);
+        Method hit = cache.get(cls);
+        if (hit != null) return hit == NEGATIVE_CACHE_SENTINEL ? null : hit;
 
         Class<?> walk = cls;
         while (walk != null && walk != Object.class) {
@@ -1276,7 +1720,7 @@ public final class BydDeviceHelper {
             } catch (NoSuchMethodException ignored) {}
             walk = walk.getSuperclass();
         }
-        cache.put(cls, null);
+        cache.put(cls, NEGATIVE_CACHE_SENTINEL);   // never null — see findGetMethod
         return null;
     }
 
@@ -1285,6 +1729,19 @@ public final class BydDeviceHelper {
         while (walk != null && walk != Object.class) {
             try {
                 Method m = walk.getDeclaredMethod("registerListener", listenerInterface);
+                m.setAccessible(true);
+                return m;
+            } catch (NoSuchMethodException ignored) {}
+            walk = walk.getSuperclass();
+        }
+        return null;
+    }
+
+    private static Method findUnregisterMethod(Class<?> cls, Class<?> listenerInterface) {
+        Class<?> walk = cls;
+        while (walk != null && walk != Object.class) {
+            try {
+                Method m = walk.getDeclaredMethod("unregisterListener", listenerInterface);
                 m.setAccessible(true);
                 return m;
             } catch (NoSuchMethodException ignored) {}

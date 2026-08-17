@@ -3,6 +3,7 @@ package com.overdrive.app.server;
 import android.graphics.Bitmap;
 import android.media.MediaMetadataRetriever;
 import com.overdrive.app.daemon.CameraDaemon;
+import com.overdrive.app.storage.RecordingDirectoryRegistry;
 import com.overdrive.app.storage.StorageManager;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -52,15 +53,6 @@ public class RecordingsApiHandler {
         return StorageManager.getInstance().getSurveillancePath();
     }
     
-    // Legacy paths for backward compatibility (migration). Used by the
-    // findVideoFile / findSiblingJpeg / findJsonSidecar fallback paths
-    // when the active StorageManager dirs don't contain the requested
-    // file — covers very old installs that wrote into <base>/recordings
-    // or directly into <base>.
-    private static final String LEGACY_RECORDINGS_DIR = "/storage/emulated/0/Android/data/com.overdrive.app/files";
-    private static final String LEGACY_SENTRY_DIR = LEGACY_RECORDINGS_DIR + "/sentry_events";
-
-
     // -----------------------------------------------------------------
     // Index integration
     // -----------------------------------------------------------------
@@ -120,9 +112,9 @@ public class RecordingsApiHandler {
      */
     public static void pruneRecordingCache() {
         try {
-            RecordingsIndex.getInstance().reconcile();
+            RecordingsIndex.getInstance().requestReconcile("periodic-prune");
         } catch (Throwable t) {
-            CameraDaemon.log("RecordingsApiHandler reconcile failed: " + t.getMessage());
+            CameraDaemon.log("RecordingsApiHandler reconcile request failed: " + t.getMessage());
         }
     }
     
@@ -211,20 +203,15 @@ public class RecordingsApiHandler {
         
         // Serve thumbnail
         if (path.startsWith("/thumb/")) {
-            String filename = path.substring(7);
-            // Strip any cache-busting/auth query (e.g. /thumb/foo.jpg?t=<token>);
-            // the notification-log snapshot URLs carry one, and serveThumbnail's
-            // ".jpg" fast-path check + File lookup would otherwise fail → 404.
-            int qIdx = filename.indexOf('?');
-            if (qIdx >= 0) filename = filename.substring(0, qIdx);
-            serveThumbnail(out, filename);
+            String filename = mediaFilename(path, "/thumb/");
+            serveThumbnail(out, filename, mediaRequestedPath(path));
             return true;
         }
         
         // Stream video file
         if (path.startsWith("/video/")) {
-            String filename = path.substring(7);
-            streamVideo(out, filename, null, null);
+            String filename = mediaFilename(path, "/video/");
+            streamVideo(out, filename, mediaRequestedPath(path), null, null);
             return true;
         }
         
@@ -245,15 +232,15 @@ public class RecordingsApiHandler {
 
         // Delete recording
         if (path.startsWith("/api/recordings/") && method.equals("DELETE")) {
-            String filename = path.substring(16);
-            deleteRecording(out, filename);
+            String filename = mediaFilename(path, "/api/recordings/");
+            deleteRecording(out, filename, mediaRequestedPath(path));
             return true;
         }
         
         // SOTA: Get event timeline for a recording (JSON sidecar)
         if (path.startsWith("/api/events/") && method.equals("GET")) {
-            String filename = path.substring(12);
-            serveEventTimeline(out, filename);
+            String filename = mediaFilename(path, "/api/events/");
+            serveEventTimeline(out, filename, mediaRequestedPath(path));
             return true;
         }
         
@@ -268,6 +255,18 @@ public class RecordingsApiHandler {
             return defaultValue;
         }
     }
+
+    private static String mediaFilename(String requestPath, String prefix) {
+        String remainder = requestPath.substring(prefix.length());
+        int queryStart = remainder.indexOf('?');
+        return queryStart >= 0 ? remainder.substring(0, queryStart) : remainder;
+    }
+
+    private static String mediaRequestedPath(String requestPath) {
+        int queryStart = requestPath.indexOf('?');
+        if (queryStart < 0 || queryStart + 1 >= requestPath.length()) return null;
+        return parseQuery(requestPath.substring(queryStart + 1)).get("path");
+    }
     
     /**
      * Handle with Range header support for video seeking and conditional GET
@@ -277,8 +276,13 @@ public class RecordingsApiHandler {
                                           String rangeHeader, String ifNoneMatchHeader,
                                           OutputStream out) throws Exception {
         if (path.startsWith("/video/")) {
-            String filename = path.substring(7);
-            streamVideo(out, filename, rangeHeader, ifNoneMatchHeader);
+            String filename = mediaFilename(path, "/video/");
+            streamVideo(
+                    out,
+                    filename,
+                    mediaRequestedPath(path),
+                    rangeHeader,
+                    ifNoneMatchHeader);
             return true;
         }
         return handle(method, path, body, out);
@@ -293,7 +297,10 @@ public class RecordingsApiHandler {
      * Serve a cached thumbnail for a video file.
      * Returns placeholder immediately if not cached, generates in background.
      */
-    private static void serveThumbnail(OutputStream out, String filename) throws Exception {
+    private static void serveThumbnail(
+            OutputStream out,
+            String filename,
+            String requestedPath) throws Exception {
         // Security: prevent path traversal
         if (filename.contains("..") || filename.contains("/")) {
             HttpResponse.sendError(out, 400, Messages.get("errors.recordings_invalid_filename"));
@@ -305,7 +312,9 @@ public class RecordingsApiHandler {
         // the MP4. Looking these up here means events.js can use a single URL
         // shape (/thumb/<filename>) for both video-frame and AI thumbnails.
         if (filename.toLowerCase(Locale.US).endsWith(".jpg")) {
-            File jpegFile = findSiblingJpeg(filename);
+            File jpegFile = requestedPath == null
+                    ? findSiblingJpeg(filename)
+                    : findRequestedMediaFile(filename, requestedPath, false);
             if (jpegFile != null && jpegFile.exists() && jpegFile.length() > 0) {
                 HttpResponse.sendImage(out, jpegFile, "image/jpeg");
                 return;
@@ -321,13 +330,30 @@ public class RecordingsApiHandler {
         }
 
         String thumbName = filename.replace(".mp4", ".jpg");
-        File thumbFile = new File(cacheDir, thumbName);
+        String cacheKey = requestedPath == null
+                ? filename
+                : Integer.toHexString(requestedPath.hashCode()) + "_" + filename;
+        String cachedThumbName = requestedPath == null
+                ? thumbName
+                : Integer.toHexString(requestedPath.hashCode()) + "_" + thumbName;
+        File thumbFile = new File(cacheDir, cachedThumbName);
+
+        // Find the source before resolving a hero so a path-qualified request
+        // remains on the exact volume represented by the index row.
+        File videoFile = findVideoFile(filename, requestedPath, true);
+        if (videoFile == null) {
+            HttpResponse.sendError(out, 404, Messages.get("errors.recordings_video_not_found_with_filename", filename));
+            return;
+        }
 
         // SOTA: if a v3 hero JPEG exists alongside the MP4, prefer it.
         // It's the peak-severity moment captured during the recording rather
         // than a generic frame at +1s. Backwards-compat: legacy clips without
         // a hero file fall through to the cache + MediaMetadataRetriever path.
-        File heroSibling = findSiblingJpeg(thumbName);
+        File exactHero = new File(videoFile.getParentFile(), thumbName);
+        File heroSibling = exactHero.exists() && exactHero.canRead() && exactHero.length() > 0
+                ? exactHero
+                : (requestedPath == null ? findSiblingJpeg(thumbName) : null);
         if (heroSibling != null && heroSibling.exists() && heroSibling.length() > 0) {
             HttpResponse.sendImage(out, heroSibling, "image/jpeg");
             return;
@@ -339,25 +365,15 @@ public class RecordingsApiHandler {
             return;
         }
 
-        // Find the source video file. allowInFlightTmp=true so a notification
-        // tapped within seconds of motion still gets a hero image: the
-        // MediaMetadataRetriever can read sync frames from <name>.mp4.tmp
-        // before the muxer finalises the moov atom on close.
-        File videoFile = findVideoFile(filename, true);
-        if (videoFile == null) {
-            HttpResponse.sendError(out, 404, Messages.get("errors.recordings_video_not_found_with_filename", filename));
-            return;
-        }
-
         // Queue background generation if not already pending. add() returns
         // false when the element was already present, so a single atomic
         // call avoids the check-then-act race where two concurrent requests
         // both pass `contains()` and submit overlapping FileOutputStreams to
         // the same thumb file.
-        if (pendingThumbs.add(filename)) {
+        if (pendingThumbs.add(cacheKey)) {
             final File vf = videoFile;
             final File tf = thumbFile;
-            final String fn = filename;
+            final String pendingKey = cacheKey;
             thumbExecutor.submit(() -> {
                 try {
                     byte[] data = generateThumbnail(vf);
@@ -369,7 +385,7 @@ public class RecordingsApiHandler {
                 } catch (Exception e) {
                     CameraDaemon.log("Background thumb gen failed: " + e.getMessage());
                 } finally {
-                    pendingThumbs.remove(fn);
+                    pendingThumbs.remove(pendingKey);
                 }
             });
         }
@@ -507,6 +523,16 @@ public class RecordingsApiHandler {
      *        fail to load it. Streaming MUST use the default false.
      */
     private static File findVideoFile(String filename, boolean allowInFlightTmp) {
+        return findVideoFile(filename, null, allowInFlightTmp);
+    }
+
+    private static File findVideoFile(
+            String filename,
+            String requestedPath,
+            boolean allowInFlightTmp) {
+        if (requestedPath != null && !requestedPath.isEmpty()) {
+            return findRequestedMediaFile(filename, requestedPath, allowInFlightTmp);
+        }
         StorageManager sm = StorageManager.getInstance();
 
         // Search all recordings directories (active + alternate)
@@ -526,14 +552,6 @@ public class RecordingsApiHandler {
             File f = new File(dir, filename);
             if (f.exists() && f.canRead() && f.length() > 0) return f;
         }
-
-        // Check legacy recordings location
-        File legacyFile = new File(LEGACY_RECORDINGS_DIR, filename);
-        if (legacyFile.exists() && legacyFile.canRead() && legacyFile.length() > 0) return legacyFile;
-
-        // Check legacy sentry location
-        File legacySentryFile = new File(LEGACY_SENTRY_DIR, filename);
-        if (legacySentryFile.exists() && legacySentryFile.canRead() && legacySentryFile.length() > 0) return legacySentryFile;
 
         // In-flight fallback (thumbnails only): a notification fires the moment
         // startRecording() returns, but the file on disk is still
@@ -560,6 +578,52 @@ public class RecordingsApiHandler {
 
         return null;
     }
+
+    private static File findRequestedMediaFile(
+            String filename,
+            String requestedPath,
+            boolean allowInFlightTmp) {
+        if (filename == null || filename.isEmpty()
+                || filename.contains("..") || filename.contains("/")) {
+            return null;
+        }
+        try {
+            File requested = new File(requestedPath).getCanonicalFile();
+            if (!requested.getName().equals(filename) || !isAllowedRecordingPath(requested)) {
+                return null;
+            }
+            if (requested.exists() && requested.canRead() && requested.length() > 0) {
+                return requested;
+            }
+            if (allowInFlightTmp) {
+                File inFlight = new File(requestedPath + ".tmp").getCanonicalFile();
+                if (isAllowedRecordingPath(inFlight)
+                        && inFlight.exists() && inFlight.canRead() && inFlight.length() > 0) {
+                    return inFlight;
+                }
+            }
+        } catch (Exception ignored) {
+            // Invalid or inaccessible path.
+        }
+        return null;
+    }
+
+    private static boolean isAllowedRecordingPath(File candidate) throws Exception {
+        String candidatePath = candidate.getCanonicalPath();
+        StorageManager sm = StorageManager.getInstance();
+        List<File> roots = new ArrayList<>();
+        roots.addAll(sm.getAllRecordingsDirs());
+        roots.addAll(sm.getAllSurveillanceDirs());
+        roots.addAll(sm.getAllProximityDirs());
+        roots.add(new File(RecordingDirectoryRegistry.LEGACY_BASE));
+        roots.add(new File(RecordingDirectoryRegistry.LEGACY_SENTRY));
+        for (File root : roots) {
+            if (root == null) continue;
+            String rootPath = root.getCanonicalPath();
+            if (candidatePath.startsWith(rootPath + File.separator)) return true;
+        }
+        return false;
+    }
     
     /**
      * Locate a JPEG sibling next to a recording. Used to serve hero / per-actor
@@ -582,10 +646,6 @@ public class RecordingsApiHandler {
             File f = new File(dir, jpegName);
             if (f.exists() && f.canRead() && f.length() > 0) return f;
         }
-        File legacy = new File(LEGACY_RECORDINGS_DIR, jpegName);
-        if (legacy.exists() && legacy.canRead() && legacy.length() > 0) return legacy;
-        File legacySentry = new File(LEGACY_SENTRY_DIR, jpegName);
-        if (legacySentry.exists() && legacySentry.canRead() && legacySentry.length() > 0) return legacySentry;
         return null;
     }
 
@@ -677,6 +737,14 @@ public class RecordingsApiHandler {
                                        String countryFilter,
                                        String storageFilter) throws Exception {
         RecordingsIndex idx = RecordingsIndex.getInstance();
+
+        // Index down (H2 closed the store and it could not be re-opened).
+        // This MUST NOT be reported as an empty library: the clips are on
+        // disk and an empty 200 response made events.html render "no
+        // recordings" for hours while recordings kept being written. Report
+        // the failure so clients show an error + retry instead.
+        if (sendIndexUnavailable(out, "recordings", page, pageSize)) return;
+
         RecordingsIndex.WarmupSnapshot snap = idx.warmupState();
         if (!snap.complete && snap.total > 0) {
             // Warmup in flight — return progress so the UI shows the
@@ -716,10 +784,37 @@ public class RecordingsApiHandler {
         // event was dropped on FUSE-mounted SD card. Cheap when in sync;
         // bounded by the fact that reconcile() itself is O(distinct
         // filenames) once.
+        // Only an UNFILTERED empty result implies index drift. hasAnyMp4OnDisk()
+        // can't see the filter, so a narrowed query that legitimately matches
+        // nothing (e.g. type=sentry on a device that has only dashcam clips) would
+        // otherwise kick a full stat-walk on every poll.
+        boolean unfiltered = isEmptyFilterValue(typeFilter) && isEmptyFilterValue(dateFilter)
+                && isEmptyFilterValue(classFilter) && isEmptyFilterValue(severityFilter)
+                && isEmptyFilterValue(proximityFilter) && isEmptyFilterValue(placeFilter)
+                && isEmptyFilterValue(placeContainsFilter) && isEmptyFilterValue(countryFilter)
+                && isEmptyFilterValue(storageFilter);
         boolean reconcileKicked = false;
-        if (rows.isEmpty() && totalCount == 0 && page == 1
-                && hasAnyMp4OnDisk()) {
+        // NOTE (audit: repair-on-read gate): the old condition was
+        // `rows.isEmpty() && totalCount == 0` — redundant (a zero-count query
+        // returns no rows) but also a trap: any future relaxation of ONE of
+        // the two conditions to catch non-empty drift would silently never
+        // fire because the other still gates on fully-empty. Collapsed to the
+        // single authoritative condition.
+        //
+        // Non-empty drift (index has 2 rows, disk has 76 files — dropped
+        // FileObserver events while the volume stayed mounted, so no mount
+        // notification ever fires) is handled by the SEPARATE cooldown-gated
+        // background check below: an authoritative-listing disk count against
+        // the index count restricted to the same scannable roots. That root
+        // restriction is what keeps the comparison safe with offline-volume
+        // rows retained in the index — an unplugged card's rows are under no
+        // scannable root, so they can't mismatch forever (see
+        // RecordingsIndex.countRowsUnderRoots).
+        if (totalCount == 0 && page == 1
+                && unfiltered && hasAnyMp4OnDisk()) {
             reconcileKicked = kickBackgroundReconcile(idx);
+        } else if (page == 1 && unfiltered) {
+            maybeCheckIndexDriftAsync(idx);
         }
 
         JSONObject response = new JSONObject();
@@ -740,6 +835,11 @@ public class RecordingsApiHandler {
             response.put("retryAfterMs", 1500);
         }
         HttpResponse.sendJson(out, response.toString());
+    }
+
+    /** True when a raw query-string filter value narrows nothing. */
+    private static boolean isEmptyFilterValue(String value) {
+        return value == null || value.trim().isEmpty();
     }
 
     /**
@@ -827,32 +927,97 @@ public class RecordingsApiHandler {
         return files != null && files.length > 0;
     }
 
-    private static final java.util.concurrent.atomic.AtomicBoolean RECONCILE_IN_FLIGHT =
-            new java.util.concurrent.atomic.AtomicBoolean(false);
-
     /**
-     * @return true when this call started a fresh reconcile thread.
-     *         false when one was already in flight (caller may still
-     *         signal "reconciling" to the client — the existing
-     *         in-flight pass will pick up the missing rows).
+     * @return true only when the coalesced repair request was accepted.
      */
     private static boolean kickBackgroundReconcile(RecordingsIndex idx) {
-        if (!RECONCILE_IN_FLIGHT.compareAndSet(false, true)) {
-            // Already running. Tell caller we're reconciling so the
-            // client retries — but don't spawn a duplicate thread.
-            return true;
+        return idx.requestReconcile("api-repair-on-read");
+    }
+
+    // ==================== Read-drift check (non-empty index) ====================
+    // (audit: non-empty repair-on-read). The empty-index gate above can't see
+    // an index that has SOME rows but is missing most of the disk (dropped
+    // FileObserver events on a FUSE mount that never unmounted — so no mount
+    // transition, no notification, and the hourly reconcile is the only
+    // healer). This check compares an authoritative disk count against the
+    // index count under the same roots, in the background, at most once per
+    // cooldown window, and kicks a coalesced reconcile on mismatch.
+    //
+    // Safety properties:
+    //  - AUTHORITATIVE ONLY: any present-but-incompletely-listed directory
+    //    aborts the whole check (a partial listing undercounts and would
+    //    fire spurious reconciles). Missing dirs = offline volume, excluded
+    //    from BOTH sides of the comparison.
+    //  - CONVERGENT: every mismatch source is repaired by the reconcile it
+    //    triggers (missing rows upserted, stale rows pruned under
+    //    authoritative roots, NULL abs_path repaired by upsert), so the
+    //    comparison can't re-fire forever on the same state.
+    //  - BOUNDED: one shell-ls walk per cooldown window, on a daemon thread,
+    //    never on the request path. Equal-counts-different-files drift is
+    //    accepted as undetectable here; the periodic reconcile covers it.
+
+    private static final long DRIFT_CHECK_INTERVAL_MS = 5 * 60_000L;
+    private static volatile long lastDriftCheckAtMs = 0;
+    private static final Object driftCheckGate = new Object();
+
+    /** Cooldown-gated fire-and-forget wrapper around {@link #checkIndexDrift}. */
+    private static void maybeCheckIndexDriftAsync(RecordingsIndex idx) {
+        long now = System.currentTimeMillis();
+        synchronized (driftCheckGate) {
+            if (now - lastDriftCheckAtMs < DRIFT_CHECK_INTERVAL_MS) return;
+            lastDriftCheckAtMs = now;
         }
-        Thread t = new Thread(() -> {
-            try { idx.reconcile(); }
-            catch (Throwable thr) {
-                CameraDaemon.log("Reconcile kick failed: " + thr.getMessage());
-            } finally {
-                RECONCILE_IN_FLIGHT.set(false);
+        try {
+            Thread t = new Thread(() -> checkIndexDrift(idx), "IndexDriftCheck");
+            t.setDaemon(true);
+            t.start();
+        } catch (Throwable ignored) {
+            // Thread spawn failure — next window retries.
+        }
+    }
+
+    private static void checkIndexDrift(RecordingsIndex idx) {
+        try {
+            StorageManager sm = StorageManager.getInstance();
+            java.util.List<java.io.File> dirs = new java.util.ArrayList<>();
+            dirs.addAll(sm.getAllRecordingsDirs());
+            dirs.addAll(sm.getAllSurveillanceDirs());
+            dirs.addAll(sm.getAllProximityDirs());
+
+            java.util.Set<String> diskNames = new java.util.HashSet<>();
+            java.util.List<String> roots = new java.util.ArrayList<>();
+            for (java.io.File dir : dirs) {
+                // Missing dir → offline volume (or never-created category
+                // dir): excluded from both sides of the comparison.
+                if (dir == null || !dir.exists() || !dir.isDirectory()) continue;
+                StorageManager.DirListing listing = sm.listMp4FilesChecked(dir);
+                if (!listing.complete) {
+                    // Present but unlistable/partial — comparison would be
+                    // built on a non-authoritative count. Abort entirely.
+                    return;
+                }
+                if (!roots.contains(dir.getAbsolutePath())) {
+                    roots.add(dir.getAbsolutePath());
+                }
+                for (java.io.File f : listing.files) {
+                    // Mirror reconcile's eligibility (isFile + size>0) so the
+                    // two sides count the same population. Distinct names —
+                    // the index is filename-keyed.
+                    if (f.isFile() && f.length() > 0) diskNames.add(f.getName());
+                }
             }
-        }, "RecordingsIndexReconcileKick");
-        t.setDaemon(true);
-        t.start();
-        return true;
+            if (roots.isEmpty()) return;
+
+            int indexCount = idx.countRowsUnderRoots(roots);
+            if (indexCount < 0) return;  // index unavailable — skip, don't compare against 0
+
+            if (diskNames.size() != indexCount) {
+                idx.requestReconcile("read-drift (disk=" + diskNames.size()
+                        + ", indexed=" + indexCount + ")");
+            }
+        } catch (Throwable t) {
+            // Best-effort background check — never let it surface to a request.
+        }
     }
 
     /**
@@ -876,6 +1041,7 @@ public class RecordingsApiHandler {
         // Indexed GROUP BY query — replaces the prior in-memory bucket
         // walk over the full filtered set. Same response shape, ~10-100x
         // faster on a 1000-clip library.
+        if (sendIndexUnavailable(out, "places")) return;
         RecordingsIndex.Filter f = buildFilter(typeFilter, dateFilter,
                 classFilter, severityFilter, proximityFilter,
                 /* placeFilter */ null, placeContainsFilter, countryFilter, storageFilter);
@@ -901,6 +1067,60 @@ public class RecordingsApiHandler {
     /** Cap mirrored across native + web. */
     private static final int PLACES_LIMIT = 8;
 
+    /**
+     * Emit a 503 {@code indexUnavailable} response when the recordings index
+     * is down, and report whether the caller should stop.
+     *
+     * <p>Every index-backed endpoint must go through this. When H2 closes the
+     * store underneath the daemon, the query methods return empty
+     * lists/zeroed aggregates — indistinguishable from a genuinely empty
+     * library. Reporting that as {@code success:true} is what made the field
+     * failure invisible: events.html rendered "no recordings" and the native
+     * header rendered "0 clips" while the clips sat on disk, and the native
+     * client's direct-FS fallback (which triggers on a null payload) was
+     * skipped because the payload looked valid.
+     *
+     * @return true when the error response was sent and the caller must return.
+     */
+    private static boolean sendIndexUnavailable(OutputStream out, String surface)
+            throws Exception {
+        return sendIndexUnavailable(out, surface, 1, 0);
+    }
+
+    private static boolean sendIndexUnavailable(OutputStream out, String surface,
+                                                int page, int pageSize) throws Exception {
+        // Tri-state check (see RecordingsIndex.isUnavailableForClients):
+        // reports true only when an empty answer would be a lie — the index
+        // was up and died, or init() permanently failed. A cold boot (HTTP
+        // server accepts requests before the index init thread runs) falls
+        // through to the normal warming / repair-on-read response, because
+        // 503-ing there would blank the storage card, calendar and place chips
+        // on the first page load after every boot.
+        if (!RecordingsIndex.getInstance().isUnavailableForClients()) return false;
+        JSONObject err = new JSONObject();
+        err.put("success", false);
+        err.put("indexUnavailable", true);
+        err.put("error", Messages.get("errors.recordings_index_unavailable"));
+        err.put("retryAfterMs", 5000);
+        // Preserve each surface's collection key so a client that reads only
+        // the payload field degrades to "empty" rather than throwing on a
+        // missing key. success=false is the authoritative signal.
+        if ("places".equals(surface)) {
+            err.put("places", new JSONArray());
+            err.put("totalDistinct", 0);
+        } else if ("dates".equals(surface)) {
+            err.put("dates", new JSONArray());
+        } else if ("recordings".equals(surface)) {
+            err.put("recordings", new JSONArray());
+            err.put("totalCount", 0);
+            err.put("totalPages", 1);
+            err.put("page", page);
+            err.put("pageSize", pageSize);
+        }
+        HttpResponse.sendJson(out, 503, err.toString());
+        return true;
+    }
+
     
     
 
@@ -913,6 +1133,7 @@ public class RecordingsApiHandler {
         // Indexed GROUP BY ymd — single SQL pass. Replaces the prior
         // multi-dir walk that re-stat'd every file across active +
         // mirror + legacy paths.
+        if (sendIndexUnavailable(out, "dates")) return;
         List<RecordingsIndex.DateBucket> buckets =
                 RecordingsIndex.getInstance().queryDates();
 
@@ -945,6 +1166,11 @@ public class RecordingsApiHandler {
      * (totalBytes alias, structured per-type sub-objects).
      */
     private static void getStorageStats(OutputStream out) throws Exception {
+        // Index down: emitting all-zero counters here would be reported as
+        // authoritative ("0 clips, 0 B") by both the web storage card and the
+        // native header — and the native client's direct-FS fallback ladder
+        // only engages when fetchStats() returns null. Fail loudly instead.
+        if (sendIndexUnavailable(out, "stats")) return;
         StorageManager storage = StorageManager.getInstance();
         RecordingsIndex.Stats s = RecordingsIndex.getInstance().queryStats();
 
@@ -991,11 +1217,13 @@ public class RecordingsApiHandler {
         response.put("surveillanceLimitMb", surLimitMb);
         response.put("recordingsLimitBytes", recLimitMb * 1024L * 1024L);
         response.put("surveillanceLimitBytes", surLimitMb * 1024L * 1024L);
-        // Replays live in the recordings dirs and are reaped under the same
-        // 'recordings' category as cam_*/dvr_* (StorageManager auxiliary
-        // prefixes), so they count toward the recordings limit here too.
+        // Replays AND proximity events live under the same 'recordings' category as
+        // cam_*/dvr_* (StorageManager auxiliary prefixes), so all three count toward
+        // the recordings limit here. Omitting proximity understated the bar while the
+        // reaper measured it — the card read "in cap" as dashcam clips were deleted.
         response.put("recordingsUsagePercent",
-                recLimitMb > 0 ? Math.round((s.normalBytes + s.replayBytes) * 100.0
+                recLimitMb > 0 ? Math.round(
+                        (s.normalBytes + s.replayBytes + s.proximityBytes) * 100.0
                         / (recLimitMb * 1024L * 1024L)) : 0);
         response.put("surveillanceUsagePercent",
                 surLimitMb > 0 ? Math.round(s.sentryBytes * 100.0 / (surLimitMb * 1024L * 1024L)) : 0);
@@ -1020,6 +1248,12 @@ public class RecordingsApiHandler {
             warm.put("total", snap.total);
             response.put("indexState", warm);
         }
+        // Field diagnostics: nonzero means H2 closed the store under the
+        // daemon at least once and it was re-opened. Cheap to surface and it
+        // is the signal that would have made the original "recordings missing
+        // from events.html" report diagnosable without a full log pull.
+        int reconnects = RecordingsIndex.getInstance().reconnectCount();
+        if (reconnects > 0) response.put("indexReconnects", reconnects);
 
         HttpResponse.sendJson(out, response.toString());
     }
@@ -1044,8 +1278,12 @@ public class RecordingsApiHandler {
      * re-streaming from the daemon. Cache headers are added in
      * HttpResponse.sendVideo / sendVideoRange.
      */
-    private static void streamVideo(OutputStream out, String filename, String rangeHeader,
-                                    String ifNoneMatchHeader) throws Exception {
+    private static void streamVideo(
+            OutputStream out,
+            String filename,
+            String requestedPath,
+            String rangeHeader,
+            String ifNoneMatchHeader) throws Exception {
         // Security: prevent path traversal
         if (filename.contains("..") || filename.contains("/")) {
             HttpResponse.sendError(out, 400, Messages.get("errors.recordings_invalid_filename"));
@@ -1053,7 +1291,7 @@ public class RecordingsApiHandler {
         }
 
         // Use shared findVideoFile which checks ALL storage locations
-        File file = findVideoFile(filename);
+        File file = findVideoFile(filename, requestedPath, false);
 
         if (file == null) {
             HttpResponse.sendError(out, 404, Messages.get("errors.recordings_not_found_with_filename", filename));
@@ -1124,7 +1362,10 @@ public class RecordingsApiHandler {
     /**
      * Delete a recording.
      */
-    private static void deleteRecording(OutputStream out, String filename) throws Exception {
+    private static void deleteRecording(
+            OutputStream out,
+            String filename,
+            String requestedPath) throws Exception {
         // Security: prevent path traversal
         if (filename.contains("..") || filename.contains("/")) {
             HttpResponse.sendJsonError(out, Messages.get("errors.recordings_invalid_filename"));
@@ -1132,7 +1373,7 @@ public class RecordingsApiHandler {
         }
         
         // Use shared findVideoFile which checks ALL storage locations
-        File file = findVideoFile(filename);
+        File file = findVideoFile(filename, requestedPath, false);
         
         if (file == null) {
             HttpResponse.sendJsonError(out, Messages.get("errors.recordings_not_found"));
@@ -1170,76 +1411,105 @@ public class RecordingsApiHandler {
      */
     public static void deleteEventSidecars(File mp4File, String filename) {
         if (mp4File == null || filename == null) return;
+        // deleteSidecars covers .json/.srt/.jpg/per-actor thumbs AND ends by
+        // invalidating the storage size/count cache. The separate .srt block that
+        // used to live here was redundant (deleteSidecars deletes the same path)
+        // and, once the invalidation moved into deleteSidecars, it also ran too
+        // late to be counted — so it is gone rather than reordered.
         deleteSidecars(mp4File, filename);
-        // .srt parity (deleteSidecars only handles .json/.jpg).
-        try {
-            File parent = mp4File.getParentFile();
-            if (parent != null) {
-                String base = filename.endsWith(".mp4")
-                        ? filename.substring(0, filename.length() - 4) : filename;
-                File srt = new File(parent, base + ".srt");
-                if (srt.exists()) srt.delete();
-            }
-        } catch (Throwable ignored) {}
     }
 
     private static void deleteSidecars(File mp4File, String filename) {
-        // Invalidate the in-memory parse cache so the next /api/recordings
-        // call doesn't return a phantom entry for the just-deleted file.
-        // Tearing down the inverted-index entry happens here too so a
-        // place chip pointing at this file's place key vanishes the
-        // moment the delete completes. Use the helper so the new
-        // (path|type) compound key is matched correctly.
+        // This helper is the single index-removal owner. It delegates to
+        // RecordingsIndex.remove(filename), so a second explicit remove here
+        // would repeat the synchronized DELETE and advance the tombstone
+        // sequence twice for every file deletion.
         invalidateRecordingCache(mp4File.getAbsolutePath());
 
-        // Drop the H2 row eagerly so a /api/recordings call immediately
-        // after delete can't return the just-deleted row. FileObserver
-        // would catch this too, but FUSE-mounted SD cards can drop the
-        // DELETE event.
-        try {
-            com.overdrive.app.server.RecordingsIndex.getInstance().remove(filename);
-        } catch (Throwable ignored) {
-            // RecordingsIndex may not be initialised yet; the
-            // FileObserver / reconcile path will catch up.
-        }
+        // Sidecar stem: strip a TRAILING ".mp4" only.
+        //
+        // These three used filename.replace(".mp4", "<ext>"), which is wrong in two
+        // ways and silently leaked sidecars: replace() rewrites EVERY occurrence,
+        // so "event_a.mp4_2.mp4" produced "event_a.json_2.json" instead of
+        // "event_a.mp4_2.json"; and for a name without a trailing ".mp4" it
+        // returned the name unchanged, so the code stat'ed the video path itself
+        // and never touched the real sidecar. SrtWriter/LocationSidecarWriter build
+        // these names by stripping at the LAST dot, so this now matches the writers.
+        String stem = filename.endsWith(".mp4")
+                ? filename.substring(0, filename.length() - ".mp4".length())
+                : filename;
+        File sidecarDir = mp4File.getParentFile();
 
         // JSON event timeline
-        String jsonName = filename.replace(".mp4", ".json");
-        File jsonFile = new File(mp4File.getParentFile(), jsonName);
+        File jsonFile = new File(sidecarDir, stem + ".json");
         if (jsonFile.exists()) jsonFile.delete();
 
         // SRT subtitle sidecar (parity — future callers shouldn't re-hit the gap).
-        String srtName = filename.replace(".mp4", ".srt");
-        File srtFile = new File(mp4File.getParentFile(), srtName);
+        File srtFile = new File(sidecarDir, stem + ".srt");
         if (srtFile.exists()) srtFile.delete();
 
         // Cached thumbnail
-        String thumbName = filename.replace(".mp4", ".jpg");
-        File thumbFile = new File(getThumbnailCacheDir(), thumbName);
+        File thumbFile = new File(getThumbnailCacheDir(), stem + ".jpg");
         if (thumbFile.exists()) thumbFile.delete();
 
-        // v3 hero JPEG sibling: <base>.jpg next to the mp4
+        // v3 hero JPEG sibling: <base>.jpg next to the mp4.
+        //
+        // This used to `return` when the parent wasn't readable, which skipped the
+        // cache invalidation at the tail — even though the .mp4/.json/.srt are
+        // already deleted by this point, so their bytes stayed in the reported
+        // size. The bail is reachable in practice: it is exactly the FUSE-mounted
+        // SD/USB case under daemon UID 2000 that the per-actor lister below exists
+        // to work around. Scoped as an if-block so the tail always runs.
         File parent = mp4File.getParentFile();
-        if (parent == null || !parent.canRead()) return;
-        String base = filename.endsWith(".mp4")
-                ? filename.substring(0, filename.length() - 4)
-                : filename;
-        File heroSibling = new File(parent, base + ".jpg");
-        if (heroSibling.exists()) heroSibling.delete();
+        if (parent != null && parent.canRead()) {
+            String base = filename.endsWith(".mp4")
+                    ? filename.substring(0, filename.length() - 4)
+                    : filename;
+            File heroSibling = new File(parent, base + ".jpg");
+            if (heroSibling.exists()) heroSibling.delete();
 
-        // Per-actor thumbs: thumb_<base>_a<id>(_<rel>).jpg
-        // Anchor with "_a" so a sibling segment named "<base>_2.mp4" with
-        // its own thumbs at "thumb_<base>_2_a*.jpg" is NOT swept when we
-        // delete <base>.mp4 — the underscore-after-_2_ is followed by 'a'
-        // for actor thumbs, but "_2_" itself is followed by an actor digit
-        // that the original prefix-only check would catch incorrectly.
-        final String perActorPrefix = "thumb_" + base + "_a";
-        // Route through StorageManager's FUSE-aware lister so SD-card +
-        // USB cleanup doesn't silently leak per-actor thumbs when
-        // listFiles() returns null on those FUSE mounts.
-        File[] perActor = StorageManager.getInstance()
-                .listFilesWithFallback(parent, perActorPrefix, ".jpg");
-        for (File f : perActor) f.delete();
+            // Per-actor thumbs: thumb_<base>_a<id>(_<rel>).jpg
+            // Anchor with "_a" so a sibling segment named "<base>_2.mp4" with
+            // its own thumbs at "thumb_<base>_2_a*.jpg" is NOT swept when we
+            // delete <base>.mp4 — the underscore-after-_2_ is followed by 'a'
+            // for actor thumbs, but "_2_" itself is followed by an actor digit
+            // that the original prefix-only check would catch incorrectly.
+            final String perActorPrefix = "thumb_" + base + "_a";
+            // Route through StorageManager's FUSE-aware lister so SD-card +
+            // USB cleanup doesn't silently leak per-actor thumbs when
+            // listFiles() returns null on those FUSE mounts.
+            File[] perActor = StorageManager.getInstance()
+                    .listFilesWithFallback(parent, perActorPrefix, ".jpg");
+            for (File f : perActor) f.delete();
+        }
+
+        // The mp4 + every sidecar counted toward the category's reported size is
+        // now gone. The storage card's size/count cache is served
+        // stale-while-revalidate, so without this the freed space isn't reflected
+        // until the TTL lapses — a user who just deleted clips would still see
+        // the old usage. Common tail of both deleteRecording and
+        // batchDeleteRecordings, so one call covers both. Category is derived
+        // from the filename prefix (event_* = surveillance, proximity_* =
+        // proximity, cam*/dvr_/replay_ = recordings); null would clear all
+        // categories, which is also correct but does more work than needed.
+        try {
+            StorageManager.getInstance()
+                    .invalidateCategorySizeCache(categoryForFilename(filename));
+        } catch (Throwable ignored) {
+            // Never let cache bookkeeping fail a delete that already succeeded.
+        }
+    }
+
+    /** Map a recording filename to the StorageManager category whose reported
+     *  size/count includes it. Returns null (= all categories) when unknown, so
+     *  an unrecognised name errs toward a correct-but-broader invalidation. */
+    private static String categoryForFilename(String filename) {
+        if (filename == null) return null;
+        if (filename.startsWith("event_")) return "surveillance";
+        if (filename.startsWith("proximity_")) return "proximity";
+        if (filename.startsWith("cam") || filename.startsWith("dvr_")
+                || filename.startsWith("replay_")) return "recordings";
+        return null;
     }
     
     /**
@@ -1327,7 +1597,10 @@ public class RecordingsApiHandler {
      * SOTA: Serve event timeline JSON for a recording.
      * Returns the JSON sidecar if it exists, or an empty events array for backward compatibility.
      */
-    private static void serveEventTimeline(OutputStream out, String filename) throws Exception {
+    private static void serveEventTimeline(
+            OutputStream out,
+            String filename,
+            String requestedPath) throws Exception {
         // Security: prevent path traversal
         if (filename.contains("..") || filename.contains("/")) {
             HttpResponse.sendError(out, 400, Messages.get("errors.recordings_invalid_filename"));
@@ -1338,7 +1611,15 @@ public class RecordingsApiHandler {
         String jsonFilename = filename.replace(".mp4", ".json");
         
         // Search for the JSON sidecar in all storage locations
-        File jsonFile = findJsonSidecar(jsonFilename);
+        File videoFile = requestedPath == null
+                ? null
+                : findRequestedMediaFile(filename, requestedPath, false);
+        File exactJson = videoFile == null
+                ? null
+                : new File(videoFile.getParentFile(), jsonFilename);
+        File jsonFile = exactJson != null && exactJson.exists()
+                ? exactJson
+                : (requestedPath == null ? findJsonSidecar(jsonFilename) : null);
         
         if (jsonFile != null && jsonFile.exists()) {
             // Serve the actual event data
@@ -1378,25 +1659,25 @@ public class RecordingsApiHandler {
      */
     private static File findJsonSidecar(String jsonFilename) {
         StorageManager sm = StorageManager.getInstance();
-        
+
         // Check all surveillance directories
         for (File dir : sm.getAllSurveillanceDirs()) {
             File f = new File(dir, jsonFilename);
             if (f.exists()) return f;
         }
-        
+
         // Check all recordings directories
         for (File dir : sm.getAllRecordingsDirs()) {
             File f = new File(dir, jsonFilename);
             if (f.exists()) return f;
         }
-        
+
         // Check all proximity directories
         for (File dir : sm.getAllProximityDirs()) {
             File f = new File(dir, jsonFilename);
             if (f.exists()) return f;
         }
-        
+
         return null;
     }
     

@@ -11,14 +11,12 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=3"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <script src="../shared/app-shell.js?v=5"></script>
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <link rel="stylesheet" href="../shared/leaflet.css" />
     <script src="../shared/leaflet.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jmuxer@2.0.4/dist/jmuxer.min.js"></script>
-    <script src="../shared/SotaPlayer.js"></script>
+    <script src="../shared/SotaPlayer.js?v=13"></script>
     <script src="../shared/Decoder.js"></script>
     <script src="../shared/YUVCanvas.js"></script>
     <script src="../shared/Player.js"></script>
@@ -51,8 +49,8 @@
                             <!-- Top Bar -->
                             <div class="camera-top-bar">
                                 <div class="top-bar-left">
-                                    <div class="connection-status" id="connectionStatus">
-                                        <span class="conn-dot"></span>
+                                    <div class="connection-status compact-status-pill" id="connectionStatus">
+                                        <span class="conn-dot compact-status-pill__dot"></span>
                                         <span class="status-text" data-i18n="pip.select_camera">Select Camera</span>
                                     </div>
                                     <div class="decoder-chip" id="decoderChip" style="display:none;">GPU</div>
@@ -195,6 +193,7 @@
                                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                             <path d="m15 18-6-6 6-6"/>
                                         </svg>
+                                        <span data-i18n="liveview.back_to_cameras">Back to cameras</span>
                                     </button>
                                 </div>
 
@@ -341,7 +340,6 @@
         .connection-status {
             display: inline-flex;
             align-items: center;
-            gap: 10px;
             padding: 8px 16px;
             background: var(--lv-pill-bg);
             backdrop-filter: blur(20px);
@@ -940,22 +938,29 @@
             margin-right: 8px;
         }
 
+        /* Labelled, not a bare icon: an unlabelled chevron pinned to the far
+           right edge reads as decoration, so the map looked like a dead end. */
         .location-close-button {
             display: none;
-            width: 44px;
+            flex: 0 0 auto;
             height: 44px;
+            padding: 0 16px 0 12px;
             align-items: center;
             justify-content: center;
-            border: 1px solid var(--lv-pill-border);
+            border: 1px solid var(--brand-primary);
             border-radius: 12px;
             background: var(--lv-pill-bg);
-            color: var(--text-primary);
+            color: var(--brand-primary);
+            font-size: 13px;
+            font-weight: 700;
+            white-space: nowrap;
             cursor: pointer;
         }
 
         .location-close-button svg {
-            width: 22px;
-            height: 22px;
+            width: 20px;
+            height: 20px;
+            margin-right: 6px;
         }
 
         /* Compact preview is deliberately passive: map controls and the
@@ -985,10 +990,31 @@
             padding: 12px 16px;
             border-bottom: 1px solid var(--border-subtle);
             background: var(--bg-surface);
+            /* The title block must be able to shrink/ellipsize: this is a nowrap
+               flex row, and with a long localized title (or a narrow 320px phone)
+               its intrinsic width exceeded the header, pushing "Back to cameras"
+               off-screen to the right — measured scrollWidth 459px in a 320px box,
+               button left edge at x=236. min-width:0 lets the title yield first so
+               the button always stays inside the viewport. */
+        }
+
+        /* Margin, NOT flex `gap`: gap on a flex container is Chrome 84+, and BYD's
+           in-app WebView is Chrome 58 (see the decoder notes further down), where it
+           would be ignored and the title would butt against the button. */
+        #panelCameras.map-expanded .location-close-button {
+            margin-left: 12px;
+        }
+
+        #panelCameras.map-expanded .location-card-header > div:first-child {
+            min-width: 0;
+            overflow: hidden;
         }
 
         #panelCameras.map-expanded .location-card-header h2 {
             font-size: 18px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         #panelCameras.map-expanded .location-close-button {
@@ -1077,15 +1103,27 @@
             #panelCameras .seamless-camera-view {
                 overflow-y: auto;
             }
+            /* The stage GROWS to absorb whatever the rail doesn't use, instead of
+               being pinned to 58%. Previously stage was `0 0 58%` and the rail
+               `0 0 auto` (~251px intrinsic), so on any viewport where those two
+               didn't happen to sum to 100% the remainder was left as dead space at
+               the bottom — measured 77px at 390x844 and 106px at 412x915. Keeping
+               a min-height preserves a usable video area on short screens; the
+               basis stays 58% so the initial proportions are unchanged where they
+               already added up. */
             #panelCameras .camera-stage {
-                flex: 0 0 58%;
-                min-height: 340px;
+                flex: 1 1 58%;
+                min-height: 300px;
             }
             #panelCameras .live-utility-rail {
-                flex: 0 0 auto;
+                /* Shrink-but-don't-grow: the rail keeps its intrinsic height and
+                   yields surplus to the stage, and can compress on short screens
+                   rather than overflowing (measured -88px at 320x568). */
+                flex: 0 1 auto;
                 flex-direction: row;
-                min-height: 220px;
+                min-height: 200px;
                 padding: 10px;
+                padding-bottom: calc(10px + var(--safe-bottom, 0px));
                 border-top: 1px solid var(--lv-pill-border-soft);
             }
             #panelCameras .camera-selector-card,
@@ -1102,8 +1140,20 @@
                 padding: 8px;
                 padding-bottom: 8px;
             }
+
+            /* Expanding the map floats .mobile-header (position:absolute, z-index:60)
+               over the panel so tiles paint to the top edge — see
+               body.live-map-active in styles.css. The expanded card's header, which
+               carries the ONLY "Back to cameras" control, sits at top:0 and was
+               therefore covered 100% by that floating header on every phone size:
+               the user had no way back except the sidebar. Start the card below the
+               header instead of under it. The header is display:none above 768px, so
+               this offset belongs in the mobile query only. */
+            #panelCameras.map-expanded .live-location-card {
+                top: var(--live-mobile-header-h, 65px);
+            }
         }
-        
+
         /* Mini preview position handled by .cameras-mode class */
 
         /* Landscape camera-first dashboard: video receives roughly 72% of
@@ -1141,11 +1191,11 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/stream.js?v=index1"></script>
+    <script src="../shared/stream.js?v=index3"></script>
     <script src="../shared/map.js?v=1"></script>
-    <script src="../shared/surveillance.js?v=index1"></script>
+    <script src="../shared/surveillance.js?v=survtoggle1"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');
@@ -1162,6 +1212,12 @@
                 if (!panel) return;
 
                 this.mapExpanded = expanded;
+                // Publish the header's MEASURED height before flipping the class:
+                // .mobile-header has no fixed height (it's content-sized, and grows
+                // with safe-area-inset-top in PWA/standalone), so the CSS offset that
+                // keeps "Back to cameras" clear of the floating header can't hardcode
+                // a number. Measured while the header is still in flow.
+                this.syncHeaderHeight();
                 panel.classList.toggle('map-expanded', expanded);
                 document.body.classList.toggle('live-map-active', expanded);
                 if (button) button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
@@ -1179,6 +1235,20 @@
             },
             toggleMap: function () {
                 this.setMapExpanded(!this.mapExpanded);
+            },
+            /** Mirror the mobile header's real height into --live-mobile-header-h.
+             *  No-op above 768px (the header is display:none there and the expanded
+             *  card correctly starts at the panel's top edge). */
+            syncHeaderHeight: function () {
+                try {
+                    var hdr = document.querySelector('.mobile-header');
+                    if (!hdr) return;
+                    var h = Math.round(hdr.getBoundingClientRect().height);
+                    // A floating (already-expanded) header still reports its height,
+                    // but 0 means display:none — desktop, where no offset applies.
+                    document.documentElement.style.setProperty(
+                        '--live-mobile-header-h', (h > 0 ? h : 0) + 'px');
+                } catch (e) { /* keep the CSS fallback */ }
             }
         };
 
@@ -1197,11 +1267,23 @@
         BYD.stream.currentViewMode = 0;
         
         BYD.stream.selectCamera = async function(mode) {
+            // Invalidate every older route response, including a DVR
+            // first-frame poll. A newer non-DVR click must always win.
+            const selectionToken = (this._viewSelectionToken || 0) + 1;
+            this._viewSelectionToken = selectionToken;
+            this._viewPollToken = (this._viewPollToken || 0) + 1;
+            const selectionIsCurrent = () => this._viewSelectionToken === selectionToken;
+
             // Capture the prior view mode + label BEFORE we mutate UI so the
-            // already-streaming branch can restore them on backend rejection.
-            const priorMode = this.currentViewMode;
+            // already-streaming branch can preserve them while the backend
+            // confirms the requested route.
+            const priorMode = this.confirmedViewMode >= 0
+                ? this.confirmedViewMode
+                : this.currentViewMode;
             const priorLabelEl0 = document.getElementById('currentCameraLabel');
             const priorLabelText = priorLabelEl0 ? priorLabelEl0.textContent : '';
+            const priorOverlayEl0 = document.getElementById('cameraLabelOverlay');
+            const priorOverlayDisplay = priorOverlayEl0 ? priorOverlayEl0.style.display : '';
 
             // Toggle behavior: if the same camera is tapped again, stop the
             // stream. The earlier guard only checked sotaPlayer (WebCodecs),
@@ -1214,7 +1296,9 @@
                 !!this.jmuxer || !!this.broadwayPlayer ||
                 (this.ws && this.ws.readyState === WebSocket.OPEN)
             );
-            if (this.currentViewMode === mode && (sotaLive || legacyLive)) {
+            const hadLiveStream = !!(sotaLive || legacyLive);
+            if (this.currentViewMode === mode
+                    && (sotaLive || legacyLive || this.streamStarted)) {
                 console.log("[Stream] Toggling off camera:", mode);
                 // Reuse the canonical stopStream path so all decoder branches
                 // (sota / jmuxer / broadway / ws) tear down cleanly. The
@@ -1222,6 +1306,10 @@
                 // when the active decoder wasn't WebCodecs.
                 this.stopStream();
                 this.currentViewMode = -1;
+                // Every selected view is persisted server-side. Queue the
+                // disable behind any in-flight route so a late response cannot
+                // resurrect this stopped stream on the next reconnect.
+                this._requestStreamDisable(this._viewSelectionToken).catch(() => {});
 
                 // Remove active state from hotspots
                 document.querySelectorAll('.cam-hotspot').forEach(el => el.classList.remove('active'));
@@ -1240,21 +1328,48 @@
                 return;
             }
             
-            // Update UI with animation
-            document.querySelectorAll('.cam-hotspot').forEach(el => {
-                el.classList.remove('active');
-                if (parseInt(el.dataset.cam) === mode) {
-                    el.classList.add('active');
-                }
-            });
-            
-            // Update camera label. Reuse existing pip.title_* keys (these
-            // labels are conceptually identical to the PiP camera titles).
             const camKeys = {0: 'pip.title_all_cameras', 1: 'pip.title_front_camera', 2: 'pip.title_right_camera', 3: 'pip.title_rear_camera', 4: 'pip.title_left_camera', 6: 'pip.title_oem_dashcam'};
             const labelEl = document.getElementById('currentCameraLabel');
             const overlayEl = document.getElementById('cameraLabelOverlay');
-            if (labelEl) labelEl.textContent = camKeys[mode] ? BYD.i18n.t(camKeys[mode]) : BYD.i18n.t('pip.default_camera');
-            if (overlayEl) overlayEl.style.display = 'block';
+
+            // Keep the confirmed label and hotspot visible while a DVR route
+            // waits for its first frame. Committing these optimistically made
+            // AVM frames look like a mislabeled DVR feed.
+            const commitSelectionUi = (selectedMode) => {
+                document.querySelectorAll('.cam-hotspot').forEach(el => {
+                    el.classList.toggle('active', parseInt(el.dataset.cam) === selectedMode);
+                });
+                if (labelEl) {
+                    labelEl.textContent = camKeys[selectedMode]
+                        ? BYD.i18n.t(camKeys[selectedMode])
+                        : BYD.i18n.t('pip.default_camera');
+                }
+                if (overlayEl) overlayEl.style.display = 'block';
+            };
+            const restorePriorUi = () => {
+                document.querySelectorAll('.cam-hotspot').forEach(el => {
+                    el.classList.toggle('active', parseInt(el.dataset.cam) === priorMode);
+                });
+                if (labelEl) labelEl.textContent = priorLabelText;
+                if (overlayEl) overlayEl.style.display = priorOverlayDisplay;
+            };
+            const restorePriorRoute = () => {
+                if (!selectionIsCurrent()) return;
+                if (hadLiveStream && priorMode >= 0) {
+                    this._requestViewRoute(priorMode, selectionToken).catch(() => {});
+                } else {
+                    this._requestStreamDisable(selectionToken).catch(() => {});
+                }
+            };
+            const reassertLatestRoute = () => {
+                const latestMode = this.currentViewMode;
+                if (latestMode >= 0) {
+                    this._requestViewRoute(
+                        latestMode, this._viewSelectionToken).catch(() => {});
+                } else {
+                    this._requestStreamDisable(this._viewSelectionToken).catch(() => {});
+                }
+            };
             
             this.currentViewMode = mode;
 
@@ -1266,15 +1381,22 @@
             // arriving from the previous source.
             const applyView = async (m) => {
                 try {
-                    let r = await fetch('/api/stream/view/' + m);
-                    let d = await r.json();
+                    if (!selectionIsCurrent()) {
+                        reassertLatestRoute();
+                        return { cancelled: true };
+                    }
+                    let d = await BYD.stream._requestViewRoute(m, selectionToken);
+                    if (!selectionIsCurrent()) {
+                        reassertLatestRoute();
+                        return { cancelled: true };
+                    }
                     if (d && d.success === false && d.starting) {
-                        d = await BYD.stream._pollViewUntilSettled(m, d);
+                        d = await BYD.stream._pollViewUntilSettled(m, d, selectionToken);
                     }
                     // Cancelled by a newer click — treat as success-ish
                     // (don't toast an error, don't revert the UI). The
                     // newer click is responsible for its own UI state.
-                    if (d && d.cancelled) return true;
+                    if (d && d.cancelled) return d;
                     if (d && d.success === false) {
                         if (BYD.utils && BYD.utils.toast) {
                             const fallback = d.exhausted
@@ -1285,7 +1407,16 @@
                         return false;
                     }
                     return true;
-                } catch (e) { return true; }   // network errors fall through
+                } catch (e) {
+                    if (!selectionIsCurrent()) {
+                        reassertLatestRoute();
+                        return { cancelled: true };
+                    }
+                    if (BYD.utils && BYD.utils.toast) {
+                        BYD.utils.toast(BYD.i18n.t('stream.view_unavailable'), 'error');
+                    }
+                    return false;
+                }
             };
 
             // If already streaming, just switch the view mode. Restore prior
@@ -1294,16 +1425,20 @@
             // exact UX glitch the Round 3 audit flagged.
             if (sotaLive || legacyLive) {
                 console.log("[Stream] Switching view to:", mode);
+                const switchGen = this._startGeneration;
                 const ok = await applyView(mode);
-                if (!ok) {
-                    document.querySelectorAll('.cam-hotspot').forEach(el => el.classList.remove('active'));
-                    if (priorMode >= 0) {
-                        const priorHotspot = document.querySelector('.cam-hotspot[data-cam="' + priorMode + '"]');
-                        if (priorHotspot) priorHotspot.classList.add('active');
-                    }
+                // A stopStream() landed mid-switch (backgrounded / toggled off):
+                // don't touch UI or confirmedViewMode for a stream that's gone.
+                if (this._startGeneration !== switchGen) return;
+                if (!selectionIsCurrent() || (ok && ok.cancelled)) return;
+                if (ok === false) {
+                    restorePriorRoute();
                     this.currentViewMode = priorMode;
-                    if (labelEl) labelEl.textContent = priorLabelText;
+                    this.confirmedViewMode = priorMode;
+                    restorePriorUi();
                 } else {
+                    this.confirmedViewMode = mode;
+                    commitSelectionUi(mode);
                     // The BYD WebView fallback reuses its open WebSocket, so
                     // switching cameras does not emit another onopen event.
                     // Mark this transition pending; the first frame from the
@@ -1313,37 +1448,68 @@
                 return;
             }
 
-            await this.startSeamlessStream();
+            const started = await this.startSeamlessStream(selectionToken);
+            if (started && selectionIsCurrent()) {
+                commitSelectionUi(mode);
+            } else if (!started && selectionIsCurrent()) {
+                restorePriorRoute();
+            }
         };
         
-        BYD.stream.startSeamlessStream = async function() {
+        BYD.stream.startSeamlessStream = async function(selectionToken) {
+            // A stopStream() during any await below (backgrounding, toggle-off)
+            // supersedes this run; without the check it would still enable
+            // streaming and build a decoder after the teardown.
+            const gen = ++this._startGeneration;
+            const superseded = () => this._startGeneration !== gen;
+            const selectionIsCurrent = () => selectionToken === undefined
+                || this._viewSelectionToken === selectionToken;
+            const reassertLatestRoute = () => {
+                const latestMode = this.currentViewMode;
+                if (latestMode >= 0) {
+                    this._requestViewRoute(
+                        latestMode, this._viewSelectionToken).catch(() => {});
+                } else {
+                    this._requestStreamDisable(this._viewSelectionToken).catch(() => {});
+                }
+            };
             this.streamStarted = true;
-            
+
             // Hide idle state
             const idleState = document.getElementById('videoIdleState');
             if (idleState) idleState.classList.add('hidden');
-            
+
             this.markStreamConnecting();
-            
+
             // 1. Set quality
             var _qSel = document.getElementById('qualitySelector');
             const quality = (_qSel && _qSel.value) || 'LOW';
             try { await fetch('/api/stream/quality/' + quality, { method: 'POST' }); } catch(e) {}
-            
+            if (superseded() || !selectionIsCurrent()) return false;
+
             // 2. Set view mode BEFORE enabling streaming. Bail if the
             // backend rejects the mode — otherwise WS connects to the
             // default sink and the UI shows a stale label over different
             // frames.
             if (this.currentViewMode >= 0) {
                 try {
-                    let r = await fetch('/api/stream/view/' + this.currentViewMode);
-                    let d = await r.json();
+                    let d = await BYD.stream._requestViewRoute(
+                        this.currentViewMode, selectionToken);
+                    if (!selectionIsCurrent()) {
+                        reassertLatestRoute();
+                        return false;
+                    }
                     if (d && d.success === false && d.starting) {
-                        d = await BYD.stream._pollViewUntilSettled(this.currentViewMode, d);
+                        d = await BYD.stream._pollViewUntilSettled(
+                            this.currentViewMode, d, selectionToken);
+                    }
+                    if (superseded() || !selectionIsCurrent()) {
+                        if (!selectionIsCurrent()) reassertLatestRoute();
+                        return false;
                     }
                     // Cancelled by a newer click; let the newer click own
                     // the UI state. Don't bail out as if an error happened.
-                    if (d && d.cancelled) return;
+                    if (d && d.cancelled) return false;
                     if (d && d.success === false) {
                         if (BYD.utils && BYD.utils.toast) {
                             const fallback = d.exhausted
@@ -1353,23 +1519,41 @@
                         }
                         document.querySelectorAll('.cam-hotspot').forEach(el => el.classList.remove('active'));
                         this.currentViewMode = -1;
+                        this.confirmedViewMode = -1;
                         this.streamStarted = false;
                         const idleState = document.getElementById('videoIdleState');
                         if (idleState) idleState.classList.remove('hidden');
                         this.updateConnectionStatus('idle');
-                        return;
+                        return false;
                     }
+                    this.confirmedViewMode = this.currentViewMode;
                     console.log("[Stream] View mode set to:", this.currentViewMode);
-                } catch(e) {}
+                } catch(e) {
+                    if (superseded() || !selectionIsCurrent()) {
+                        if (!selectionIsCurrent()) reassertLatestRoute();
+                        return false;
+                    }
+                    if (BYD.utils && BYD.utils.toast) {
+                        BYD.utils.toast(BYD.i18n.t('stream.view_unavailable'), 'error');
+                    }
+                    this.currentViewMode = -1;
+                    this.confirmedViewMode = -1;
+                    this.streamStarted = false;
+                    if (idleState) idleState.classList.remove('hidden');
+                    this.updateConnectionStatus('idle');
+                    return false;
+                }
             }
             
             // 3. Enable Streaming on Backend
             const enabled = await this.enableStreaming();
+            if (superseded() || !selectionIsCurrent()) return false;
             if (!enabled) {
                 if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('liveview.enable_failed'), 'error');
-                return;
+                this.streamStarted = false;
+                return false;
             }
-            
+
             // 4. Initialize SOTA Player (WebCodecs)
             if ('VideoDecoder' in window && typeof SotaPlayer !== 'undefined') {
                 console.log("[Stream] Initializing SOTA Player (WebCodecs)...");
@@ -1421,6 +1605,23 @@
                 };
                 this.sotaPlayer.onDisconnected = () => this.markStreamConnecting();
                 this.sotaPlayer.onFrame = (count) => this.noteFrameReceived(count);
+                // Unrecoverable WebCodecs failure → switch decoders. This page
+                // wires its own player, so without this hook the shared
+                // fallback in stream.js never ran and the canvas stayed black
+                // on phones whose decoder rejects the stream's profile.
+                this.sotaPlayer.onError = () => {
+                    if (BYD.utils && BYD.utils.toast) {
+                        BYD.utils.toast(BYD.i18n.t('liveview.decoder_fallback'), 'warning');
+                    }
+                    const chip = document.getElementById('decoderChip');
+                    if (chip) {
+                        chip.textContent = 'Fallback';
+                        chip.style.background = 'rgba(251, 191, 36, 0.15)';
+                        chip.style.borderColor = 'rgba(251, 191, 36, 0.3)';
+                        chip.style.color = '#fbbf24';
+                    }
+                    this.fallbackFromWebCodecs();
+                };
                 this.sotaPlayer.start();
                 
             } else {
@@ -1429,8 +1630,10 @@
                 const decoderReady = await this.initDecoder();
                 if (!decoderReady) {
                     if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Decoder init failed', 'error');
-                    return;
+                    this.streamStarted = false;
+                    return false;
                 }
+                if (superseded() || !selectionIsCurrent()) return false;
                 
                 const chip = document.getElementById('decoderChip');
                 if (chip) {
@@ -1459,6 +1662,7 @@
                 
                 this.connectWebSocket();
             }
+            return true;
         };
         
         BYD.stream.updateConnectionStatus = function(status) {
@@ -1472,6 +1676,8 @@
             } else if (status === 'connecting') {
                 el.classList.add('connecting');
                 if (textEl) textEl.textContent = BYD.i18n.t('pip.connecting');
+            } else if (status === 'disconnected') {
+                if (textEl) textEl.textContent = BYD.i18n.t('stream.disconnected');
             } else {
                 if (textEl) textEl.textContent = BYD.i18n.t('pip.select_camera');
             }
@@ -1716,13 +1922,10 @@
                         topGuard = c.bottom + BREATH;
                     }
                 }
-                // Bottom: car-selector-bottom only exists on the camera tab.
-                // On the map tab use the .map-info-bar if present, else the
-                // safe-bottom inset.
+                // Bottom: car-selector-bottom only exists on the camera panel;
+                // otherwise fall back to the safe-bottom inset.
                 var bottomGuard = MARGIN;
-                var carSel = obstructionRect('.tab-panel.active .car-selector-bottom');
-                var infoBar = obstructionRect('.tab-panel.active .map-info-bar');
-                var obstr = carSel || infoBar;
+                var obstr = obstructionRect('.tab-panel.active .car-selector-bottom');
                 if (obstr && obstr.top > 0 && obstr.top < railH) {
                     // Distance from rail bottom up to the top edge of the
                     // obstruction. Only honour rects that are actually
@@ -1989,6 +2192,18 @@
                 } catch (e) {}
             });
         })();
+
+        // Keep --live-mobile-header-h honest across rotation and viewport changes:
+        // the offset that holds "Back to cameras" clear of the floating header is a
+        // measured value, and rotating while the map is already expanded would
+        // otherwise leave the portrait height applied in landscape (where the header
+        // is display:none and the offset must collapse to 0).
+        window.addEventListener('resize', function () {
+            if (BYD.liveLayout) BYD.liveLayout.syncHeaderHeight();
+        });
+        // Also measure once at startup so the very first expand is correct even if
+        // the header's height differs from the CSS fallback (safe-area insets).
+        if (BYD.liveLayout) BYD.liveLayout.syncHeaderHeight();
 
         document.addEventListener('fullscreenchange', () => {
             if (!document.fullscreenElement && BYD.stream.isFullscreen) {

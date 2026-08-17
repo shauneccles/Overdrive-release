@@ -126,8 +126,15 @@ public class GpuSurveillancePipeline {
     // HAL) + the blindspot.debugPreview flag on a ~250ms loop while the lane is
     // enabled, and shows/hides + side-switches the SurfaceControl layer. Replaces
     // the deleted app-process BlindSpotOverlayService tick (no app process needed).
-    private java.util.concurrent.ScheduledExecutorService bsTurnExec;
+    // Volatile: isBsGateAllowed()/getBsGateReason() read it from the HTTP thread to
+    // report "no gate evaluation is running" without racing start/stopBsTurnLoop.
+    private volatile java.util.concurrent.ScheduledExecutorService bsTurnExec;
     private long bsLastTurnOnMs = 0L;
+    // Last tick the turn LAMP was observed lit — tracks the physical signal session
+    // independently of whether the card was actually displayed. bsLastTurnOnMs freezes
+    // while the conditional gate suppresses the card, so it cannot distinguish a blink
+    // off-phase from a real stalk release; this can.
+    private long bsLastLampOnMs = 0L;
     // Defense-in-depth latch for the map-leak fix: a turn-signal projection open is
     // a SESSION (the signal goes on, blinks, goes off). On the LEADING edge of such a
     // session — and only when no sustained map legitimately holds the projection — we
@@ -136,8 +143,27 @@ public class GpuSurveillancePipeline {
     // was ever missed. Latched so we issue the (full-JSON) UCM write ONCE per session,
     // not every 250ms tick. Reset when the signal clears.
     private boolean bsDismissedOrphanMap = false;
+    // User dismissed the card via the floating ✕ (StatusOverlayService). Scoped to the
+    // CURRENT display session only: cleared the moment the signal session genuinely ends
+    // (same !signalOn + debounce test bsDismissedOrphanMap re-arms on) so the next turn
+    // signal always shows the card again. A blind-spot dismiss must never be sticky —
+    // this is a safety view, and the feature stays armed (blindspot.enabled untouched).
+    // Volatile: written from the HTTP thread (dismissBlindSpotCard), read on the 250ms
+    // turn tick.
+    private volatile boolean bsUserDismissed = false;
     private static final long BS_TURN_POLL_MS = 250L;
     private static final long BS_OFF_DEBOUNCE_MS = 800L;  // ride through blink off-phase
+    // Last conditional-gate verdict (speed window / reverse), for /api/bs/status +
+    // the edge-logged transition. Starts ALLOW so an un-gated config reports open.
+    private volatile boolean bsGateAllowed = true;
+    private volatile String bsGateReason = "";
+    // Speed-bound slack applied only while the card is already shown, so a speed
+    // sitting exactly on a bound can't strobe the card (and, on cluster, the gauges).
+    private static final double BS_SPEED_HYST_KMH = 3.0;
+    // Floor for the HYSTERESIS-widened lower bound. Keeps it strictly above 0 so a
+    // stopped car (0 km/h) always falls below it — otherwise a min at or under the
+    // slack would widen to <= 0, which no reading can be under, pinning the card up.
+    private static final double BS_SPEED_MIN_EFFECTIVE_KMH = 0.5;
     private final java.util.concurrent.locks.ReentrantLock bsLifecycleLock =
         new java.util.concurrent.locks.ReentrantLock();
     private static final int BS_WIDTH = 1280;
@@ -157,7 +183,9 @@ public class GpuSurveillancePipeline {
     // concurrent enable (BS or camview) detect an in-flight build and bail instead
     // of double-allocating the scaler/layer.
     private volatile boolean camViewEnabling = false;
-    private volatile int camViewMode = 0;         // 0=all-4 mosaic,1=front,2=right,3=rear,4=left
+    // 0=all-4 mosaic,1=front,2=right,3=rear,4=left,7=rear+side L,8=rear+side R
+    // (7/8 are the blind-spot composite, sharing its calibration/merge/fisheye).
+    private volatile int camViewMode = 0;
     private volatile String camViewTarget = "head_unit";
     // Camera-view geometry (panel px), independent of the BS card's geometry so the
     // two programs can occupy different rects. Same atomic-rect discipline as bsGeomRect.
@@ -167,6 +195,13 @@ public class GpuSurveillancePipeline {
     // Auto-hide: elapsedRealtime deadline after which the camera view hides itself
     // (0 = stay until explicitly hidden). Set on show.
     private volatile long camViewHideAtMs = 0L;
+    // One-shot guard for the auto-hide dispatch. camViewHideAtMs is checked from TWO
+    // sites (bsTurnTick's pre-yield check and camViewTick's own), each doing a
+    // read-compare-zero that is not atomic on a volatile long — so both could observe the
+    // same expired deadline and spawn a disableCamView thread. Cleared when a new
+    // deadline is armed.
+    private final java.util.concurrent.atomic.AtomicBoolean camViewAutoHideFired =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
     // Which program the lane is CURRENTLY configured for (0=none,1=bs,2=camview), so
     // the arbiter reconfigures (viewMode/calibration/geometry/target) only on a real
     // transition, not every 250ms tick. -1 forces a reconfig on next arbitration.
@@ -175,7 +210,12 @@ public class GpuSurveillancePipeline {
 
     // Telemetry overlay
     private TelemetryDataCollector telemetryCollector;
+    // ACC-on (pano trip) overlay master. Preserves the legacy single-flag
+    // behavior for the driving flow; set from the "pano" resolver.
     private volatile boolean overlayEnabledConfig = false;
+    // ACC-off surveillance overlay master. Independent opt-in, defaults off, so
+    // sentry event clips are unchanged (no burn-in) until the user enables it.
+    private volatile boolean surveillanceOverlayEnabledConfig = false;
 
     // Config-change listener for live propagation of recording.rectifyStrength
     // edits. UI writes to UnifiedConfigManager; this listener picks up the
@@ -232,6 +272,16 @@ public class GpuSurveillancePipeline {
     // goes away the camera can drop back to the BS idle rate (or recording rate).
     // Set by RecordingModeManager; null otherwise.
     private volatile Runnable streamStateListener;
+
+    /** Max frame rate we declare to the LIVE-VIEW stream encoder on dilink4.
+     *
+     *  <p>Matches the OEM's own AVM panoramic request (10 fps,
+     *  {@code PanoCameraRecordService:530}); its publisher lane uses 8. That HAL
+     *  refuses {@code setCameraFps} outright and emits at its own fixed low rate,
+     *  so declaring more than it delivers just makes the encoder treat most ticks
+     *  as duplicates. Applies to the stream encoder's declared rate only —
+     *  resolution, bitrate and every legacy-vehicle path are unaffected. */
+    private static final int DILINK4_STREAM_FPS_CAP = 10;
 
     // Configuration
     private final int cameraWidth;
@@ -1427,6 +1477,66 @@ public class GpuSurveillancePipeline {
     }
 
     /**
+     * Push the camera layout, the DiLink 4 producer-corner/flip map, and the
+     * dilink4-only red-mask + APA inset onto the CURRENT {@link #recorder}.
+     *
+     * <p>Single source of truth, called from BOTH the init path and
+     * {@link #reinitializeEncoder()}. Reinit can allocate a brand-new
+     * {@code GpuMosaicRecorder}, whose {@code cameraLayout} defaults to 0 and
+     * whose producer-corner map is all zeros; before this was factored out, only
+     * init pushed them, so a codec/quality/fps change on a working DiLink 4 car
+     * silently reverted the recorder to legacy 4-strip geometry with every
+     * output quadrant sampling the producer's top-left corner.
+     *
+     * <p>Layout 3 = DiLink 4 (HAL emits a non-canonical 2x2; we rearrange via
+     * the per-role corner remap). Layout 0 = legacy 4-strip. Corner/flip values
+     * come from {@link com.overdrive.app.camera.Dilink4Constants} — the shared
+     * constant the recorder, stream scaler, blind-spot scaler, AI downscaler and
+     * motion cropper all read, so they can never silently disagree.
+     *
+     * <p>DiLink 4 layout is the only known-good arrangement for that HAL:
+     * Front=TL X-mirrored, Right=BR, Rear=TR, Left=BL, NO Y flip on any role.
+     * A previous comment here claimed rear/left were Y-flipped; that was wrong
+     * on device (front and right were the inverted tiles). Do not reintroduce Y
+     * bits without a device frame showing rear/left inverted.
+     */
+    private void applyRecorderDilink4Layout() {
+        GpuMosaicRecorder rec = recorder;
+        if (rec == null) return;
+        int layoutMode = camera != null ? camera.getCameraLayoutMode() : 0;
+        rec.setCameraLayout(layoutMode);
+        rec.setProducerLayout(
+            com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
+            com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
+            com.overdrive.app.camera.Dilink4Constants.CORNER_REAR,
+            com.overdrive.app.camera.Dilink4Constants.CORNER_LEFT,
+            com.overdrive.app.camera.Dilink4Constants.FLIP_FRONT,
+            com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
+            com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
+            com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
+        try {
+            org.json.JSONObject camCfg = com.overdrive.app.config
+                .UnifiedConfigManager.loadConfig().optJSONObject("camera");
+            if (camCfg != null && layoutMode == 3) {
+                // LAYOUT-GATED. The red-mask GLSL block sits OUTSIDE the
+                // `uApaMode > 2.5` branch chain in every shader, so unlike the
+                // corner/flip uniforms it is NOT structurally inert on legacy
+                // cars: pushing 1.0 would desaturate every red-dominant pixel
+                // (brake lights, red vehicles) in a LEGACY car's recordings.
+                // The flag is a dilink4-only remedy — its API handler, its UI
+                // label and its own comments all say so — so gate to match.
+                rec.setRedMaskEnabled(camCfg.optBoolean("dilink4RedMask", false));
+                // APA center inset — oem APACropFilter parity. Default
+                // 240/2560 = 0.09375 trims the chrome-painted seams on byd_apa.
+                rec.setApaCenterInset(
+                    (float) camCfg.optDouble("dilink4ApaCenterInset", 0.09375));
+            }
+        } catch (Throwable t) {
+            logger.warn("Failed to apply dilink4 red-mask/inset to recorder: " + t.getMessage());
+        }
+    }
+
+    /**
      * Reinitializes the encoder with current config settings.
      * This is a synchronous operation that waits for completion.
      *
@@ -1621,6 +1731,15 @@ public class GpuSurveillancePipeline {
                         // wedge-ticker grace-windowing keeps working post-
                         // encoder-reinit.
                         recorder.setSegmentRotatedListener(this::noteSegmentRotated);
+                        // FIX: a FRESH recorder starts with cameraLayout=0 and
+                        // an all-zero producer-corner map, because the DiLink 4
+                        // layout push lives only in the init path above. Without
+                        // re-applying it here, a codec/quality/fps change on a
+                        // WORKING DiLink 4 car silently reverts the recorder to
+                        // legacy 4-strip geometry — all four output quadrants
+                        // then sample the producer's top-left corner and the
+                        // recording is garbled until the next daemon restart.
+                        applyRecorderDilink4Layout();
                     }
                     recorder.init(camera.getEglCore(), encoder);
                     logger.info("Recorder reinitialized on GL thread");
@@ -1651,8 +1770,21 @@ public class GpuSurveillancePipeline {
             }
         }
         
-        // Update bitrate controller
+        // Update bitrate controller. Release the OLD one before replacing it:
+        // AdaptiveBitrateController holds a hard reference to the encoder it was
+        // constructed against, and its ramp animator calls encoder.setBitrate()
+        // from a callback. Dropping the reference without release() leaves a
+        // running animator driving the encoder we just tore down above — a
+        // use-after-release on the stale MediaCodec, not merely a leaked object.
+        // release() only cancels the animator (no encoder interaction), so it is
+        // safe to call unconditionally here. Mirrors the correct teardown at
+        // stop() and the start()-rollback path.
         if (bitrateController != null) {
+            try {
+                bitrateController.release();
+            } catch (Throwable t) {
+                logger.warn("Stale bitrateController release failed: " + t.getMessage());
+            }
             bitrateController = new AdaptiveBitrateController(encoder, bitrate);
         }
 
@@ -1857,10 +1989,31 @@ public class GpuSurveillancePipeline {
         downscaler = new GpuDownscaler(quadrantStripOffsetX);
         // Note: downscaler.init() will be called after EGL context is created by camera
 
-        // 4. Create surveillance engine (uses shared recorder)
+        // 4. Create surveillance engine (uses shared recorder).
+        //
+        // Release any PREVIOUS engine first. init() is re-entered from start()
+        // whenever !initialized, and stop() clears initialized in its finally —
+        // so every arm/disarm cycle lands here again. Normal teardown paths call
+        // sentry.disable() but never sentry.release() (release() is reachable only
+        // from the start()-failure rollback), so without this the outgoing engine's
+        // executor threads — aiExecutor, aiScheduler, segmentMetadata, mosaicJpeg,
+        // storageMaintenance — were abandoned still parked on their queues, one set
+        // per cycle until process death. They are daemon threads, which is why the
+        // leak stayed invisible. Mirrors the recorder guard above.
+        if (sentry != null) {
+            try {
+                sentry.release();
+            } catch (Throwable t) {
+                logger.warn("Previous sentry engine release failed: " + t.getMessage());
+            }
+            sentry = null;
+        }
         sentry = new SurveillanceEngineGpu();
         sentry.init(eventOutputDir, downscaler, assetManager, context);  // Pass Context for Java TFLite
         sentry.setRecorder(recorder);  // Share recorder with normal recording
+        // Drive the (opt-in, default-off) surveillance telemetry overlay for the
+        // exact span of each sentry event clip.
+        sentry.setEventOverlayHook(this::applySurveillanceOverlayForEvent);
         // Per-vehicle camera-tile height for the foveated FOV scaling math
         // in DistanceEstimator. Seal=960, Tang=720. Without this the
         // foveated path uses a Seal-specific 0.66 ratio and reads ~30%
@@ -1951,8 +2104,8 @@ public class GpuSurveillancePipeline {
             }
             camera.setCameraSurfaceMode(resolvedCamera.getPanoSurfaceMode());
             camera.setAutoProbeCameras(false);
-            // ESCO-PARITY: dilink4 trusts the HAL camera-id resolution
-            // unconditionally — esco's gl/C5920a static-init resolves the
+            // OEM-PARITY: dilink4 trusts the HAL camera-id resolution
+            // unconditionally — oem's gl/C5920a static-init resolves the
             // camera ID via BmmCameraInfo and never re-probes. Frame-50
             // black-pixel re-probe (PanoramicCameraGpu.java:2233-2251)
             // would call closeCameraForPath + recreateCameraSurface on
@@ -1964,7 +2117,7 @@ public class GpuSurveillancePipeline {
             } catch (Throwable ignored) {}
             camera.setSkipFrameValidation(dilink4Cam);
             if (dilink4Cam) {
-                logger.info("dilink4: skipping frame-50 auto-probe re-validation (esco-parity)");
+                logger.info("dilink4: skipping frame-50 auto-probe re-validation (oem-parity)");
             }
         }
 
@@ -1972,11 +2125,15 @@ public class GpuSurveillancePipeline {
         camera.setCameraProbeCallback((cameraId, surfaceMode) -> {
             logger.info("Probe found working camera: id=" + cameraId + ", surfaceMode=" + surfaceMode);
             try {
+                // OBSERVED dims, never the configured cameraWidth/Height —
+                // passing the configured pair made probedWidth/Height a
+                // self-confirming copy of the profile default, so a car whose
+                // HAL emits a different size could never be detected.
                 com.overdrive.app.camera.CameraConfigResolver.persistPanoramicProbe(
                     cameraId,
                     surfaceMode,
-                    cameraWidth,
-                    cameraHeight,
+                    camera.getObservedProducerWidth(),
+                    camera.getObservedProducerHeight(),
                     true,
                     false);
                 logger.info("Saved camera config for next launch");
@@ -1989,54 +2146,11 @@ public class GpuSurveillancePipeline {
             }, "PendingRecCheck").start();
         });
         
-        // esco-parity: when the camera is using the SurfaceTexture path, the
-        // BYD HAL emits its final framing into the producer surface directly
-        // Layout 3 = DiLink 4 (HAL emits 2x2 natively but in non-canonical
-        // arrangement; recorder/stream/cropper rearrange via per-role corner
-        // remap below). Layout 0 = legacy 4-strip → 2x2 rearrangement. The
-        // camera class returns 3 whenever cameraMode=dilink4 is selected
-        // (USE_ESCO_SURFACE_TEXTURE_PATH path), 0 for every other car.
-        int layoutMode = camera != null ? camera.getCameraLayoutMode() : 0;
         if (recorder != null) {
-            recorder.setCameraLayout(layoutMode);
-            // DiLink 4 layout is hardcoded to the only known-good arrangement
-            // for that HAL: Front=TL X-flipped, Rear=TR Y-flipped, Left=BL
-            // Y-flipped, Right=BR no flip. No user-tunable surface — every
-            // DiLink 4 trim seen so far emits this exact mosaic.
-            // Combined setter — single source of truth for the DiLink 4
-            // mosaic arrangement (Dilink4Constants). Recorder + stream
-            // scaler both reference this so they can never silently
-            // disagree.
-            recorder.setProducerLayout(
-                com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
-                com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
-                com.overdrive.app.camera.Dilink4Constants.CORNER_REAR,
-                com.overdrive.app.camera.Dilink4Constants.CORNER_LEFT,
-                com.overdrive.app.camera.Dilink4Constants.FLIP_FRONT,
-                com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
-                com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
-                com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
-            // Red-overlay mask (HAL 'calibration failed' chrome suppression).
-            // Off by default; user opts in when the car is uncalibrated and
-            // the chrome is in the way.
-            try {
-                org.json.JSONObject camCfg = com.overdrive.app.config
-                    .UnifiedConfigManager.loadConfig().optJSONObject("camera");
-                if (camCfg != null) {
-                    recorder.setRedMaskEnabled(
-                        camCfg.optBoolean("dilink4RedMask", false));
-                    // APA center inset — esco APACropFilter parity. Default
-                    // 240/2560 = 0.09375 trims the chrome-painted seams on
-                    // byd_apa firmware. Only applied when cameraLayout=3
-                    // because the inset uniform is gated by uApaMode>2.5.
-                    if (layoutMode == 3) {
-                        recorder.setApaCenterInset(
-                            (float) camCfg.optDouble("dilink4ApaCenterInset", 0.09375));
-                    }
-                }
-            } catch (Throwable t) {
-                logger.warn("Failed to read dilink4RedMask from config: " + t.getMessage());
-            }
+            // Camera layout + DiLink 4 producer-corner map + dilink4 red-mask /
+            // APA inset. Shared with reinitializeEncoder() so a fresh recorder
+            // can never come up with legacy geometry on a DiLink 4 car.
+            applyRecorderDilink4Layout();
             // Recording dewarp strength — shader gates on uApaMode==0, so
             // pushing a non-zero value on dilink4 is a no-op (safe).
             // We push regardless of layout so a layout flip later picks up
@@ -2062,7 +2176,18 @@ public class GpuSurveillancePipeline {
             }
         }
 
-        // 6. Create adaptive bitrate controller
+        // 6. Create adaptive bitrate controller. Defensive release of any
+        // pre-existing instance for the same reason as the reinit path above:
+        // a surviving animator would keep driving a prior encoder. Normally
+        // null here (stop() clears it), but a start() that follows a partial
+        // teardown can reach this with a stale controller still set.
+        if (bitrateController != null) {
+            try {
+                bitrateController.release();
+            } catch (Throwable t) {
+                logger.warn("Stale bitrateController release failed (init): " + t.getMessage());
+            }
+        }
         bitrateController = new AdaptiveBitrateController(encoder, 6_000_000);
 
         // Register a single config-change listener that pushes rectifyStrength
@@ -2204,6 +2329,13 @@ public class GpuSurveillancePipeline {
                     // which nulls the camera's local refs. The pipeline still holds the actual objects.
                     if (streamingEnabled && streamScaler != null && streamEncoder != null && camera != null) {
                         camera.setStreamingComponents(streamScaler, streamEncoder);
+                        camera.updateStreamFrameStride();
+                        // Re-arm the client-presence gate — a yield may have run
+                        // clearStreamingComponents() which reset it to fail-open.
+                        com.overdrive.app.streaming.WebSocketStreamServer wsRe = wsStreamServer;
+                        if (wsRe != null) {
+                            camera.setStreamClientProbe(wsRe::hasActiveClients);
+                        }
                         logger.info("Post-reacquire: streaming components restored");
                     }
                     
@@ -2212,6 +2344,21 @@ public class GpuSurveillancePipeline {
                         // Sentry mode — re-enable surveillance (it will start recording on motion)
                         if (sentry != null && !sentry.isActive()) {
                             sentry.enable();
+                        } else if (sentry != null) {
+                            // RESYNC (audit R7 ExtC-1): onPreYield stopped the
+                            // RECORDER only — the engine's active/recording
+                            // flags were untouched, so this !isActive() guard
+                            // skipped the restart while the engine still
+                            // believed it was recording. Continuous mode has
+                            // no tick loop and its start-retry chain died at
+                            // the first success, so nothing ever noticed:
+                            // zero video for the rest of the parked session
+                            // (reachable via any AVM camera claim or HAL
+                            // error restart, both of which use this listener
+                            // pair). The hook repairs the flag desync and
+                            // restarts the continuous recorder; a no-op for
+                            // smart mode, whose tick loop self-heals.
+                            sentry.resumeAfterCameraReacquire();
                         }
                         logger.info("Post-reacquire: surveillance mode restored");
                     } else if (currentMode == Mode.NORMAL_RECORDING || recordingMode) {
@@ -2297,7 +2444,7 @@ public class GpuSurveillancePipeline {
             });
             
             // Wait for camera to fully initialize and GL context to be ready.
-            // This isn't an esco-parity concern — the sleep gives MediaCodec
+            // This isn't an oem-parity concern — the sleep gives MediaCodec
             // time to consume the first encoder input frame so the
             // INFO_OUTPUT_FORMAT_CHANGED callback fires and the encoder format
             // is saved for reuse. Field log (camera_daemon_20260604_120145.log)
@@ -2335,8 +2482,11 @@ public class GpuSurveillancePipeline {
                     recorder.startRecording();
                     currentMode = Mode.NORMAL_RECORDING;
                     
-                    // Enable overlay for auto-started recording
+                    // Enable overlay for auto-started recording (pano flow).
+                    // Push the pano field selection (additive) then the ORIGINAL
+                    // polling mechanics — unchanged from before this feature.
                     recorder.setOverlayRecordingModeAllowed(true);
+                    pushOverlayFieldsForFlow("pano");
                     if (telemetryCollector != null && recorder.isOverlayEnabled()) {
                         telemetryCollector.setOverlayRecordingActive(true);
                         telemetryCollector.startPolling();
@@ -2914,6 +3064,7 @@ public class GpuSurveillancePipeline {
                     activeRecordingDir = outputDir;
                     activeRecordingPrefix = prefix;
                     snapRecorder.setOverlayRecordingModeAllowed(true);
+                    pushOverlayFieldsForFlow("pano");
                     if (telemetryCollector != null) {
                         telemetryCollector.setOverlayRecordingActive(true);
                         telemetryCollector.startPolling();
@@ -3058,6 +3209,7 @@ public class GpuSurveillancePipeline {
             activeRecordingDir = dir;
             activeRecordingPrefix = prefix;
             localRecorder.setOverlayRecordingModeAllowed(true);
+            pushOverlayFieldsForFlow("pano");
             if (telemetryCollector != null) {
                 telemetryCollector.setOverlayRecordingActive(true);
                 telemetryCollector.startPolling();
@@ -3201,6 +3353,7 @@ public class GpuSurveillancePipeline {
                             activeRecordingDir = outputDir;
                             activeRecordingPrefix = prefix;
                             snapRec.setOverlayRecordingModeAllowed(true);
+                            pushOverlayFieldsForFlow("pano");
                             if (telemetryCollector != null) {
                                 telemetryCollector.setOverlayRecordingActive(true);
                                 telemetryCollector.startPolling();
@@ -3339,6 +3492,7 @@ public class GpuSurveillancePipeline {
                             activeRecordingDir = outputDir;
                             activeRecordingPrefix = prefix;
                             snapRec.setOverlayRecordingModeAllowed(true);
+                            pushOverlayFieldsForFlow("pano");
                             if (telemetryCollector != null) {
                                 telemetryCollector.setOverlayRecordingActive(true);
                                 telemetryCollector.startPolling();
@@ -3715,8 +3869,25 @@ public class GpuSurveillancePipeline {
      */
     public void disableSurveillance() {
         if (sentry != null) {
-            sentry.disable();
+            // PUBLISH IDLE **BEFORE** THE ENGINE DISABLE (audit R14-2 /
+            // ExtF-2). sentry.disable() is a serialized state transition
+            // that can take multi-second worst case (drains + recording
+            // stop + encoder close). With IDLE published only AFTER it, a
+            // camera reacquire landing in that window read
+            // currentMode==SURVEILLANCE + !sentry.isActive(), queued
+            // enable() behind the engine's state-transition lock, RE-ARMED
+            // surveillance the moment our disable finished — and then this
+            // method's trailing IDLE write published a mode that
+            // contradicted the armed engine (engine armed, pipeline
+            // reporting idle: no frames routed, zombie session). Publishing
+            // the intent first means any reacquire during the teardown sees
+            // IDLE and routes to normal-mode handling; the engine-side
+            // monitor (R13-2) makes the disable itself atomic. If the
+            // disable somehow fails, IDLE still reflects the caller's
+            // intent — the engine's own guards keep a half-disabled session
+            // from recording.
             currentMode = Mode.IDLE;
+            sentry.disable();
             logger.info( "Surveillance mode disabled");
             // Back to IDLE → restore the dashcam layout profile so the next
             // normal/continuous recording uses the dashcam setting, not the
@@ -3800,7 +3971,7 @@ public class GpuSurveillancePipeline {
                 logger.warn("onAccOn: config.setRecordingMode(NORMAL) failed: " + t.getMessage());
             }
 
-            // ESCO-PARITY: dilink4 never closes the AVMCamera handle. esco's
+            // OEM-PARITY: dilink4 never closes the AVMCamera handle. oem's
             // PanoCameraRecord stays alive across ACC ON; the BYD native AVC app
             // attaches as a co-consumer of the AVM HAL daemon (gl/C5920a.java
             // observerSet) and shares the producer surface naturally.
@@ -3818,7 +3989,7 @@ public class GpuSurveillancePipeline {
                 camera.reopenCamera();
                 logger.info("ACC ON transition complete - all recordings finalized, camera reopened");
             } else if (dilink4) {
-                logger.info("ACC ON transition complete - dilink4 keeps camera alive (esco-parity, no reopen)");
+                logger.info("ACC ON transition complete - dilink4 keeps camera alive (oem-parity, no reopen)");
             } else {
                 logger.info("ACC ON transition complete - all recordings finalized");
             }
@@ -3934,12 +4105,45 @@ public class GpuSurveillancePipeline {
         // unbinding an OEM source that this fresh enable never bound.
         externalStreamSourceActive = false;
 
+        // On dilink4, cap the ENCODER's declared frame rate to what this HAL can
+        // actually deliver.
+        //
+        // The byd_apa AVM HAL emits at its own fixed low rate and cannot be
+        // retimed: setCameraFps returns false for every value we pass (1, 15, 25),
+        // and the OEM app (gl/a.java:402) and other OEM-derived players discard that return —
+        // false is simply normal here. The OEM's answer is to ASK LOW: its
+        // panoramic recorder requests 10 fps (PanoCameraRecordService:530) and its
+        // publisher 8 (qi/g.java:316), never the 15-30 our quality presets offer.
+        // With the request at or below delivery, the gap never manifests.
+        //
+        // We keep the user's preset for RESOLUTION and BITRATE — only the declared
+        // frame rate is clamped, because that is the number MediaCodec uses to
+        // budget bits and pace its rate control. Declaring 15 while receiving ~4.5
+        // makes it treat two of every three ticks as a duplicate.
+        //
+        // Legacy (ImageReader) vehicles are untouched: their HAL honours the
+        // requested rate, so the clamp is skipped entirely and streaming behaves
+        // byte-identically to before.
+        int effectiveStreamFps = streamFps;
+        try {
+            if (camera != null && camera.isUsingOemSurfaceTexturePath()
+                    && streamFps > DILINK4_STREAM_FPS_CAP) {
+                effectiveStreamFps = DILINK4_STREAM_FPS_CAP;
+                logger.info("dilink4: clamping stream encoder fps " + streamFps + " → "
+                    + effectiveStreamFps + " (this HAL refuses setCameraFps and emits"
+                    + " at its own low fixed rate; OEM asks 10 on this lane)."
+                    + " Resolution/bitrate keep the user's preset.");
+            }
+        } catch (Throwable t) {
+            logger.warn("dilink4 stream-fps clamp check failed: " + t.getMessage());
+        }
+
         logger.info(String.format("Enabling H.264 streaming: %dx%d @ %dfps, %d Mbps",
-                streamWidth, streamHeight, streamFps, streamBitrate / 1_000_000));
-        
+                streamWidth, streamHeight, effectiveStreamFps, streamBitrate / 1_000_000));
+
         // Create stream encoder
         logger.info("Creating stream encoder...");
-        streamEncoder = new HardwareEventRecorderGpu(streamWidth, streamHeight, streamFps, streamBitrate);
+        streamEncoder = new HardwareEventRecorderGpu(streamWidth, streamHeight, effectiveStreamFps, streamBitrate);
         streamEncoder.setUsePreRecordBuffer(false);  // Stream-only, no pre-record needed
         // Do NOT pin KEY_OPERATING_RATE on this SECONDARY encoder. The primary
         // recording encoder already pins it at fps to hold the Venus clock; if
@@ -3977,17 +4181,17 @@ public class GpuSurveillancePipeline {
             logger.warn("od init failed: " + t.getMessage());
         }
 
-        // Match the recorder's layout choice. esco-parity passthrough (3)
+        // Match the recorder's layout choice. oem-parity passthrough (3)
         // when SurfaceTexture path is active; legacy 4-cam mosaic (0)
         // otherwise.
-        boolean streamUsingEscoPath =
-            (camera != null && camera.isUsingEscoSurfaceTexturePath());
-        streamScaler.setCameraLayout(streamUsingEscoPath ? 3 : 0);
+        boolean streamUsingOemPath =
+            (camera != null && camera.isUsingOemSurfaceTexturePath());
+        streamScaler.setCameraLayout(streamUsingOemPath ? 3 : 0);
 
         // Hardcoded Variant A corner+flip constants on DiLink 4. Mirrors
         // GpuMosaicRecorder so live stream and recording stay aligned. On
         // legacy cars the uniforms are unused (uApaMode != 3 path).
-        if (streamUsingEscoPath) {
+        if (streamUsingOemPath) {
             // Single combined call referencing the shared Dilink4Constants
             // so the stream scaler can never silently diverge from the
             // recorder's mosaic arrangement.
@@ -4093,12 +4297,23 @@ public class GpuSurveillancePipeline {
         // Now set components on camera (scaler is guaranteed initialized)
         logger.info("Setting streaming components on camera...");
         camera.setStreamingComponents(streamScaler, streamEncoder);
-        
+        camera.updateStreamFrameStride();
+
         // Create WebSocket stream server (port 8887)
         // WebSocket has zero buffering delay vs HTTP Chunked (64KB+ buffer)
         logger.info("Starting WebSocket stream server...");
         wsStreamServer = new com.overdrive.app.streaming.WebSocketStreamServer();
-        
+
+        // Gate PASS 1B on live client presence: with no viewer on either the
+        // port-8887 or the /ws relay path, skip the stream raster + encode
+        // entirely (the encoded bytes would be dropped anyway). hasActiveClients
+        // counts both consumer paths; the camera re-requests an IDR on the
+        // rising edge so a reconnect within the 30s idle window is instantly
+        // decodable. Cleared to fail-open in clearStreamingComponents().
+        final com.overdrive.app.streaming.WebSocketStreamServer wsForProbe = wsStreamServer;
+        camera.setStreamClientProbe(wsForProbe::hasActiveClients);
+
+
         // Set idle shutdown callback - auto-stop pipeline when no clients for
         // WebSocketStreamServer.IDLE_TIMEOUT_MS (30 seconds; was mis-documented as 15s)
         final GpuSurveillancePipeline self = this;
@@ -4111,7 +4326,10 @@ public class GpuSurveillancePipeline {
                     @Override
                     public void run() {
                         try {
-                            self.disableStreaming();
+                            if (!self.disableStreamingIfIdle(wsForProbe)) {
+                                logger.info("WebSocket idle shutdown cancelled by a new client");
+                                return;
+                            }
                             // The WS pipe just went dark — view 6 is no longer
                             // a "keep warm" reason for OEM. Re-evaluate so OEM
                             // tears down if no recording mode is asking for it.
@@ -4168,8 +4386,8 @@ public class GpuSurveillancePipeline {
                             // tear the pipeline down out from under a deferred
                             // recording that hadn't yet landed.
                             boolean pendingRec = pendingRecordingPrefix != null;
-                            // ESCO-PARITY: dilink4 keeps the pipeline alive
-                            // unconditionally — esco's PanoCameraRecord is
+                            // OEM-PARITY: dilink4 keeps the pipeline alive
+                            // unconditionally — oem's PanoCameraRecord is
                             // started at boot and never stopped on stream-
                             // client idle. The auto-stop here is a legacy
                             // resource-saving optimisation that breaks the
@@ -4180,7 +4398,7 @@ public class GpuSurveillancePipeline {
                                     .isDilink4ModeActiveStatic();
                             } catch (Throwable ignored) {}
                             if (dilink4Persistent) {
-                                logger.info("Pipeline kept alive (dilink4 esco-parity — never auto-stop on WS idle)");
+                                logger.info("Pipeline kept alive (dilink4 oem-parity — never auto-stop on WS idle)");
                             } else if (mode == Mode.IDLE && !recordingActive && !pendingRec && !keepAlive && !sentryActive && running) {
                                 logger.info("No recording consumers active - stopping pipeline to save resources");
                                 self.stop();
@@ -4229,6 +4447,28 @@ public class GpuSurveillancePipeline {
         streamLifecycleLock.lock();
         try {
             disableStreamingLocked();
+        } finally {
+            streamLifecycleLock.unlock();
+        }
+    }
+
+    /**
+     * Disable the current stream only when the exact server that fired the
+     * idle callback is still current and still has no clients. A new /ws
+     * registration is serialized by the same lock, so it either wins before
+     * this check or is rejected after this teardown, never half-registering on
+     * a retired encoder.
+     */
+    private boolean disableStreamingIfIdle(
+            com.overdrive.app.streaming.WebSocketStreamServer idleServer) {
+        streamLifecycleLock.lock();
+        try {
+            if (!streamingEnabled || wsStreamServer != idleServer
+                    || idleServer == null || idleServer.hasActiveClients()) {
+                return false;
+            }
+            disableStreamingLocked();
+            return true;
         } finally {
             streamLifecycleLock.unlock();
         }
@@ -4434,6 +4674,158 @@ public class GpuSurveillancePipeline {
      *  isBlindSpotEnabled() (lane armed but possibly hidden). Drives the BS
      *  idle↔active global-fps ramp in RecordingModeManager. */
     public boolean isBlindSpotLayerVisible() { return bsLayerVisible; }
+
+    /**
+     * True when the BLIND-SPOT card specifically is on screen — the signal the floating
+     * ✕ ({@link com.overdrive.app.overlay.StatusOverlayService}) attaches to.
+     *
+     * <p>Requires {@code laneProgram == PROG_BS}, NOT just {@code bsLayerVisible}: the
+     * layer is SHARED with the camera-view program, and camViewTick sets bsLayerVisible
+     * too. Keying the BS ✕ on the bare visibility flag would attach it over a CAMERA VIEW
+     * — on top of camview's own ✕ at the same corner, two buttons stacked, the upper one
+     * POSTing the wrong hide. The program check makes the two mutually exclusive by
+     * construction.
+     *
+     * <p>Deliberately NOT gated on the head-unit target: the caller decides that (the
+     * app can't overlay the cluster display), and the poll reconcile needs the raw
+     * "is it showing" fact paired with {@link #getBsTargetString()} to make that call —
+     * exactly how camViewActive/camViewTarget are reported.
+     */
+    public boolean isBlindSpotCardShowing() {
+        return blindSpotEnabled && bsLayerVisible && laneProgram == PROG_BS;
+    }
+
+    /**
+     * The lane's current on-screen dest rect {x,y,w,h} — whichever program owns it.
+     *
+     * <p>The floating ✕ needs this because the card renders on a SurfaceControl layer at
+     * {@code Integer.MAX_VALUE - 1}, far ABOVE any app window, so a ✕ overlapping the card
+     * is composited UNDER it and invisible. A fixed top-right ✕ sat fully inside the
+     * default blind-spot rect (corner "tr", 24px inset) — which is why the blind-spot close
+     * button could not be seen at all. The camera view hid the same bug only because its
+     * default corner is "center". The caller offsets the button clear of this rect.
+     *
+     * <p>Returns a COPY (the field is swapped wholesale by the resolvers, and callers must
+     * not alias it). Null when no lane geometry is resolved yet.
+     */
+    public int[] getLaneGeomRect() {
+        int[] g = bsGeomRect;
+        if (g == null || g.length != 4) return null;
+        // bsGeomRect starts life as the {-1,-1,-1,-1} SENTINEL (never-resolved), and a
+        // degenerate w/h can also appear mid-resolve. Publishing that as a real rect made
+        // the overlay place its ✕ against a card at x=-1,w=-1 — which lands it in the
+        // wrong corner entirely. Report "unknown" instead so the caller keeps its fixed
+        // inset until real geometry exists.
+        if (g[2] <= 0 || g[3] <= 0) return null;
+        return new int[]{g[0], g[1], g[2], g[3]};
+    }
+
+    /**
+     * Dismiss the CURRENTLY-SHOWING blind-spot card (the floating ✕ tap).
+     *
+     * <p>Hides the card for THIS display session only and leaves the feature armed:
+     * {@code blindspot.enabled} is untouched, the lane stays warm, and the next turn
+     * signal shows the card again (the latch self-clears when the signal session ends —
+     * see {@link #bsUserDismissed}). A blind-spot dismiss must never be sticky.
+     *
+     * <p>Two cases:
+     * <ul>
+     *   <li><b>Turn-triggered card</b> — set the latch; the turn tick takes its hide
+     *       branch on the next pass (and skips re-showing while the stalk is still held).
+     *   <li><b>Calibration preview</b> — {@code debugPreview} is a PERSISTED intent that
+     *       the tick re-asserts every 250ms, so a latch alone would fight it forever.
+     *       Clear the flag instead, which is what "Hide preview" in the settings UI does.
+     * </ul>
+     *
+     * <p>Returns true if a card was actually showing and is now dismissed. Idempotent:
+     * a tap with nothing on screen is a no-op false (so the caller can restore its ✕
+     * rather than leave a view stranded).
+     */
+    public boolean dismissBlindSpotCard() {
+        if (!isBlindSpotCardShowing()) return false;
+        // Read the persisted preview intent BEFORE taking the lane lock: forceReload is a
+        // full-file parse and getBlindSpot may block on the cross-process config lock, and
+        // holding bsLifecycleLock across that would stall the 250ms tick / projThread.
+        boolean preview = false;
+        try {
+            // forceReload: the flag is written by the web UI in the APP uid, so the
+            // daemon's cached snapshot can be stale here.
+            preview = com.overdrive.app.config.UnifiedConfigManager.forceReload()
+                    .optJSONObject("blindspot") != null
+                && com.overdrive.app.config.UnifiedConfigManager.getBlindSpot()
+                    .optBoolean("debugPreview", false);
+        } catch (Throwable t) {
+            logger.debug("dismissBlindSpotCard: preview flag read failed: " + t.getMessage());
+        }
+        if (preview) {
+            // Clear the persisted preview intent. The tick's debugPreview branch returns
+            // before ever consulting bsUserDismissed, so the latch alone would fight it
+            // every 250ms and leave the card up with the ✕ gone.
+            // Single-key merge — never clobbers the calibration siblings (debugView, the
+            // fov/yaw/roll tuning values) that live in the same section.
+            try {
+                com.overdrive.app.config.UnifiedConfigManager.setBlindSpotValues(
+                        java.util.Collections.singletonMap("debugPreview", (Object) false));
+            } catch (Throwable t) {
+                logger.warn("dismissBlindSpotCard: clearing debugPreview failed: "
+                        + t.getMessage());
+            }
+        }
+        // Commit the latch under the LANE LOCK, re-checking liveness inside it. The config
+        // I/O above can block for hundreds of ms, and a disableBlindSpot() (web toggle /
+        // ACC-off teardown) landing in that window clears the latch + drops the lane via
+        // stopBsTurnLoop. A bare `bsUserDismissed = true` after that would write a STALE
+        // true into a dead lane — and startBsTurnLoop does NOT clear it — so the first turn
+        // signal of the NEXT session would silently render no card, with no ✕ on screen to
+        // explain or undo it (the "never sticky" invariant, violated across sessions).
+        // Taking the same lock those teardowns hold makes the check-then-set atomic against
+        // them; the re-check means we only latch a lane that is still live.
+        boolean latched = false;
+        bsLifecycleLock.lock();
+        try {
+            if (isBlindSpotCardShowing()) {
+                // Latch regardless of `preview`: on a preview dismiss it also suppresses a
+                // turn signal live at this instant, so one tap clears the screen either way.
+                bsUserDismissed = true;
+                latched = true;
+                if (bsLayerVisible) setBlindSpotVisible(false);
+            }
+        } catch (Throwable t) {
+            logger.warn("dismissBlindSpotCard: hide failed: " + t.getMessage());
+        } finally {
+            bsLifecycleLock.unlock();
+        }
+        if (!latched) {
+            // The card went away under us (auto-hide, teardown, camview takeover). Nothing
+            // to dismiss and nothing latched — report false so the ✕ owner reconciles.
+            logger.info("BS: dismiss raced a teardown/auto-hide — nothing to dismiss");
+            return false;
+        }
+        // Cluster gauge restore, OUTSIDE the lane lock (requestCloseLingered can call back
+        // in via notifyPipelineClosed → onClusterProjectionClosed, which takes this lock).
+        releaseClusterProjectionForDismiss();
+        logger.info("BS: card dismissed by user (preview=" + preview
+                + ") — re-shows on the next turn signal");
+        return true;
+    }
+
+    /**
+     * Release the TRANSIENT cluster projection a dismissed BS session had opened, so the
+     * driver's gauges come back — mirroring the turn tick's hide branch. Without it, a
+     * dismissed cluster card would leave the gauges blanked until the linger/max-cap
+     * expired. MUST be called WITHOUT bsLifecycleLock: requestCloseLingered can call back
+     * into the pipeline (notifyPipelineClosed → onClusterProjectionClosed, which takes
+     * that same lock), so keeping it out avoids holding the lane lock across the
+     * controller's own monitor. No-op for a head-unit session.
+     */
+    private void releaseClusterProjectionForDismiss() {
+        if (!isClusterTarget()) return;
+        try {
+            com.overdrive.app.surveillance.ClusterProjectionController.getInstance()
+                    .requestCloseLingered();
+        } catch (Throwable ignored) {}
+    }
+
     /** Current on-screen BS layer rect [x,y,w,h] (panel px); -1s if unresolved. */
     public int[] getBsGeometry() { int[] r = bsGeomRect; return new int[]{r[0], r[1], r[2], r[3]}; }
 
@@ -4478,18 +4870,88 @@ public class GpuSurveillancePipeline {
         // so holding the lock briefly here can't deadlock against the GL thread.
         bsLifecycleLock.lock();
         try {
+            // The SCALER is shared with the camera view, so reconfiguring it while a camera view
+            // owns the lane would hijack the visible picture: an /api/bs/side POST (gated only on
+            // isBlindSpotEnabled) flipped a plain camera view to the stitched blind-spot view with
+            // the card's rotation, and camViewTick could never repair it because its reconfig is
+            // transition-gated on `laneProgram != PROG_CAMVIEW`, which stays false for the rest of
+            // the session (audit 2026-08). bsViewMode is already recorded above, so blind-spot's
+            // takeback applies the side itself (it calls setViewMode + applyBlindSpotCalibration).
+            if (camViewOwnsLane()) return;
             com.overdrive.app.streaming.GpuStreamScaler s = bsScaler;
             if (s != null) {
                 s.setViewMode(mode);          // sets side sign internally (7→-1, 8→+1)
                 applyBlindSpotCalibration(s);
+            }
+            // PER-SIDE POSITION: on the turn edge, jump the card to THIS camera's
+            // chosen corner (cornerLeft vs cornerRight). Do NOT call resolveBsGeometry()
+            // here — on the cluster target it runs clusterDisplaySize() → `dumpsys
+            // display` (a subprocess) under this lock, which the turn path deliberately
+            // avoids (see bsTurnTick's "no panel query, no dumpsys" note). The panel
+            // size can't change on a mere side switch, so reuse the size cached by the
+            // last resolveBsGeometry (bsLastPanelW/H) and only recompute the rect from
+            // the new side's corner via presetRect. Falls back to a full resolve only if
+            // the panel size was never cached (lane just armed → resolveBsGeometry ran).
+            // Reposition ONLY when the card is in PRESET form (sizePct persisted) — the
+            // exact same discriminator resolveBsGeometry uses. If the user pinned an
+            // ABSOLUTE rect (/api/bs/geometry/{x}/{y}/{w}/{h}, no sizePct), leave it put:
+            // recomputing a preset rect here would override their absolute placement on
+            // the first turn-side flip (a regression). currentGeometryObj is a cheap
+            // cached config read (no panel query).
+            //
+            // NOT while a CAMERA VIEW owns the shared lane. bsGeomRect then holds camview's
+            // rect (placed at camViewCorner from the camview config), and recomputing it from
+            // the blind-spot corner would silently move the user's chosen camera-view position
+            // to the card's corner on the first turn-signal flip — the "I picked top right and
+            // it went top left" half of the position bug. A real blind-spot card takes the lane
+            // through its own arm path, which resolves geometry properly.
+            org.json.JSONObject gNow = currentGeometryObj();
+            boolean presetForm = (gNow != null && gNow.has("sizePct"));
+            if (presetForm && !camViewOwnsLane()
+                    && bsLastPanelW > 0 && bsLastPanelH > 0 && bsSizePct > 0) {
+                bsCorner = resolveBsCorner(gNow);
+                // presetRect is NOT in-bounds by construction: it derives h from w at 4:3,
+                // so on the short 1920×720 cluster any sizePct above 50 overflows the panel
+                // height (the UI's cluster default is 80 → 1536×1152). Clamp with the
+                // pure-math helper against the cached panel — NOT clampBsRect, which calls
+                // panelForTarget → clusterDisplaySize → dumpsys, the subprocess this path
+                // exists to avoid. A size/panel change still comes through the full
+                // resolveBsGeometry path (enable / orientation / settings).
+                int[] pr = presetRect(new android.graphics.Point(bsLastPanelW, bsLastPanelH));
+                if (pr != null) {
+                    int[] cr = clampBsRectTo(pr[0], pr[1], pr[2], pr[3],
+                                             bsLastPanelW, bsLastPanelH);
+                    bsGeomRect = new int[]{cr[0], cr[1], cr[2], cr[3]};   // atomic publish
+                }
+            }
+            com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
+            if (layer != null && layer.isCreated() && bsLayerVisible) {
+                int[] gr = bsGeomRect;
+                if (gr[0] >= 0) layer.setGeometry(gr[0], gr[1], gr[2], gr[3]);
             }
         } finally {
             bsLifecycleLock.unlock();
         }
     }
 
-    /** Apply the persisted 'blindspot' UCM calibration to a BS scaler. */
+    /** Apply the persisted 'blindspot' UCM calibration to a BS scaler, resolving
+     *  per-side values against the blind-spot card's own view. */
     private void applyBlindSpotCalibration(com.overdrive.app.streaming.GpuStreamScaler s) {
+        applyBlindSpotCalibration(s, bsViewMode, false);
+    }
+
+    /** As above, but resolving the PER-SIDE keys (rotation, corner) against an
+     *  explicit view. A composite camera view (mode 7/8) shares this calibration but
+     *  picks its side from the request, not from the card's current turn side — using
+     *  bsViewMode there would give a right-side view the left camera's angle.
+     *
+     *  @param forCamView true when the rect being aligned to is the CAMERA VIEW's (so a rotated
+     *         card pillarboxes against {@code camViewCorner} and its "center" default) rather than
+     *         the blind-spot card's. The caller must state this: neither {@code viewMode !=
+     *         bsViewMode} nor {@code laneProgram} can be read reliably at the call sites — see the
+     *         alignX comment below. */
+    private void applyBlindSpotCalibration(com.overdrive.app.streaming.GpuStreamScaler s,
+                                           int viewMode, boolean forCamView) {
         try {
             com.overdrive.app.config.UnifiedConfigManager.forceReload();
             org.json.JSONObject bs = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
@@ -4507,12 +4969,70 @@ public class GpuSurveillancePipeline {
                 // Merge mode (both/side/rear) — re-applied here so it survives an
                 // enable or a side switch, same lifecycle as the stitch calibration.
                 s.setBlindSpotMergeMode(bsMergeModeCode(bs.optString("mergeMode", "both")));
+<<<<<<< HEAD
                 // Card clarity (contrast/sharpen) — same lifecycle as the stitch
                 // calibration/merge mode above: re-applied on every enable/resync/
                 // side switch so a config change lands without an ACC cycle.
                 s.setBlindSpotClarity(
                     com.overdrive.app.config.UnifiedConfigManager.getBlindSpotContrast(),
                     com.overdrive.app.config.UnifiedConfigManager.getBlindSpotSharpen());
+=======
+                // Fisheye/lens dewarp for the single-camera views (side/rear). Separate
+                // knob from recording.rectifyStrength; the shader applies it ONLY in the
+                // merge 1/2 passthrough (identity at 0, and never touches 'both'). The
+                // BS card buffer is 4:3 (1280×960) → aspect 0.75, same as a camera tile.
+                s.setBlindSpotRectifyStrength((float) bs.optInt("rectifyStrength", 0));
+                s.setBlindSpotRectifyAspect((float) BS_HEIGHT / (float) BS_WIDTH);
+                // On-screen card rotation is done in the GL vertex shader (output
+                // geometry), NOT via the SurfaceControl layer transform — this
+                // firmware's compositor drops a 90/270 layer transform → blank card
+                // (issue #164). resolveBsRotation already gates rotation to the
+                // single-view side/rear modes and reads AUTO/gear; re-apply it here so
+                // it survives enable/side-switch, same lifecycle as the calibration.
+                // PER-SIDE: pass the current view (7=left/8=right) so a side switch
+                // re-resolves to that camera's own rotation. Keep bsRotationDeg in sync
+                // with what we just pushed, so the 250ms turn-tick change-detector
+                // (wantRot != bsRotationDeg) doesn't see a stale angle after a side
+                // switch and either miss a needed re-apply or churn a redundant one.
+                int rot = resolveBsRotation(bs, viewMode);
+                // Only mirror into bsRotationDeg when this is the CARD's own render, not a
+                // composite camera view's — a camview angle must not become the card's
+                // change-detector baseline (the turn tick would then skip a needed re-apply).
+                // Keyed on the caller's forCamView, not on `viewMode == bsViewMode`: the latter is
+                // the inferred discriminator that broke the alignment below, and it compares equal
+                // whenever a camview happens to show the card's current side. Harmless today
+                // (resolveBsRotation returns the same angle for the same view), but the two must
+                // not disagree about whose render this is.
+                if (!forCamView) bsRotationDeg = rot;
+                // Align the rotated card to the CURRENT side's corner edge. Resolve the
+                // corner from this same config object (not the bsCorner field, which the
+                // reposition step updates only AFTER this call) so a 90/270 card hugs the
+                // right/left edge matching where it's anchored, per side.
+                //
+                // A COMPOSITE CAMERA VIEW is anchored by its OWN camview geometry, so a
+                // rotated one must pillarbox against camViewCorner — using the card's
+                // corner would flush the picture to the opposite edge of its rect.
+                int alignX;
+                // Which feature's corner does the rect belong to? The caller knows, so it TELLS us
+                // via forCamView — do not infer it here:
+                //  - `viewMode != bsViewMode` was wrong because bsViewMode defaults to 7, so a
+                //    camera view showing the LEFT composite (view 7) compared equal and aligned
+                //    against the blind-spot corner;
+                //  - `laneProgram == PROG_CAMVIEW` is wrong too: the camview call site sits INSIDE
+                //    its own `laneProgram != PROG_CAMVIEW` transition block, so the flag is not yet
+                //    set when this runs, and the blind-spot takeback call site still sees
+                //    PROG_CAMVIEW. Both readings are false at exactly the wrong moment.
+                if (forCamView && (viewMode == 7 || viewMode == 8)) {
+                    // Camera-view lane: pass ITS default ("center"), the same one
+                    // camViewPresetRect uses, so rect and alignment agree on any token.
+                    alignX = bsCornerAlignX(camViewCorner, "center");
+                } else {
+                    String geomKey = isClusterTarget() ? "geometryCluster" : "geometry";
+                    org.json.JSONObject g = bs.optJSONObject(geomKey);
+                    alignX = bsCornerAlignX(resolveBsCorner(g));
+                }
+                s.setContentRotation(rot, alignX);
+>>>>>>> upstream/main
             }
         } catch (Throwable t) {
             logger.warn("blindspot calib apply failed: " + t.getMessage());
@@ -4655,8 +5175,26 @@ public class GpuSurveillancePipeline {
         resolveBsGeometry();
         if (bsLayer != null) {
             int[] g0 = bsGeomRect;
-            if (bsLayerVisible) bsLayer.setGeometry(g0[0], g0[1], g0[2], g0[3]);
-            else bsLayer.setGeometryHidden(g0[0], g0[1], g0[2], g0[3]);
+            // bsLayerVisible can be true here when BS ADOPTS a lane a camera-view was
+            // already displaying (buildSharedLaneLocked reused it). setGeometry SHOWS
+            // the layer, so honour the conditional gate before inheriting that visible
+            // state — otherwise a car parked outside the speed window would paint the BS
+            // card for one poll interval.
+            // holding=FALSE: the visible thing on screen is a CAMVIEW, not a BS card the
+            // driver was granted, so this is a decision to START a BS display and must
+            // use the narrow turn-ON threshold. Passing true would lend the adopt the
+            // hysteresis slack and paint the BS card just below the configured minimum.
+            boolean showNow = bsLayerVisible && bsGateBlockReason(
+                com.overdrive.app.config.UnifiedConfigManager.getBlindSpot(), false).isEmpty();
+            if (showNow) {
+                bsLayer.setGeometry(g0[0], g0[1], g0[2], g0[3]);
+            } else {
+                bsLayer.setGeometryHidden(g0[0], g0[1], g0[2], g0[3]);
+                // Keep the intent flag consistent with the layer we just hid, so the
+                // turn tick's hide branch isn't waiting on a debounce to correct a
+                // desync (and the fps ramp drops to idle immediately).
+                if (bsLayerVisible) setBlindSpotVisible(false);
+            }
         }
 
         // Blind-spot PRIORITY: if a camera-view was using the lane, BS now takes full
@@ -4680,6 +5218,22 @@ public class GpuSurveillancePipeline {
             // view. emitCamViewState only spawns a detached `am broadcast` (no lock, no
             // block), so it's safe to call inline here under bsLifecycleLock.
             emitCamViewState(false, null);
+            // Clear the persisted request too: this path tears the session down without
+            // going through disableCamView, so camview.enabled would stay true in config
+            // while the runtime says gone. Nothing currently restores from that flag, so
+            // this is about the config not lying rather than a live defect. Dispatched
+            // OFF-THREAD: setCamViewValues is a full-JSON write under the cross-process
+            // config file lock, and we hold bsLifecycleLock here — doing it inline would
+            // block the lane lifecycle behind a peer daemon's config write.
+            Thread cvOff = new Thread(() -> {
+                try {
+                    java.util.Map<String, Object> off = new java.util.HashMap<>();
+                    off.put("enabled", false);
+                    com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(off);
+                } catch (Throwable ignored) {}
+            }, "CamViewFlagClear");
+            cvOff.setDaemon(true);
+            cvOff.start();
         }
 
         blindSpotEnabled = true;
@@ -4746,9 +5300,9 @@ public class GpuSurveillancePipeline {
             logger.warn("BS: od init failed: " + t.getMessage());
         }
 
-        boolean escoPath = (camera != null && camera.isUsingEscoSurfaceTexturePath());
-        bsScaler.setCameraLayout(escoPath ? 3 : 0);
-        if (escoPath) {
+        boolean oemPath = (camera != null && camera.isUsingOemSurfaceTexturePath());
+        bsScaler.setCameraLayout(oemPath ? 3 : 0);
+        if (oemPath) {
             bsScaler.setProducerLayout(
                 com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
                 com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
@@ -4758,6 +5312,25 @@ public class GpuSurveillancePipeline {
                 com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
                 com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
                 com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
+            // Parity with the recorder + stream lanes: the blind-spot scaler is
+            // another GpuStreamScaler sampling the SAME producer, so it needs the
+            // same two dilink4 corrections or its card diverges visually from
+            // every other view — it was the only feed site never given either.
+            // (Its 7/8 branches return before the red-mask splice, so the mask
+            // is inert for those views today; pushing it keeps the contract
+            // uniform if the branch layout ever changes.)
+            try {
+                org.json.JSONObject bsCamCfg = com.overdrive.app.config.UnifiedConfigManager
+                    .loadConfig().optJSONObject("camera");
+                if (bsCamCfg != null) {
+                    bsScaler.setRedMaskEnabled(
+                        bsCamCfg.optBoolean("dilink4RedMask", false));
+                    bsScaler.setApaCenterInset(
+                        (float) bsCamCfg.optDouble("dilink4ApaCenterInset", 0.09375));
+                }
+            } catch (Throwable t) {
+                logger.warn("BS: failed to apply dilink4 red-mask/inset: " + t.getMessage());
+            }
         }
 
         // GL-thread init + WAIT (captured locals, same rationale as the stream lane).
@@ -4868,7 +5441,7 @@ public class GpuSurveillancePipeline {
             // (side/rear) may rotate; the merged panorama stays landscape. This makes
             // the effective rotation self-correcting when the user switches back to
             // "both" without having to clear the stored angle.
-            bsRotationDeg = resolveBsRotation(bs);
+            bsRotationDeg = resolveBsRotation(bs, bsViewMode);
 
             android.graphics.Point panel = (ctx != null)
                 ? panelForTarget(ctx)
@@ -4888,10 +5461,21 @@ public class GpuSurveillancePipeline {
             if (g != null && g.has("sizePct")) {
                 // Preset form (orientation-safe): recompute px from the live panel.
                 bsSizePct = g.optInt("sizePct", bsSizePct);
-                if (g.has("corner")) bsCorner = g.optString("corner", bsCorner);
+                // PER-SIDE POSITION: the left camera (view 7, left turn) and right
+                // camera (view 8, right turn) can each sit at their own corner —
+                // mirroring per-side rotation, so a driver can put the left card on the
+                // left of the screen and the right card on the right. Pick the current
+                // view's corner key (cornerLeft/cornerRight) with a fallback to the
+                // legacy single "corner" so an un-migrated config is unchanged.
+                bsCorner = resolveBsCorner(g);
                 r = presetRect(panel);
             } else if (g != null && g.has("x") && g.has("w")) {
                 // Absolute form: honour the stored rect, clamped to the live panel.
+                // Still resolve the corner — it does not place the rect here, but it IS what
+                // bsRotationAlignX uses to decide which edge a ROTATED card's pillarboxed content
+                // hugs. Leaving it at the stale field value flushed the picture to the wrong edge
+                // of an absolutely-placed card (audit 2026-08).
+                bsCorner = resolveBsCorner(g);
                 r = clampBsRect(g.optInt("x"), g.optInt("y"), g.optInt("w"), g.optInt("h"));
             } else {
                 // Nothing persisted → target-aware default card, 4:3, top-right.
@@ -4913,11 +5497,21 @@ public class GpuSurveillancePipeline {
                 r = clampBsRect(r[0], r[1], r[2], r[3]);
             }
             bsGeomRect = new int[]{r[0], r[1], r[2], r[3]};   // atomic publish
-            // Push the resolved rotation onto the layer so the setGeometry calls that
-            // follow (enable / show / retarget) composite the buffer at the right
-            // angle. Cheap store; the rect above already matches the rotated aspect.
+            // Rotation is applied in the GL render (bsScaler.setContentRotation via
+            // applyBlindSpotCalibration), so the SurfaceControl layer stays at IDENTITY
+            // orientation — a 90/270 LAYER transform is dropped by this firmware's
+            // compositor and blanks the card (issue #164). Force the layer's buffer
+            // rotation to 0 so no setGeometry call ever re-introduces a layer-level
+            // transform, and keep the dest rect at the buffer's native 4:3 (done above).
             com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
-            if (layer != null) layer.setBufferRotation(bsRotationDeg);
+            if (layer != null) layer.setBufferRotation(0);
+            // Keep the GL scaler's card rotation in sync with the freshly-resolved angle
+            // (covers the settings-write / enable path; the turn-tick AUTO path syncs it
+            // too). Gated to side/rear inside resolveBsRotation. bsCorner is resolved for
+            // the current side just above (preset branch), so align the rotated card to
+            // that corner's edge — a 90/270 card hugs left/right per side, not centered.
+            com.overdrive.app.streaming.GpuStreamScaler bss = bsScaler;
+            if (bss != null) bss.setContentRotation(bsRotationDeg, bsRotationAlignX());
         } catch (Throwable t) {
             logger.warn("resolveBsGeometry failed: " + t.getMessage());
             if (bsGeomRect[2] <= 0) bsGeomRect = new int[]{24, 24, 640, 480};
@@ -4928,21 +5522,41 @@ public class GpuSurveillancePipeline {
      *  Rotation is honoured ONLY for the single-view merge modes (side/rear); the
      *  merged "both" panorama is inherently landscape and always renders upright.
      *
-     *  <p>The stored {@code rotation} is either a fixed quarter turn (int
-     *  0/90/180/270) or the string {@code "auto"}. In AUTO mode the on-screen angle
-     *  tracks the DIRECTION OF TRAVEL: it holds the configured base angle
-     *  ({@code rotationBase}) while moving forward and flips 180° in reverse gear,
+     *  <p>PER-SIDE: the left camera (view 7, left turn) and the right camera (view 8,
+     *  right turn) are physically mirror-imaged, so each needs its OWN rotation — a
+     *  single global angle that reads upright on the left camera reads upside-down /
+     *  sideways on the right one. The stored config therefore carries per-side keys:
+     *  fixed {@code rotationLeft}/{@code rotationRight} (int 0/90/180/270 or the
+     *  string {@code "auto"}) and, for AUTO, per-side forward bases
+     *  {@code rotationBaseLeft}/{@code rotationBaseRight}. When a per-side key is
+     *  ABSENT we fall back to the legacy global {@code rotation}/{@code rotationBase}
+     *  so an existing config (and any device that only ever set the old keys) keeps
+     *  its current behaviour byte-for-byte.
+     *
+     *  <p>In AUTO mode the on-screen angle tracks the DIRECTION OF TRAVEL: it holds
+     *  the configured base angle while moving forward and flips 180° in reverse gear,
      *  so the view reads naturally when backing up. Gear is read live from the
      *  daemon-local {@link com.overdrive.app.monitor.GearMonitor} (5 Hz), so no
      *  cross-process hop is involved. Any non-multiple-of-90 value is snapped to the
-     *  nearest quarter turn. */
-    private int resolveBsRotation(org.json.JSONObject bs) {
+     *  nearest quarter turn.
+     *
+     *  @param viewMode the active blind-spot view (7 = left camera, 8 = right camera).
+     *                  Any other value falls back to the left-side keys. */
+    private int resolveBsRotation(org.json.JSONObject bs, int viewMode) {
         if (bs == null) return 0;
         String merge = bs.optString("mergeMode", "both");
         if (!"side".equals(merge) && !"rear".equals(merge)) return 0;
-        Object rotVal = bs.opt("rotation");
+        // view 8 = RIGHT camera; everything else (incl. 7) = LEFT camera.
+        boolean right = (viewMode == 8);
+        // Fixed-rotation key: per-side (rotationRight/rotationLeft) with a fallback to
+        // the legacy global "rotation" so an un-migrated config is unchanged.
+        String sideKey = right ? "rotationRight" : "rotationLeft";
+        Object rotVal = bs.has(sideKey) ? bs.opt(sideKey) : bs.opt("rotation");
         if (rotVal instanceof String && "auto".equalsIgnoreCase((String) rotVal)) {
-            int base = snapDeg(bs.optInt("rotationBase", 0));
+            String baseKey = right ? "rotationBaseRight" : "rotationBaseLeft";
+            int base = bs.has(baseKey)
+                    ? snapDeg(bs.optInt(baseKey, 0))
+                    : snapDeg(bs.optInt("rotationBase", 0));
             boolean reverse = false;
             try {
                 reverse = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear()
@@ -4950,13 +5564,234 @@ public class GpuSurveillancePipeline {
             } catch (Throwable ignored) {}
             return reverse ? (base + 180) % 360 : base;
         }
-        return snapDeg(bs.optInt("rotation", 0));
+        // Fixed angle: read the per-side key when present, else the legacy global.
+        int fixed = bs.has(sideKey) ? bs.optInt(sideKey, 0) : bs.optInt("rotation", 0);
+        return snapDeg(fixed);
     }
 
     /** Normalise an angle into {0,90,180,270} (mod 360, nearest quarter turn). */
     private static int snapDeg(int deg) {
         deg = ((deg % 360) + 360) % 360;
         return (Math.round(deg / 90f) * 90) % 360;
+    }
+
+    /**
+     * Conditional-display gate for the blind-spot card: may it be shown right now?
+     * Evaluated on the 250ms turn tick, and its verdict is folded into the tick's
+     * {@code side} value — so a gate that closes mid-signal HIDES an already-visible
+     * card through the same debounced path as a turn-signal release (drive out of the
+     * speed window / shift to R with the indicator still on).
+     *
+     * <p>Two independent user gates, both DISARMED by default so an existing config
+     * behaves exactly as before:
+     * <ul>
+     *   <li><b>Speed window</b> {@code minSpeedKmh}/{@code maxSpeedKmh} — 0 means
+     *       "no bound on that end", so 0/0 is off entirely. FAIL-OPEN on an
+     *       unreadable speed: {@link com.overdrive.app.byd.BydDataCollector#readCurrentSpeedKmh()}
+     *       returns NaN whenever the cluster's raw unit was never hardware-detected
+     *       (and on any transient SDK miss), and silently withholding a SAFETY view on
+     *       those trims would be a regression — so an unknown speed ALLOWS the card.
+     *       An INVERTED pair (min &gt; max) describes an empty window that could never
+     *       show anything, so it is treated as misconfiguration and ignored.</li>
+     *   <li><b>Reverse suppression</b> {@code suppressInReverse} — hide while the
+     *       gearbox reports R. Only trusted when {@link com.overdrive.app.monitor.GearMonitor}
+     *       is actually polling ({@code isActive()}); its {@code currentGear} field
+     *       cold-starts at GEAR_P and, after a {@code stop()} taken in R, would be a
+     *       stale "reverse" that wrongly suppresses. Fail-open again: no live gear ⇒
+     *       allow.</li>
+     * </ul>
+     *
+     * <p>HYSTERESIS: the speed bounds are widened by {@link #BS_SPEED_HYST_KMH} while
+     * the card is already up. Without it, cruising at exactly the boundary (min=30,
+     * speed oscillating 29.9↔30.1) would flap the card — and each flap is a
+     * SurfaceControl show/hide plus, on the cluster target, a projection open/close
+     * that blanks and restores the gauges. The asymmetric thresholds make the on and
+     * off edges distinct so a steady boundary speed settles instead of strobing.
+     *
+     * <p>Debug-preview is NOT gated (calibration must work parked at 0 km/h) — the
+     * caller applies this only on the turn-signal path.
+     *
+     * <p>PURE: this only reads state — it does not publish {@link #bsGateAllowed}, so
+     * it is safe to call from projThread (the cluster cold-open re-show path) as well
+     * as the turn tick, without one thread's evaluation polluting the other's
+     * edge-logged transition. {@link #bsEvalConditionalGate} is the tick's
+     * publishing wrapper.
+     *
+     * @param bs the blindspot config snapshot the caller already read (one read per
+     *           tick, and the gate sees the same values as the rotation resolution).
+     * @param holding whether to apply the hysteresis slack — i.e. whether this is a
+     *                DECISION TO KEEP/RESUME a display the driver has already been
+     *                given, rather than a decision to start one. The turn tick passes
+     *                the live {@code bsLayerVisible}; the cluster cold-open re-show
+     *                passes TRUE, because by then the tick has already hidden the card
+     *                (bsLayerVisible==false) even though the projection is lingering
+     *                for exactly that session — reading the raw flag there would apply
+     *                the narrow turn-ON threshold to a re-show and contradict the
+     *                verdict the tick just published for the same speed.
+     * @return the blocking reason, or "" when the card is allowed.
+     */
+    private String bsGateBlockReason(org.json.JSONObject bs, boolean holding) {
+        try {
+            // Calibration preview is never gated: it must work parked (0 km/h) and in
+            // any gear, which is exactly what the speed/reverse gates would forbid.
+            if (bs.optBoolean("debugPreview", false)) return "";
+            int min = com.overdrive.app.config.UnifiedConfigManager
+                .clampBsSpeedBound(bs.optInt("minSpeedKmh", 0));
+            int max = com.overdrive.app.config.UnifiedConfigManager
+                .clampBsSpeedBound(bs.optInt("maxSpeedKmh", 0));
+            // An inverted window is unsatisfiable — ignore it instead of hiding forever.
+            if (min > 0 && max > 0 && min > max) { min = 0; max = 0; }
+            if (min > 0 || max > 0) {
+                double kmh = com.overdrive.app.byd.BydDataCollector.getInstance().readCurrentSpeedKmh();
+                // NaN = raw speed unit undetected / SDK miss → fail open (show).
+                if (!Double.isNaN(kmh)) {
+                    // Widen the window while holding a display (see HYSTERESIS above).
+                    // The widened lower bound is clamped to be strictly REACHABLE: for a
+                    // small min (<= the slack) an unclamped min-slack lands at or below
+                    // 0, and since no speed is < 0 the card would pin up even at a full
+                    // standstill. Flooring at 0 alone isn't enough (kmh < 0 is never
+                    // true), so hold the widened bound just above 0 — a stopped car then
+                    // still falls below it and the card hides.
+                    double slack = holding ? BS_SPEED_HYST_KMH : 0.0;
+                    double lowBound = Math.max(BS_SPEED_MIN_EFFECTIVE_KMH, min - slack);
+                    if (min > 0 && kmh < lowBound) return "below min " + min;
+                    if (max > 0 && kmh > (max + slack)) return "above max " + max;
+                }
+            }
+            if (bs.optBoolean("suppressInReverse", false)) {
+                com.overdrive.app.monitor.GearMonitor gm = com.overdrive.app.monitor.GearMonitor.getInstance();
+                if (gm.isActive() && gm.getCurrentGear() == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
+                    return "reverse";
+                }
+            }
+        } catch (Throwable t) {
+            // Never let a config/SDK error suppress a safety view.
+            return "";
+        }
+        return "";
+    }
+
+    /** Evaluate the conditional gate AND publish the verdict (edge-logged, exposed on
+     *  /api/bs/status). Called once per turn tick on every tick that REACHES it —
+     *  including no-indicator ticks, so the verdict can't go stale describing a
+     *  condition that has since passed while BS owns the lane. Ticks that return
+     *  earlier (camview-only, debugPreview) don't publish at all; the readers detect
+     *  that via {@link #bsGateVerdictLive()} instead of serving a latched value. Costs
+     *  nothing when no gate is armed (the reason resolver returns before any SDK read).
+     *  The turn loop is the ONLY writer of these fields, so the log fires exactly once
+     *  per real transition. */
+    private boolean bsEvalConditionalGate(org.json.JSONObject bs) {
+        String reason = bsGateBlockReason(bs, bsLayerVisible);
+        boolean allow = reason.isEmpty();
+        if (allow != bsGateAllowed) {
+            logger.info("BS gate: " + (allow ? "ALLOW" : ("BLOCK (" + reason + ")")));
+        }
+        bsGateAllowed = allow;
+        bsGateReason = reason;
+        return allow;
+    }
+
+    /** Whether a published gate verdict is CURRENTLY being maintained, i.e. whether
+     *  {@link #bsGateAllowed}/{@link #bsGateReason} describe live conditions.
+     *
+     *  <p>Requires BOTH that the turn loop is up AND that blind-spot owns it: the loop
+     *  also runs for camera-view sessions, where {@code bsTurnTick} returns at its
+     *  {@code !blindSpotEnabled} guard without evaluating the gate. And a BS disable
+     *  that hands the lane to camview does NOT stop the loop, so "executor non-null"
+     *  alone would keep serving a verdict from the last BS session forever. The
+     *  debugPreview branch also returns early, but preview is ungated by definition, so
+     *  it is reported as allowed rather than as a stale block.
+     *
+     *  <p>Resolved here rather than by resetting the fields on stop, so the turn loop
+     *  stays the single writer — {@code shutdownNow()} interrupts but does not await, so
+     *  a reset in {@code stopBsTurnLoop} could be re-latched by an in-flight tick. */
+    private boolean bsGateVerdictLive() {
+        if (bsTurnExec == null || !blindSpotEnabled) return false;
+        try {
+            return !com.overdrive.app.config.UnifiedConfigManager.getBlindSpot()
+                .optBoolean("debugPreview", false);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Whether the conditional gate (speed window / reverse) currently permits the
+     *  card. True when no gate is armed, and true whenever no live verdict is being
+     *  maintained (see {@link #bsGateVerdictLive()}) so a latched BLOCK is never
+     *  reported for a feature that isn't currently gated. Exposed for /api/bs/status. */
+    public boolean isBsGateAllowed() { return !bsGateVerdictLive() || bsGateAllowed; }
+
+    /** Why the gate is blocking ("" when allowing, or when no live verdict is being
+     *  maintained — see {@link #isBsGateAllowed()}). Exposed for /api/bs/status. */
+    public String getBsGateReason() { return bsGateVerdictLive() ? bsGateReason : ""; }
+
+    /** Resolve the on-screen card corner for the CURRENT view from a per-target
+     *  geometry object. PER-SIDE: view 8 (right turn) reads {@code cornerRight},
+     *  everything else (incl. view 7 / left turn) reads {@code cornerLeft}; either
+     *  falls back to the legacy single {@code corner} (then the current field, then
+     *  "tr") when the per-side key is absent, so an un-migrated config keeps its
+     *  existing placement. Kept side-aware so a turn-signal side switch repositions
+     *  the card to that camera's chosen corner. */
+    private String resolveBsCorner(org.json.JSONObject g) {
+        if (g == null) return canonicalCorner(bsCorner, "tr");
+        String legacy = g.optString("corner", canonicalCorner(bsCorner, "tr"));
+        String sideKey = (bsViewMode == 8) ? "cornerRight" : "cornerLeft";
+        // Canonicalise HERE, at the single point every corner read passes through: the config
+        // may hold a token from an older build, a hand edit, an import, or the unified-settings
+        // POST (which does not validate geometry). Returning it raw let the rect decoder and
+        // bsCornerAlignX disagree — see canonicalCorner.
+        return canonicalCorner(g.optString(sideKey, legacy), "tr");
+    }
+
+    /** Horizontal alignment (+1 right / -1 left / 0 center) for a rotated (90/270)
+     *  card anchored at {@code corner}: a RIGHT corner (tr/br) hugs the right screen
+     *  edge, a LEFT corner (tl/bl) the left, a centered card stays centered. Passed to
+     *  {@code setContentRotation} so the pillarboxed portrait content sits flush with
+     *  the same edge the card is anchored to instead of floating in the middle of its
+     *  dest rect. No effect at 0/180 (no pillarbox). */
+    private static int bsCornerAlignX(String corner) {
+        return bsCornerAlignX(corner, "tr");
+    }
+
+    /**
+     * {@link #bsCornerAlignX} with an EXPLICIT fallback, so each lane uses the same default its
+     * rect decoder does. The blind-spot card defaults to {@code tr}; the camera view defaults to
+     * {@code center}. Passing the wrong one makes this disagree with {@code cornerRect} for an
+     * unrecognised token: a camview corner resolved as {@code tr} (alignX +1) while its rect was
+     * centred flushed the rotated picture to the right edge of a centred rect (audit 2026-08).
+     *
+     * @param fallback the lane's own default corner, matching what its rect decoder passes
+     */
+    private static int bsCornerAlignX(String corner, String fallback) {
+        // Canonicalise first so this can never disagree with cornerRect for the same input.
+        // It used to decode the raw token, which meant an uppercase/legacy "TR" anchored the
+        // card top-RIGHT (cornerRect lowercases) while alignX read 0 — leaving a rotated
+        // card's pillarboxed content floating centred in a right-anchored rect, the exact
+        // defect this parameter exists to prevent.
+        String c = canonicalCorner(corner, fallback);
+        if ("center".equals(c)) return 0;
+        if (c.endsWith("r")) return 1;
+        if (c.endsWith("l")) return -1;
+        return 0;
+    }
+
+    /** {@link #bsCornerAlignX} for the current {@link #bsCorner} field. */
+    private int bsRotationAlignX() {
+        return bsCornerAlignX(bsCorner);
+    }
+
+    /** The ACTIVE target's geometry JSON object ("geometry" for head-unit,
+     *  "geometryCluster" for cluster), or null. Cheap config read (no panel query),
+     *  so it's safe on the turn-signal side-switch path. Used by the per-side
+     *  reposition to pick cornerLeft/cornerRight without a full resolveBsGeometry. */
+    private org.json.JSONObject currentGeometryObj() {
+        try {
+            org.json.JSONObject bs = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+            if (bs == null) return null;
+            return bs.optJSONObject(isClusterTarget() ? "geometryCluster" : "geometry");
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /** Update the on-screen geometry live (from /api/bs/geometry / settings UI).
@@ -4971,6 +5806,86 @@ public class GpuSurveillancePipeline {
         if (layer != null && layer.isCreated() && bsLayerVisible) {
             layer.setGeometry(r[0], r[1], r[2], r[3]);
         }
+    }
+
+    /**
+     * Apply a persisted size-only Blind Spot geometry edit. The caller has already
+     * updated the target's geometry object; this computes the live rect from that
+     * object while preserving its per-side corner choices.
+     */
+    public void setBsGeometrySize(int pct, String target) {
+        boolean cluster = "cluster".equals(target);
+        if (cluster != isClusterTarget()) return;
+        try {
+            bsSizePct = Math.max(15, Math.min(pct, 90));
+            org.json.JSONObject geometry = currentGeometryObj();
+            bsCorner = resolveBsCorner(geometry);
+            android.content.Context ctx = savedContext;
+            if (ctx == null) ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            android.graphics.Point panel = (ctx != null)
+                ? panelForTarget(ctx)
+                : new android.graphics.Point(1920, cluster ? 720 : 1080);
+            int[] r = presetRect(panel);
+            if (r == null) return;
+            // Do NOT touch the shared rect at all while a camera view owns the lane. Mirrors
+            // setCamViewGeometrySize's guard. Without this, moving the Blind Spot size slider
+            // while a camera view was on screen shrank the camera view and jumped it to the card's
+            // corner (audit 2026-08).
+            //
+            // Not even a publish-without-push: bsGeomRect is the field the SHOW helpers read
+            // (setBlindSpotVisible, and clusterShowWhenReady on every tick it finds the layer not
+            // yet shown), while camview re-asserts it only on its program-transition tick. So
+            // storing BS's rect here corrupted the next camview show. The size is already
+            // persisted by the caller, and blind-spot's own takeback recomputes the rect from
+            // config (resolveBsGeometry / the cluster preset branch), so nothing is lost.
+            if (camViewOwnsLane()) return;
+            setBsGeometry(r[0], r[1], r[2], r[3]);
+        } catch (Throwable t) {
+            logger.warn("setBsGeometrySize failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Apply a persisted size-only normal camera-view geometry edit. It preserves the
+     * selected camera and corner, and only moves the shared native layer while the
+     * camera-view program owns it. Blind Spot may temporarily own that lane; in that
+     * case its geometry must remain untouched and the saved camera-view size is picked
+     * up when the normal view regains the lane.
+     */
+    public void setCamViewGeometrySize(int pct, String target) {
+        boolean notifyOverlay = false;
+        String activeTarget = null;
+        bsLifecycleLock.lock();
+        try {
+            String requestedTarget = "cluster".equals(target) ? "cluster" : "head_unit";
+            if (!camViewActive || !requestedTarget.equals(camViewTarget)) return;
+
+            // The API persisted the geometry first. Resolve it here so the panel-specific
+            // 4:3 rect uses the current display dimensions and keeps the stored corner.
+            resolveCamViewGeometry();
+            if (laneProgram != PROG_CAMVIEW) return;
+
+            // The camview program currently owns the shared geometry. Publishing the new
+            // rect then issuing one SurfaceControl transaction resizes it without a GL
+            // rebuild or a camera re-open.
+            bsTarget = camViewTarget;
+            bsGeomRect = camViewGeomRect;
+            com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
+            if (layer != null && layer.isCreated() && bsLayerVisible) {
+                int[] r = camViewGeomRect;
+                layer.setGeometry(r[0], r[1], r[2], r[3]);
+            }
+            notifyOverlay = true;
+            activeTarget = camViewTarget;
+        } catch (Throwable t) {
+            logger.warn("setCamViewGeometrySize failed: " + t.getMessage());
+        } finally {
+            bsLifecycleLock.unlock();
+        }
+
+        // Refresh the head-unit close button with the new rect. This runs after the
+        // shared rect is published, so the broadcast never gives it stale geometry.
+        if (notifyOverlay) emitCamViewState(true, activeTarget);
     }
 
     /** Set on-screen geometry from a size%+corner preset for the CURRENT target. */
@@ -4996,35 +5911,76 @@ public class GpuSurveillancePipeline {
             int w = (int) (panel.x * (p / 100.0));
             int h = (int) (w * (double) BS_HEIGHT / BS_WIDTH);
             int inset = 24;
-            int x, y;
-            if ("center".equals(corner)) {
-                x = (panel.x - w) / 2; y = (panel.y - h) / 2;
-            } else {
-                boolean right = corner == null || corner.endsWith("r");
-                boolean bottom = corner != null && corner.startsWith("b");
-                x = right ? panel.x - w - inset : inset;
-                y = bottom ? panel.y - h - inset : inset;
-            }
+            // One canonical decode for every path (see canonicalCorner): this used to derive
+            // right/bottom inline, which read an unknown token as top-left.
+            String canonical = canonicalCorner(corner, "tr");
+            int[] pr = cornerRect(canonical, panel, w, h, inset);
+            int x = pr[0], y = pr[1];
             // Persist the PRESET (sizePct + corner) under the target's key — NOT
             // absolute px — so it stays correct across rotation. resolveBsGeometry()
             // recomputes the px rect from the LIVE target panel on enable + rotation.
-            // updateSection is a shallow per-key merge, so writing one geometry key
-            // never clobbers the other target's key.
+            // updateSection is a shallow per-key merge at the TOP level only, so it
+            // REPLACES the whole geometry object — we must therefore carry forward the
+            // existing keys we don't set here, or a single-corner preset write would
+            // silently drop the user's per-side cornerLeft/cornerRight. This
+            // single-corner API means "put the card here" for BOTH sides, so mirror
+            // `corner` into cornerLeft+cornerRight (keeping them coherent) while still
+            // preserving any other keys (e.g. absolute x/y/w/h) already stored.
             String geomKey = cluster ? "geometryCluster" : "geometry";
-            org.json.JSONObject g = new org.json.JSONObject();
-            g.put("sizePct", p); g.put("corner", (corner != null) ? corner : "tr");
+            // Persist the CANONICAL token, never the caller's raw string: storing an
+            // unrecognised corner would make every later read decode it as top-left.
+            String cornerVal = canonical;
+            org.json.JSONObject g;
+            try {
+                org.json.JSONObject bsNow = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+                org.json.JSONObject existing = (bsNow != null) ? bsNow.optJSONObject(geomKey) : null;
+                g = (existing != null) ? new org.json.JSONObject(existing.toString()) : new org.json.JSONObject();
+            } catch (Throwable t) {
+                g = new org.json.JSONObject();
+            }
+            g.put("sizePct", p);
+            g.put("corner", cornerVal);
+            g.put("cornerLeft", cornerVal);
+            g.put("cornerRight", cornerVal);
             com.overdrive.app.config.UnifiedConfigManager.updateSection("blindspot",
                 new org.json.JSONObject().put(geomKey, g));
             // Apply live only if editing the active target; otherwise it's persisted
             // for when that target is next selected.
             if (cluster == isClusterTarget()) {
                 bsSizePct = p;
-                bsCorner = (corner != null) ? corner : "tr";
+                bsCorner = canonical;
+                // Never move the shared layer while a CAMERA VIEW owns it: the size/corner fields
+                // above are blind-spot's own and are re-read when it takes the lane back, but
+                // setBsGeometry publishes bsGeomRect AND pushes it, so a Blind Spot settings write
+                // used to resize the on-screen camera view and jump it to the card's corner
+                // (audit 2026-08). Same guard as setBsGeometrySize / setCamViewGeometrySize.
+                if (camViewOwnsLane()) return;
                 setBsGeometry(x, y, w, h);
             }
         } catch (Throwable t) {
             logger.warn("setBsGeometryPreset failed: " + t.getMessage());
         }
+    }
+
+    /**
+     * True when a CAMERA VIEW currently owns the shared native lane, so blind-spot code must not
+     * move the layer or overwrite {@code bsGeomRect}/{@code bsTarget}.
+     *
+     * <p>{@code laneProgram != PROG_BS} rather than {@code == PROG_CAMVIEW}: {@code enableCamView}
+     * publishes {@code camViewActive = true} together with {@code laneProgram = PROG_NONE} and
+     * reconfigures on the NEXT tick, so a {@code == PROG_CAMVIEW} test reads false for up to one
+     * 250ms tick and every guard misfires exactly during the handover. Testing "not blind-spot"
+     * covers that window while still yielding when blind-spot has genuinely taken the lane —
+     * {@code camViewActive && laneProgram == PROG_BS} is a documented reachable state (blind-spot
+     * has priority and can hold the lane while a camera-view request stands).
+     *
+     * <p>Both fields are volatile and read non-atomically, so this is advisory: a concurrent
+     * enable/disable can still land either side of the check. That is acceptable here — every
+     * caller's fallback is "leave the shared rect alone and let the owner re-resolve it", which is
+     * the safe direction. Do not use this where correctness needs a lock.
+     */
+    private boolean camViewOwnsLane() {
+        return camViewActive && laneProgram != PROG_BS;
     }
 
     /** True when the blind-spot display target is the driver cluster. */
@@ -5056,12 +6012,44 @@ public class GpuSurveillancePipeline {
         // portrait — that is the post-scale rotation, not the scale reference.)
         int h = (int) (w * (double) BS_HEIGHT / BS_WIDTH);
         int inset = 24;
-        String corner = (bsCorner != null) ? bsCorner : "tr";
-        if ("center".equals(corner)) {
+        return cornerRect(canonicalCorner(bsCorner, "tr"), panel, w, h, inset);
+    }
+
+    /**
+     * Canonicalise a stored corner token to one of {@code center|tl|tr|bl|br}, falling back to
+     * {@code fallback} (and LOGGING) when it is unrecognised.
+     *
+     * <p>The decode below reads left/right and top/bottom from the token's shape
+     * ({@code endsWith("r")} / {@code startsWith("b")}), so an unknown string resolves to
+     * neither-right-nor-bottom — top-left — no matter what the user actually picked. That silent
+     * mis-decode is what made a "top right" selection render top left. Naming it in the log turns
+     * a wrong position into a diagnosable one. The API layer rejects unknown corners at ingest
+     * (StreamingApiHandler.VALID_CORNERS); this is the second line of defence for a config written
+     * by an older build, a hand edit, or an import.
+     */
+    private static String canonicalCorner(String corner, String fallback) {
+        if (corner != null) {
+            String c = corner.trim().toLowerCase();
+            if ("center".equals(c) || "tl".equals(c) || "tr".equals(c)
+                    || "bl".equals(c) || "br".equals(c)) {
+                return c;
+            }
+            logger.warn("blindspot/camview: unknown corner '" + corner
+                + "' — falling back to " + fallback + " (expected center|tl|tr|bl|br)");
+        }
+        return fallback;
+    }
+
+    /** Anchor a w×h card at a CANONICAL corner within {@code panel}, inset from the edges.
+     *  Shared by the blind-spot and camera-view preset paths so the two can never disagree
+     *  about what a corner code means. */
+    private static int[] cornerRect(String canonicalCorner, android.graphics.Point panel,
+                                    int w, int h, int inset) {
+        if ("center".equals(canonicalCorner)) {
             return new int[]{ (panel.x - w) / 2, (panel.y - h) / 2, w, h };
         }
-        boolean right = corner.endsWith("r");
-        boolean bottom = corner.startsWith("b");
+        boolean right = canonicalCorner.endsWith("r");
+        boolean bottom = canonicalCorner.startsWith("b");
         int x = right ? panel.x - w - inset : inset;
         int y = bottom ? panel.y - h - inset : inset;
         return new int[]{x, y, w, h};
@@ -5094,6 +6082,24 @@ public class GpuSurveillancePipeline {
             w = Math.max(160, w); h = Math.max(120, h);
             x = Math.max(0, x); y = Math.max(0, y);
         }
+        return new int[]{x, y, w, h};
+    }
+
+    /**
+     * {@link #clampBsRect} against an EXPLICIT panel — pure arithmetic, no display query.
+     * clampBsRect resolves the panel itself, and for a cluster target that reaches
+     * clusterDisplaySize() → a {@code dumpsys display} shell-out, which may run only on
+     * projThread (never on the 250ms turn loop). Callers on that loop pass the panel size
+     * cached by the last full resolve, the same idiom presetRect uses.
+     */
+    private static int[] clampBsRectTo(int x, int y, int w, int h, int panelW, int panelH) {
+        w = Math.max(160, Math.min(w, panelW));
+        h = Math.max(120, Math.min(h, panelH));
+        double want = (double) BS_WIDTH / BS_HEIGHT;   // 4:3, all rotations (see clampBsRect)
+        if ((double) w / h > want) w = (int) (h * want);
+        else                       h = (int) (w / want);
+        x = Math.max(0, Math.min(x, panelW - w));
+        y = Math.max(0, Math.min(y, panelH - h));
         return new int[]{x, y, w, h};
     }
 
@@ -5268,7 +6274,14 @@ public class GpuSurveillancePipeline {
             // resolveBsGeometry() below resets bsTarget to head_unit, so every subsequent
             // re-notify then short-circuited on isClusterTarget() and the camview card never
             // showed on the cluster at all.
-            boolean camViewCluster = camViewActive && !blindSpotEnabled && isCamViewClusterTarget();
+            // Ownership is `laneProgram == PROG_CAMVIEW`, NOT `!blindSpotEnabled`. Blind-spot can be
+            // ENABLED (armed, waiting on a turn signal) while a camera view actually owns the lane —
+            // the file documents that state as reachable. With the old test, camViewCluster went
+            // false there and the branch below took resolveBsGeometry(), overwriting the camera
+            // view's cluster rect with a head-unit-sized blind-spot rect AND resetting bsTarget,
+            // which then broke every later re-notify (audit 2026-08).
+            boolean camViewCluster = camViewOwnsLane()
+                    && isCamViewClusterTarget();
             if (!isClusterTarget() && !camViewCluster) return;
             com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
             if (layer == null || !layer.isCreated()) return;
@@ -5333,6 +6346,34 @@ public class GpuSurveillancePipeline {
             } catch (Throwable t) {
                 sustained = false;
             }
+            // CONDITIONAL GATE on the cold-open re-show. The clause above deliberately
+            // shows the card even when bsLayerVisible is already false (the signal
+            // cleared during the 1-3.5s fission materialise), which would otherwise
+            // walk straight past the speed/reverse gate the tick applies. Re-check it
+            // here so a blocked gate can't be back-doored by the linger re-show. Skipped
+            // for a camview session — this gate belongs to the blind-spot program only.
+            // holding=true: this is a re-show for a session the driver was already
+            // granted, so it must use the same widened threshold the tick used to allow
+            // it — reading the raw bsLayerVisible (false by now, the tick hid the card)
+            // would apply the narrow turn-ON bound and contradict that verdict.
+            if (!camViewCluster && blindSpotEnabled) {
+                String block = bsGateBlockReason(
+                    com.overdrive.app.config.UnifiedConfigManager.getBlindSpot(), true);
+                if (!block.isEmpty()) {
+                    logger.info("onClusterProjectionReady: BS gate blocks show (" + block + ")");
+                    // Don't leave a TRANSIENT (BS-only) projection open with nothing to
+                    // paint — that's blanked gauges showing an empty screen for the whole
+                    // linger. A sustained holder (nav map / camview) owns its own content,
+                    // so only collapse the linger when nobody else is holding.
+                    if (!sustained) {
+                        try {
+                            com.overdrive.app.surveillance.ClusterProjectionController
+                                .getInstance().forceClose("bs-gate-blocked");
+                        } catch (Throwable ignored) {}
+                    }
+                    return;
+                }
+            }
             if (bsLayerVisible || !sustained) clusterShowWhenReady();
         } catch (Throwable t) {
             logger.warn("onClusterProjectionReady failed: " + t.getMessage());
@@ -5347,6 +6388,12 @@ public class GpuSurveillancePipeline {
      *  just re-resolves geometry; the projection opens lazily on the next signal. */
     public void retargetBlindSpot() {
         try {
+            // Not while a CAMERA VIEW owns the shared lane: this rewrites bsTarget, can
+            // force-close the cluster projection and re-stack the layer, and then pushes a
+            // blind-spot rect. A blind-spot target switch used to yank a cluster camera view off
+            // the fission stack, making it vanish (audit 2026-08). The new target is persisted, and
+            // blind-spot re-resolves target + geometry when it next takes the lane.
+            if (camViewOwnsLane()) return;
             com.overdrive.app.config.UnifiedConfigManager.forceReload();
             org.json.JSONObject bs = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
             String newTarget = (bs != null) ? bs.optString("target", "head_unit") : "head_unit";
@@ -5405,6 +6452,12 @@ public class GpuSurveillancePipeline {
      *  view 7/8 + show, hidden after BS_OFF_DEBOUNCE_MS of no signal. */
     private void startBsTurnLoop() {
         if (bsTurnExec != null) return;
+        // A FRESH session must never inherit a user-dismiss latch. stopBsTurnLoop already
+        // clears it, but clearing here too makes it impossible for any ordering (a dismiss
+        // that raced a teardown, a stop path that threw before the reset) to carry a stale
+        // `true` into the new loop and silently suppress the first turn signal's card.
+        // Cheap volatile write; the tick isn't scheduled yet, so nothing can observe a tear.
+        bsUserDismissed = false;
         bsTurnExec = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "BsTurnTrigger");
             t.setDaemon(true);
@@ -5421,6 +6474,18 @@ public class GpuSurveillancePipeline {
             bsTurnExec = null;
         }
         bsLastTurnOnMs = 0L;
+        bsLastLampOnMs = 0L;
+        // Session state — clear it with the clocks. A dismiss is scoped to the display
+        // session that was showing; carrying it across a disable→re-enable (or an
+        // ACC cycle) would suppress the FIRST turn signal of the new session, with no ✕
+        // on screen to explain why. The turn loop is the only consumer, and it is down
+        // from here, so this cannot race a tick's show decision.
+        bsUserDismissed = false;
+        // NOTE: deliberately does NOT reset bsGateAllowed/bsGateReason. shutdownNow()
+        // interrupts but does not AWAIT termination, so a tick already past its
+        // blindSpotEnabled check would publish after the reset and re-latch a stale
+        // BLOCK. The readers resolve "loop is down" from bsTurnExec==null instead, which
+        // keeps the turn loop the single writer of those fields.
     }
 
     /**
@@ -5442,7 +6507,8 @@ public class GpuSurveillancePipeline {
             // ordering barrier (EGL_BAD_NATIVE_WINDOW / use-after-release risk). So
             // run the disable on a SEPARATE short-lived thread, never inline.
             long hideAt = camViewHideAtMs;
-            if (hideAt > 0 && android.os.SystemClock.elapsedRealtime() >= hideAt) {
+            if (hideAt > 0 && android.os.SystemClock.elapsedRealtime() >= hideAt
+                    && camViewAutoHideFired.compareAndSet(false, true)) {
                 camViewHideAtMs = 0L;   // one-shot: don't re-dispatch every tick
                 Thread t = new Thread(this::disableCamView, "CamViewAutoHide");
                 t.setDaemon(true);
@@ -5469,18 +6535,36 @@ public class GpuSurveillancePipeline {
                 // Configure the shared scaler for the camview program on first entry /
                 // after a program handover (transition-only, not every tick).
                 if (laneProgram != PROG_CAMVIEW) {
-                    com.overdrive.app.streaming.GpuStreamScaler s = bsScaler;
-                    if (s != null) {
-                        // Plain camera view: modes 0-4 do NOT sample the blind-spot stitch
-                        // path, so no calibration/warp is applied (clean single-cam/mosaic).
-                        s.setViewMode(camViewMode);
-                    }
                     // Point the shared geometry fields at the camview rect + target so the
                     // existing show helpers (setBlindSpotVisible / clusterShowWhenReady)
-                    // place the layer where camview wants it.
+                    // place the layer where camview wants it. FIRST, because it refreshes
+                    // camViewCorner, which the composite branch below aligns rotation to.
                     bsTarget = camViewTarget;
                     resolveCamViewGeometry();
                     bsGeomRect = camViewGeomRect;
+                    com.overdrive.app.streaming.GpuStreamScaler s = bsScaler;
+                    if (s != null) {
+                        s.setViewMode(camViewMode);
+                        if (camViewMode == 7 || camViewMode == 8) {
+                            // Views 7/8 sample the blind-spot stitch path, so they need the
+                            // dialed calibration + merge mode + fisheye — WITHOUT it the
+                            // stitch runs on identity odParams and mis-projects. Shares the
+                            // blindspot.* settings by design: tune the card, the composite
+                            // camera view follows. Rotation comes from that same per-side
+                            // config rather than 0 (a 90° card angle applies here too),
+                            // resolved against THIS view's side — not the card's.
+                            // forCamView=true: this scaler is rendering the CAMERA VIEW, so a
+                            // rotated composite must pillarbox against camViewCorner.
+                            applyBlindSpotCalibration(s, camViewMode, true);
+                        } else {
+                            // Plain camera view: modes 0-4 do NOT sample the stitch path, so
+                            // no calibration/warp is applied (clean single-cam/mosaic). Reset
+                            // the scaler-wide ROTATION uniform — blind-spot sets it for its
+                            // side/rear card, and inheriting that renders a plain camera view
+                            // sideways or upside-down.
+                            s.setContentRotation(0, 0);
+                        }
+                    }
                     laneProgram = PROG_CAMVIEW;
                 }
 
@@ -5501,6 +6585,13 @@ public class GpuSurveillancePipeline {
                     // each tick (cheap no-op once held). Released in disableCamView / arbiter.
                     c.acquireSustained("camview");
                     bsLayerVisible = true;   // intent
+                    // The fps ramp is edge-detected inside setBlindSpotVisible, which this
+                    // raw write bypasses — so a CLUSTER camview under an enabled-but-idle
+                    // blind-spot never triggered a reconcile and rendered at the BS idle
+                    // rate (~1fps, a frozen image). Notify explicitly; it is edge-guarded,
+                    // so the per-tick re-assert costs nothing. Also keeps
+                    // bsLastNotifiedVisible in sync so the later hide still fires.
+                    fireBsVisibilityChanged();
                     if (c.isReady()) clusterShowWhenReady();
                 } else {
                     if (!bsLayerVisible) setBlindSpotVisible(true);
@@ -5527,9 +6618,237 @@ public class GpuSurveillancePipeline {
                 if (camViewActive) { camViewTick(); }
                 return;
             }
-            // Blind-spot is enabled and owns the lane. If it was just handed the lane
+            // Config + turn-signal read hoisted ABOVE the program re-assert below: the
+            // camview yield needs both to decide whether blind-spot wants the lane at
+            // all, and claiming the lane first is what caused the 4Hz hide/show blink.
+            org.json.JSONObject bs = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+            // Turn-gated: daemon owns the light HAL. readTurnNow packs bit0=L,bit1=R.
+            int packed = com.overdrive.app.byd.BydDataCollector.getInstance().readTurnNow();
+            boolean leftOn = packed > 0 && (packed & 0x1) != 0;
+            boolean rightOn = packed > 0 && (packed & 0x2) != 0;
+            int side = (leftOn && !rightOn) ? 7 : (rightOn && !leftOn) ? 8 : 0;  // both/none → hide
+            long now = android.os.SystemClock.elapsedRealtime();
+
+            // ── Yield to camera-view when blind-spot has NOTHING to show ────────────
+            // Blind-spot priority (below) is about not MASKING a turn signal, not about
+            // owning the lane while idle. An explicit camera-view request — from an
+            // automation, a key mapping, or /api/camview/show — must still render
+            // whenever BS isn't actually using the lane: no turn signal, or a signal the
+            // conditional gate is suppressing. Without this, enabling blind-spot silently
+            // kills "show camera view" (enableCamView never shows the layer itself; it
+            // relies entirely on camViewTick), and turning ON "hide in reverse" made that
+            // visible because the reverse-camera case is exactly when a user reaches for
+            // the rear view.
+            //
+            // THIS MUST PRECEDE the `laneProgram != PROG_BS` restore. When the restore ran
+            // first it set laneProgram=PROG_BS unconditionally, which re-armed the
+            // hand-over-hidden guard below (setBlindSpotVisible(false) → layer.hide()) and
+            // then camViewTick's own `laneProgram != PROG_CAMVIEW` reconfig showed it again
+            // — a hide/show SurfaceControl pair EVERY 250ms tick, forever. That was the
+            // "camera view blinks while blind-spot is enabled" defect, plus its two
+            // side effects: an 8Hz fps-ramp/PASS-1C gate flip, and a `dumpsys display`
+            // shell-out per tick on this thread (camview's cluster reconfig →
+            // resolveCamViewGeometry → clusterDisplaySize), which the I9 rule forbids.
+            // Deciding to yield BEFORE claiming the lane makes the handover one-shot
+            // again: the guard below fires on the real BS→camview edge and nothing
+            // re-arms it. The reverse preemption is unchanged — the moment a signal
+            // arrives AND the gate allows it, bsWantsLane goes true, we stop yielding and
+            // the restore re-asserts the BS program on that same tick.
+            //
+            // Skipping the geometry/rotation maintenance below is REQUIRED on this path,
+            // not just cheaper: bsGeomRect and the scaler's rotation uniform are SHARED
+            // fields that camview owns while it holds the lane, so the orientation repair
+            // and the AUTO-rotation re-apply would clobber the live camera view.
+            if (camViewActive) {
+                // AUTO-HIDE IS EVALUATED HERE, not only inside camViewTick. The deadline
+                // check used to live solely in that tick, which runs only when camview
+                // actually gets the lane — so a camview requested while blind-spot held it
+                // (debugPreview on, or a sustained turn signal) never aged out: it stayed
+                // "active" indefinitely, pinning the camera at the camview fps and leaving
+                // an orphaned ✕ on screen with nothing behind it. Checking on every tick
+                // makes the timeout mean wall-clock time, independent of lane ownership.
+                long cvHideAt = camViewHideAtMs;
+                if (cvHideAt > 0 && now >= cvHideAt
+                        && camViewAutoHideFired.compareAndSet(false, true)) {
+                    camViewHideAtMs = 0L;
+                    Thread t = new Thread(this::disableCamView, "CamViewAutoHide");
+                    t.setDaemon(true);
+                    t.start();
+                    return;   // next tick sees camViewActive=false and proceeds normally
+                }
+                // bsUserDismissed must be folded in HERE too, not only at the show
+                // decision below: after the ✕ tap the card will not be shown for the rest
+                // of this session, so blind-spot does not actually want the lane. Without
+                // it a held indicator kept bsWantsLane true, camViewTick() was never
+                // reached, and the ✕ the user pressed to get their camera view back
+                // blanked the lane until the stalk was released.
+                boolean bsWantsLane = bs.optBoolean("debugPreview", false)
+                        || (side != 0 && !bsUserDismissed
+                            && bsGateBlockReason(bs, bsLayerVisible).isEmpty());
+                if (!bsWantsLane) {
+                    // Publish the gate verdict on EVERY yielding tick, not just signalling
+                    // ones: /api/bs/status reads these fields whenever the loop is up and BS
+                    // is enabled, so skipping the no-signal case froze the last verdict
+                    // ("below min 30") for as long as a camera view stayed up.
+                    bsEvalConditionalGate(bs);
+                    // SESSION BOOKKEEPING STILL RUNS. This branch returns early, skipping
+                    // the turn/hide logic below — but that logic also maintains state keyed
+                    // to the PHYSICAL STALK, which is independent of who owns the lane.
+                    // Starving it while a camera view is up would mean: the orphan-map
+                    // latch never re-arms (so the next BS cluster session skips the
+                    // parked-map dismiss it exists to guarantee), and notifySignalCleared()
+                    // never fires (so a 90s max-cap lockout could never lift). Both are
+                    // cheap, idempotent, and correct to do here.
+                    if (side != 0) bsLastLampOnMs = now;
+                    if (side == 0) {
+                        // BLIND-SPOT's OWN target, read from config — NOT isClusterTarget().
+                        // That helper reads the SHARED bsTarget field, which camViewTick
+                        // overwrites with camViewTarget on the tick it takes the lane. So on
+                        // every yielding tick after the handover it answers "is CAMVIEW on the
+                        // cluster", and both answers are wrong here: a cluster BS + head-unit
+                        // camview would SKIP the clear, stranding a 90s max-cap lockout that
+                        // only a real indicator-off can lift (next signal → no card at all),
+                        // and the inverse would poke a controller this BS never uses. Plain
+                        // string read off the config already in hand — no panel query.
+                        if ("cluster".equals(bs.optString("target", "head_unit"))) {
+                            try {
+                                com.overdrive.app.surveillance.ClusterProjectionController
+                                    .getInstance().notifySignalCleared();
+                            } catch (Throwable ignored) {}
+                        }
+                        if ((now - bsLastLampOnMs) >= BS_OFF_DEBOUNCE_MS) {
+                            bsDismissedOrphanMap = false;
+                            // Clear the user-dismiss latch on the SAME genuine session end.
+                            // CRITICAL: this branch returns before the hide-branch clear
+                            // below ever runs, so while a camera view is active (the yield
+                            // path) that clear is starved — and without this line one ✕ tap
+                            // would suppress the blind-spot card across ALL later turn
+                            // signals, making a safety-view dismiss permanently sticky.
+                            // Same debounce + !signalOn condition as the orphan-map latch
+                            // beside it (a blink off-phase must not clear it mid-session).
+                            bsUserDismissed = false;
+                        }
+                    }
+                    // Hand over a HIDDEN layer when blind-spot still owns it: camViewTick
+                    // reconfigures only on a program change, so a layer left shown with BS
+                    // geometry would flash the BS rect for one tick before camview's rect
+                    // lands. Gated on bsLayerVisible so the common path (BS already hidden)
+                    // costs nothing and doesn't churn the fps-ramp edge — camViewTick's own
+                    // setBlindSpotVisible(true) supplies the off→on edge RMM needs. With the
+                    // yield now decided BEFORE the restore, laneProgram is still
+                    // PROG_CAMVIEW on every tick after the first, so this fires ONCE per
+                    // real handover instead of every tick.
+                    if (laneProgram == PROG_BS && bsLayerVisible) {
+                        setBlindSpotVisible(false);
+                        // Release the TRANSIENT cluster projection BS opened for this
+                        // session. The linger close normally happens in the hide branch
+                        // below, which this return skips — so without it a BS-opened
+                        // projection stayed up with the gauges blanked, and if camview is
+                        // head-unit-targeted nothing would paint on the cluster or ever
+                        // close it. camViewTick re-acquires its own sustained hold on the
+                        // next line if it wants the cluster, and a sustained holder makes
+                        // maybeLingerClose a no-op — so this cannot close a projection
+                        // camview still needs.
+                        if (isClusterTarget()) {
+                            try {
+                                com.overdrive.app.surveillance.ClusterProjectionController
+                                    .getInstance().requestCloseLingered();
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                    camViewTick();
+                    return;
+                }
+            }
+            // Blind-spot is enabled and WANTS the lane. If it was just handed the lane
             // back from camview (laneProgram != PROG_BS), re-assert the BS program.
             if (laneProgram != PROG_BS) {
+                // FULL program restore. camViewTick clobbers the SHARED program fields —
+                // bsTarget, bsGeomRect and the scaler's rotation uniform — so restoring
+                // only viewMode+calibration left blind-spot running on camview's target
+                // and rect. Concretely: a cluster-targeted camview left bsTarget="cluster"
+                // behind, so the very next turn signal made a HEAD-UNIT-configured
+                // blind-spot open the OEM cluster projection and blank the driver's
+                // gauges, painted at camview's cluster rect. It was also STICKY — the
+                // head-unit orientation-repair path that would have called
+                // resolveBsGeometry() is itself gated on !cluster, so it never ran.
+                // Restore bsTarget from config FIRST and CHEAPLY — a plain string read, no
+                // panel query. Doing this via resolveBsGeometry() would be wrong here: for
+                // a cluster target that helper reaches clusterDisplaySize() → a `dumpsys
+                // display` shell-out, which per the I9 rule may run ONLY on projThread,
+                // never on this 250ms turn loop.
+                org.json.JSONObject bsCfg =
+                    com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+                bsTarget = bsCfg.optString("target", "head_unit");
+                // Now the rect + rotation. Geometry is recomputed only for the HEAD-UNIT
+                // target, whose displaySize() is a cheap DisplayManager read; the cluster
+                // is a fixed 1920×720 that never rotates, and its rect is re-resolved on
+                // the projection-ready callback (projThread) where the dumpsys is legal.
+                // Either way the ROTATION uniform is re-applied, since camViewTick zeroes
+                // it and a stale 0 would render a side/rear BS card unrotated.
+                if (!isClusterTarget()) {
+                    resolveBsGeometry();
+                } else {
+                    // CLUSTER: cannot call resolveBsGeometry (dumpsys), and cannot rely on
+                    // onClusterProjectionReady to re-resolve later either — when a cluster
+                    // camview already holds the projection OPEN, BS's requestOpen() returns
+                    // early (ST_OPEN) so that callback never fires, and the card would paint
+                    // at camview's rect for the whole session. Recompute the rect here from
+                    // the panel size cached by the last full resolve, the same dumpsys-free
+                    // idiom setBlindSpotViewMode uses for a turn-side flip.
+                    bsRotationDeg = resolveBsRotation(bsCfg, bsViewMode);
+                    org.json.JSONObject gCl = currentGeometryObj();
+                    boolean rectRestored = false;
+                    // Panel dims for the pure-math clamps below. enableBlindSpot always
+                    // runs resolveBsGeometry (which seeds these), so the cache is warm on
+                    // every arm path; fall back to the fixed cluster panel anyway so a
+                    // cold cache can never leave camview's rect in place — the same
+                    // 1920×720 clusterDisplaySize itself defaults to, no display query.
+                    int panW = bsLastPanelW > 0 ? bsLastPanelW : 1920;
+                    int panH = bsLastPanelH > 0 ? bsLastPanelH : 720;
+                    if (gCl != null && gCl.has("sizePct")) {
+                        bsSizePct = gCl.optInt("sizePct", bsSizePct);
+                        bsCorner = resolveBsCorner(gCl);
+                        int[] pr = presetRect(new android.graphics.Point(panW, panH));
+                        if (pr != null) {
+                            // CLAMP, as resolveBsGeometry does after its own presetRect:
+                            // presetRect derives h from w at 4:3, so on the short 1920×720
+                            // cluster any sizePct above 50 overflows the panel height (the
+                            // UI's cluster default is 80 → 1536×1152). Unclamped, the
+                            // restored card paints oversized and bottom-clipped over the
+                            // gauges, and differs from the same config's armed geometry.
+                            int[] cr = clampBsRectTo(pr[0], pr[1], pr[2], pr[3], panW, panH);
+                            bsGeomRect = new int[]{cr[0], cr[1], cr[2], cr[3]};
+                            rectRestored = true;
+                        }
+                    } else if (gCl != null && gCl.has("x") && gCl.has("w")) {
+                        // ABSOLUTE cluster geometry. Unlike the turn-side-flip path this
+                        // must NOT be "left alone": bsGeomRect currently holds CAMVIEW's
+                        // rect, so leaving it would paint the safety card at the camera
+                        // view's position for the whole signal session (and the
+                        // orientation repair that would fix it is head-unit-only).
+                        int[] ar = clampBsRectTo(gCl.optInt("x"), gCl.optInt("y"),
+                                                 gCl.optInt("w"), gCl.optInt("h"),
+                                                 panW, panH);
+                        bsGeomRect = new int[]{ar[0], ar[1], ar[2], ar[3]};
+                        rectRestored = true;
+                    }
+                    if (!rectRestored) {
+                        // NOTHING persisted for the cluster (the common case — the user
+                        // never saved a cluster preset). Fall back to the same default
+                        // card resolveBsGeometry would compute, so the rect is BS's own
+                        // rather than the camera view's.
+                        int defW = Math.max(320, (int) (panW * 0.80));
+                        int defH = (int) (defW * (double) BS_HEIGHT / BS_WIDTH);
+                        int[] dr = clampBsRectTo(panW - defW - 24, 24, defW, defH,
+                                                 panW, panH);
+                        bsGeomRect = new int[]{dr[0], dr[1], dr[2], dr[3]};
+                    }
+                    // No setContentRotation here: applyBlindSpotCalibration() below is the
+                    // authoritative push (same angle, and it resolves alignX from the
+                    // config rather than the bsCorner field), so a call here would only be
+                    // overwritten three lines later.
+                }
                 com.overdrive.app.streaming.GpuStreamScaler s = bsScaler;
                 if (s != null) { s.setViewMode(bsViewMode); applyBlindSpotCalibration(s); }
                 // Blind-spot has priority and now OWNS the lane + projection lifecycle.
@@ -5539,6 +6858,32 @@ public class GpuSurveillancePipeline {
                 // from here. Idempotent (no-op if camview never held). This closes the
                 // "camview stuck sustained → BS transient gauge-restore disarmed" gap.
                 try { com.overdrive.app.surveillance.ClusterProjectionController.getInstance().releaseSustained("camview"); } catch (Throwable ignored) {}
+                // PUSH the restored rect to the LAYER, not just the field. camview can hand
+                // back a layer that is still SHOWN (its own setBlindSpotVisible(true)), and
+                // every setGeometry below is gated on the layer being hidden or the side
+                // changing: the show branch only calls setBlindSpotVisible when
+                // !bsLayerVisible, setBlindSpotViewMode only fires when side != bsViewMode,
+                // and clusterShowWhenReady is wrapped in !layer.isShown(). So preempting a
+                // camview with the SAME side already selected left the blind-spot card
+                // painting at CAMVIEW's rect for the whole signal session.
+                // ONLY for a real camview handover (PROG_CAMVIEW). laneProgram is also
+                // PROG_NONE — enableCamView sets it while a BS card may still be SHOWING,
+                // and on that tick BS often still wants the lane (so no yield happens) and
+                // lands here. Repainting then is pointless (the rect is already BS's) and
+                // the cluster branch would blank a live safety card for a projThread hop.
+                // Every other PROG_NONE route already clears bsLayerVisible first.
+                if (bsLayerVisible && laneProgram == PROG_CAMVIEW) {
+                    if (!isClusterTarget()) {
+                        // Re-asserts layerStack 0 + the restored rect in one transaction.
+                        // Idempotent, and the fps-ramp edge is already latched true.
+                        setBlindSpotVisible(true);
+                    } else {
+                        // CLUSTER: the inherited layer may be on camview's stack, and this
+                        // thread may not resolve the live one (dumpsys → I9). Drop to hidden
+                        // and let the gated show below re-place it on the correct stack.
+                        setBlindSpotVisible(false);
+                    }
+                }
                 laneProgram = PROG_BS;
             }
             boolean cluster = isClusterTarget();
@@ -5566,28 +6911,29 @@ public class GpuSurveillancePipeline {
                 } catch (Throwable ignored) {}
             }
 
-            org.json.JSONObject bs = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
             // AUTO rotation (direction-of-travel): when rotation="auto" the effective
             // angle depends on gear (forward=base, reverse=base+180), so it must be
             // re-evaluated live rather than only on a settings write. Re-resolve
-            // cheaply each tick and re-apply only on change. AUTO flips by 180° only,
-            // so base↔base+180 keeps the same 4:3/3:4 aspect parity — the dest rect is
-            // unchanged, so we skip the panel query entirely (no resolveBsGeometry).
-            // That also keeps this cluster-safe: unlike the orientation-change branch
-            // above, it never touches clusterDisplaySize/dumpsys on the 250ms loop.
-            // No-op churn for fixed rotations (want == bsRotationDeg in steady state).
+            // cheaply each tick and re-apply only on change. Rotation is applied in the
+            // GL vertex shader (bsScaler.setContentRotation), NOT the SurfaceControl
+            // layer (a 90/270 LAYER transform blanks the card on this firmware — issue
+            // #164), so the change is a single cheap uniform swap: no setGeometry, no
+            // panel query, no dumpsys — keeping this cluster-safe on the 250ms loop.
+            // The dest rect is always the buffer's 4:3, so it never needs recomputing
+            // on a rotation change. No-op churn when want == bsRotationDeg (steady state).
             {
-                int wantRot = resolveBsRotation(bs);
+                // PER-SIDE: resolve for the CURRENT view (7=left/8=right). A side
+                // switch above (setBlindSpotViewMode) already re-applied the new side's
+                // angle and synced bsRotationDeg, so here we only catch the AUTO gear
+                // flip (forward↔reverse) for the side we're on — no double-apply churn.
+                int wantRot = resolveBsRotation(bs, bsViewMode);
                 if (wantRot != bsRotationDeg) {
                     bsRotationDeg = wantRot;
-                    com.overdrive.app.surveillance.BsNativeLayer rl = bsLayer;
-                    if (rl != null) {
-                        rl.setBufferRotation(wantRot);
-                        if (bsLayerVisible && rl.isCreated()) {
-                            int[] g = bsGeomRect;
-                            rl.setGeometry(g[0], g[1], g[2], g[3]);
-                        }
-                    }
+                    com.overdrive.app.streaming.GpuStreamScaler bss = bsScaler;
+                    // bsCorner reflects the current side (setBlindSpotViewMode's
+                    // reposition runs before this on a side change), so align the
+                    // rotated card to that side's edge.
+                    if (bss != null) bss.setContentRotation(wantRot, bsRotationAlignX());
                 }
             }
             boolean debugPreview = bs.optBoolean("debugPreview", false);
@@ -5616,12 +6962,43 @@ public class GpuSurveillancePipeline {
                 }
                 return;
             }
-            // Turn-gated: daemon owns the light HAL. readTurnNow packs bit0=L,bit1=R.
-            int packed = com.overdrive.app.byd.BydDataCollector.getInstance().readTurnNow();
-            boolean leftOn = packed > 0 && (packed & 0x1) != 0;
-            boolean rightOn = packed > 0 && (packed & 0x2) != 0;
-            int side = (leftOn && !rightOn) ? 7 : (rightOn && !leftOn) ? 8 : 0;  // both/none → hide
-            long now = android.os.SystemClock.elapsedRealtime();
+            // Conditional display (speed window / reverse). Evaluated on EVERY tick, so
+            // the verdict published for /api/bs/status can never describe a condition
+            // that has already passed. A blocked gate suppresses the display, but it is
+            // deliberately kept DISTINCT from side==0: the no-indicator branch below
+            // also means "the driver let go of the stalk", and two things there are
+            // keyed to that meaning rather than to "card not shown" —
+            //   * notifySignalCleared() lifts the 90s max-cap lockout, whose whole
+            //     contract is "only a real indicator-off lifts it, so a STUCK signal
+            //     stays capped". A gate block can return to allowed with no driver
+            //     action, so forging a clear here would let a stuck indicator re-blank
+            //     the gauges every time the speed crossed a bound.
+            //   * bsDismissedOrphanMap re-arms per SIGNAL SESSION; re-arming it on a
+            //     gate blip would split one session into many and re-issue the
+            //     full-JSON navMap config write on this 250ms thread each time.
+            // So gateOk only gates the SHOW, and the hide runs through the same
+            // debounced path without claiming the signal ended.
+            //
+            // bsLastTurnOnMs is stamped only on ticks that actually DISPLAY (below), not
+            // on every signal-on tick: it is the "last tick that wanted the card up"
+            // clock the BS_OFF_DEBOUNCE_MS hide is measured from. Stamping it while the
+            // gate blocks would keep re-arming the debounce for as long as the indicator
+            // was held, so a blocked card could never hide at all.
+            boolean gateOk = bsEvalConditionalGate(bs);
+            boolean signalOn = (side != 0);
+            // Last tick the LAMP was lit, independent of whether we displayed. Used to
+            // tell a blink off-phase (and a transient readTurnNow miss) from a genuine
+            // stalk release even while the gate is suppressing the card — the display
+            // clock below can't, because a gate block freezes it.
+            if (signalOn) bsLastLampOnMs = now;
+            if (!gateOk) side = 0;
+            // USER DISMISS (floating ✕): suppress the show for the REST OF THIS SESSION.
+            // Folded in here with the gate rather than earlier so it only affects the
+            // SHOW — every "the stalk was released" behaviour below (notifySignalCleared
+            // lifting the 90s max-cap, the orphan-map latch re-arm) stays keyed to the
+            // physical signal, exactly as the gate block is. Cleared in the else branch
+            // once the session genuinely ends, so the next signal shows the card again.
+            if (bsUserDismissed) side = 0;
             if (side != 0) {
                 bsLastTurnOnMs = now;
                 if (side != bsViewMode) setBlindSpotViewMode(side);
@@ -5659,19 +7036,50 @@ public class GpuSurveillancePipeline {
                     if (!bsLayerVisible) setBlindSpotVisible(true);
                 }
             } else {
-                // side == 0 (no indicator). Lift any max-cap lockout on the first
-                // genuinely-clear tick so a fresh indicator after the cap re-opens
-                // normally (a real blink reaches here between flashes; a forgotten
-                // signal never does, keeping the cap effective).
-                if (cluster && side == 0) {
+                // Not showing. Lift any max-cap lockout on the first GENUINELY-clear
+                // tick so a fresh indicator after the cap re-opens normally (a real
+                // blink reaches here between flashes; a forgotten signal never does,
+                // keeping the cap effective). Keyed to !signalOn, NOT to side==0: a
+                // gate-blocked tick has the indicator physically ON, and treating that
+                // as a clear would hand a stuck signal an unlimited supply of fresh
+                // 90s gauge-blanking windows.
+                if (cluster && !signalOn) {
                     com.overdrive.app.surveillance.ClusterProjectionController.getInstance()
                         .notifySignalCleared();
                 }
+                // Re-arm the orphan-dismiss latch once a signal SESSION has really ended.
+                // Two conditions, and both are load-bearing:
+                //   !signalOn        — a gate block leaves the indicator physically ON, and
+                //                      re-arming then would re-issue the navMap write every
+                //                      time the speed crossed a bound.
+                //   past the debounce — the lamp reads 0 on every blink OFF-PHASE (~1.5Hz;
+                //                      that is precisely why BS_OFF_DEBOUNCE_MS exists), and
+                //                      readTurnNow() also returns -1 on a transient SDK
+                //                      miss. Keying on the raw !signalOn alone turned ONE
+                //                      full-JSON config write per session into one per
+                //                      blink — on this 250ms thread, under the cross-process
+                //                      config lock, invalidating every UID's config cache.
+                // Deliberately NOT nested in the hide block below: that block additionally
+                // requires bsLayerVisible, and a gate block hides the card mid-session, so
+                // the later genuine release would find it already false and never re-arm —
+                // leaving the latch consumed and the next session skipping the dismiss.
+                // Idempotent: assigning false when already false is free.
+                // Measured against bsLastLampOnMs (last tick the LAMP was lit), not
+                // bsLastTurnOnMs (last tick that DISPLAYED). While the gate blocks, the
+                // display clock is frozen, so a blink gap 800ms later would look like a
+                // session end even with the stalk still held — re-arming mid-session and
+                // costing an extra write per bound-crossing.
+                boolean sessionEnded = !signalOn && (now - bsLastLampOnMs) >= BS_OFF_DEBOUNCE_MS;
+                if (sessionEnded) bsDismissedOrphanMap = false;
+                // Release the user's ✕ dismiss on the same genuine session end. This is
+                // what keeps a dismiss NON-STICKY: the next turn signal shows the card
+                // again, so one tap can never leave a safety view suppressed. Keyed to
+                // sessionEnded (not bare !signalOn) for the same reason the latch above
+                // is — the lamp reads 0 on every blink off-phase, which would otherwise
+                // clear the dismiss mid-session and pop the card straight back up.
+                if (sessionEnded) bsUserDismissed = false;
                 if (bsLayerVisible && (now - bsLastTurnOnMs) >= BS_OFF_DEBOUNCE_MS) {
                     setBlindSpotVisible(false);
-                    // Signal session ended — re-arm the orphan-dismiss latch so the
-                    // next turn-signal open re-checks for a parked map.
-                    bsDismissedOrphanMap = false;
                     if (cluster) {
                         // Hide the card now; restore the gauges after the linger window
                         // (rides brief blink gaps without re-paying the open latency).
@@ -5682,6 +7090,12 @@ public class GpuSurveillancePipeline {
             }
         } catch (Throwable t) {
             logger.debug("bsTurnTick: " + t.getMessage());
+        } finally {
+            // Reconcile the floating ✕ from the authoritative post-tick state, on EVERY
+            // exit path (show, hide, dismiss, camview yield, early return). Edge-detected
+            // so it only broadcasts on a real transition. Lock-free here (the tick holds
+            // no lock at this point), matching emitBsCardState's off-lock contract.
+            fireBsCardStateChanged();
         }
     }
 
@@ -5725,6 +7139,12 @@ public class GpuSurveillancePipeline {
             logger.info("BS: NATIVE blind-spot lane disabled");
         } finally {
             bsLifecycleLock.unlock();
+            // Retract the ✕ if the card was showing when the feature was disabled. The
+            // turn loop is stopped in the teardown branch, so its finally-block reconcile
+            // won't run again — fire the hide edge here (outside the lock, like camview's
+            // emitCamViewState). No-op edge if the card wasn't showing. blindSpotEnabled
+            // is already false, so isBlindSpotCardShowing() is false → broadcasts closed.
+            fireBsCardStateChanged();
         }
     }
 
@@ -5818,6 +7238,29 @@ public class GpuSurveillancePipeline {
     public int getCamViewMode() { return camViewMode; }
     public String getCamViewTargetString() { return camViewTarget; }
 
+    /** True when the camera view is not just REQUESTED but actually driving the shared
+     *  lane with the layer shown — i.e. frames are on screen. Distinct from
+     *  {@link #isCamViewActive()}, which is only the request flag: blind-spot can own the
+     *  lane while a camview request stands, in which case nothing is rendering. */
+    public boolean isCamViewRendering() {
+        return camViewActive && laneProgram == PROG_CAMVIEW && bsLayerVisible;
+    }
+
+    /** True once the auto-hide deadline for the CURRENT camview request has fired. The
+     *  timeout path calls disableCamView() without clearing the persisted
+     *  camview.enabled, so a deferred-arm retry that only consulted config could re-arm a
+     *  view that just timed out. Cleared when a new session arms a fresh deadline. */
+    public boolean camViewAutoHideConsumed() { return camViewAutoHideFired.get(); }
+
+    /** True when a camera view is requested but blind-spot is ACTUALLY holding the shared
+     *  lane, so the view is waiting rather than failed. Requires laneProgram == PROG_BS,
+     *  not merely != PROG_CAMVIEW: a freshly built lane sits at PROG_NONE until the first
+     *  tick configures it, and reporting "masked" in that window would mislabel a view
+     *  that is simply about to appear. */
+    public boolean isCamViewMaskedByBlindSpot() {
+        return camViewActive && blindSpotEnabled && laneProgram == PROG_BS;
+    }
+
     /**
      * Show a camera view. Builds the shared lane if neither program has it up, then
      * marks camview active; the arbiter (bsTurnTick) applies the camview program
@@ -5837,10 +7280,12 @@ public class GpuSurveillancePipeline {
             if (camViewActive && isCamViewClusterTarget() && !"cluster".equals(newTarget)) {
                 try { com.overdrive.app.surveillance.ClusterProjectionController.getInstance().releaseSustained("camview"); } catch (Throwable ignored) {}
             }
-            camViewMode = (mode >= 0 && mode <= 4) ? mode : 0;
+            camViewMode = com.overdrive.app.server.StreamingApiHandler.isCamViewMode(mode) ? mode : 0;
             camViewTarget = newTarget;
             camViewHideAtMs = (autoHideSec > 0)
                 ? android.os.SystemClock.elapsedRealtime() + autoHideSec * 1000L : 0L;
+            // Re-arm the one-shot dispatch guard for this new session/deadline.
+            camViewAutoHideFired.set(false);
             resolveCamViewGeometry();
 
             if (!running || camera == null || camera.getGlHandler() == null) {
@@ -5929,6 +7374,19 @@ public class GpuSurveillancePipeline {
         try {
             wasActive = camViewActive;
             if (!camViewActive) return;
+            // Invalidate any pending deferred-arm retry. Placed AFTER the no-op early-out
+            // above, deliberately: pipeline.stop() calls this method unconditionally (a
+            // routine warmup restart does stop()→setMode), so cancelling before that
+            // return would kill a legitimate retry whose view has not armed yet
+            // (camViewActive==false for the whole deferral) — silently dropping the key
+            // press the retry exists to rescue. Here it only fires on a REAL teardown of a
+            // REAL session, which is exactly when a pending arm must not resurrect it.
+            // Direct static call (this class already calls StreamingApiHandler elsewhere)
+            // so R8 renaming can't break it, and it is a bare atomic increment — no lock,
+            // no I/O — so holding bsLifecycleLock across it is safe.
+            try {
+                com.overdrive.app.server.StreamingApiHandler.cancelCamViewArmRetry();
+            } catch (Throwable ignored) {}
             logger.info("CamView: disabling camera view...");
             camViewActive = false;
             camViewHideAtMs = 0L;
@@ -5984,13 +7442,58 @@ public class GpuSurveillancePipeline {
      * we never read, so it can never block the lifecycle path. Never throws.
      */
     private void emitCamViewState(boolean active, String target) {
+        emitOverlayCloseState(com.overdrive.app.overlay.StatusOverlayService.ACTION_CAMVIEW_STATE,
+                active, target, "camview-state-broadcast");
+    }
+
+    /**
+     * Fire an {@code am broadcast} telling the app-process close-button overlay
+     * (the blind-spot ✕ hosted in {@link com.overdrive.app.overlay.StatusOverlayService})
+     * that the blind-spot card appeared ({@code active=true}) or went away
+     * ({@code active=false}). Same zero-poll edge contract as {@link #emitCamViewState}
+     * — the poll reconcile in the overlay is the catch-up for a dropped broadcast.
+     */
+    private void emitBsCardState(boolean active, String target) {
+        emitOverlayCloseState(com.overdrive.app.overlay.StatusOverlayService.ACTION_BS_STATE,
+                active, target, "bs-state-broadcast");
+    }
+
+    /**
+     * Shared implementation for the camera-view / blind-spot close-button edge
+     * broadcasts. Best-effort + fully detached: a short-lived {@code am broadcast} exec
+     * whose output we drain-and-discard on a daemon thread, so it can never block the
+     * lifecycle path or wedge on a full pipe. Never throws.
+     */
+    private void emitOverlayCloseState(String action, boolean active, String target,
+                                       String threadName) {
         try {
             java.util.List<String> cmd = new java.util.ArrayList<>(java.util.Arrays.asList(
                     "am", "broadcast",
-                    "-a", com.overdrive.app.overlay.StatusOverlayService.ACTION_CAMVIEW_STATE,
+                    "-a", action,
                     "-p", "com.overdrive.app",
                     "--ez", "active", active ? "true" : "false"));
             if (target != null) { cmd.add("--es"); cmd.add("target"); cmd.add(target); }
+            // Carry the card's on-screen rect on the SHOW edge so the overlay can place its
+            // ✕ clear of the card immediately. Without it the button attaches on this edge
+            // but only learns the rect from the next /status poll (up to 3s, 30s when the
+            // overlay is idle-throttled) — so a card resized while hidden would swallow the
+            // ✕ for that whole window, since the card's SurfaceControl layer composites
+            // above any app window. Omitted when unresolved (receiver keeps its fixed inset).
+            // CLUSTER rects are in the 1920×720 cluster panel's space and the overlay can't
+            // draw there at all — it suppresses the ✕ on a cluster target. Sending one would
+            // leave cluster-space coordinates cached in the overlay, which a LATER head-unit
+            // show could then position against (a 1080-tall panel vs a 720-tall rect → the
+            // degenerate "card fills the panel" branch → ✕ back under the layer). Only the
+            // head-unit rect is meaningful to the ✕.
+            if (active && !"cluster".equals(target)) {
+                int[] lr = getLaneGeomRect();
+                if (lr != null) {
+                    cmd.add("--ei"); cmd.add("rectX"); cmd.add(Integer.toString(lr[0]));
+                    cmd.add("--ei"); cmd.add("rectY"); cmd.add(Integer.toString(lr[1]));
+                    cmd.add("--ei"); cmd.add("rectW"); cmd.add(Integer.toString(lr[2]));
+                    cmd.add("--ei"); cmd.add("rectH"); cmd.add(Integer.toString(lr[3]));
+                }
+            }
             Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
             // Detach: drain+discard on a daemon thread so the child can't wedge on a
             // full pipe, and never wait on the lifecycle thread.
@@ -5998,11 +7501,11 @@ public class GpuSurveillancePipeline {
             Thread drain = new Thread(() -> {
                 byte[] buf = new byte[256];
                 try { while (is.read(buf) != -1) { /* discard */ } } catch (Throwable ignored) {}
-            }, "camview-state-broadcast");
+            }, threadName);
             drain.setDaemon(true);
             drain.start();
         } catch (Throwable t) {
-            logger.debug("emitCamViewState failed: " + t.getMessage());
+            logger.debug("emitOverlayCloseState(" + action + ") failed: " + t.getMessage());
         }
     }
 
@@ -6023,7 +7526,13 @@ public class GpuSurveillancePipeline {
             int[] r;
             if (g != null && g.has("sizePct")) {
                 camViewSizePct = g.optInt("sizePct", camViewSizePct);
-                if (g.has("corner")) camViewCorner = g.optString("corner", camViewCorner);
+                // ALWAYS reset the corner for this target, canonicalised — do not leave the
+                // previous target's value in place when this one stores none. camViewCorner is a
+                // single field shared by head-unit and cluster, so a conditional assignment made
+                // the rendered position depend on which target was shown earlier: an identical
+                // config rendered bottom-right this boot (inherited field) and centre after a
+                // restart (fresh field). Absent → this lane's own "center" default.
+                camViewCorner = canonicalCorner(g.optString("corner", null), "center");
                 r = camViewPresetRect(panel);
             } else if (g != null && g.has("x") && g.has("w")) {
                 r = clampRectToPanel(g.optInt("x"), g.optInt("y"), g.optInt("w"), g.optInt("h"), panel);
@@ -6045,15 +7554,9 @@ public class GpuSurveillancePipeline {
         int w = (int) (panel.x * (p / 100.0));
         int h = (int) (w * (double) BS_HEIGHT / BS_WIDTH);
         int inset = 24;
-        String corner = (camViewCorner != null) ? camViewCorner : "center";
-        if ("center".equals(corner)) {
-            return clampRectToPanel((panel.x - w) / 2, (panel.y - h) / 2, w, h, panel);
-        }
-        boolean right = corner.endsWith("r");
-        boolean bottom = corner.startsWith("b");
-        int x = right ? panel.x - w - inset : inset;
-        int y = bottom ? panel.y - h - inset : inset;
-        return clampRectToPanel(x, y, w, h, panel);
+        // Camera-view defaults to CENTER (not the card's tr) when nothing is stored.
+        int[] r = cornerRect(canonicalCorner(camViewCorner, "center"), panel, w, h, inset);
+        return clampRectToPanel(r[0], r[1], r[2], r[3], panel);
     }
 
     /** Clamp a rect into the given panel, keeping the 4:3 buffer ratio (uniform scale). */
@@ -6203,6 +7706,71 @@ public class GpuSurveillancePipeline {
     public com.overdrive.app.streaming.WebSocketStreamServer getWebSocketServer() {
         return wsStreamServer;
     }
+
+    /** A lifecycle-bound /ws sink. The captured pair remains safe to remove
+     * even after a later disable/re-enable installs a different encoder. */
+    public static final class ExternalStreamClientSubscription {
+        private final HardwareEventRecorderGpu encoder;
+        private final com.overdrive.app.streaming.WebSocketStreamServer server;
+        private final HardwareEventRecorderGpu.StreamCallback callback;
+
+        private ExternalStreamClientSubscription(HardwareEventRecorderGpu encoder,
+                com.overdrive.app.streaming.WebSocketStreamServer server,
+                HardwareEventRecorderGpu.StreamCallback callback) {
+            this.encoder = encoder;
+            this.server = server;
+            this.callback = callback;
+        }
+
+        public HardwareEventRecorderGpu getEncoder() {
+            return encoder;
+        }
+    }
+
+    /**
+     * Atomically attach one single-port /ws client to the live encoder. This
+     * prevents a reconnect from adding its callback to an encoder that an idle
+     * shutdown or quality restart has already retired.
+     */
+    public ExternalStreamClientSubscription registerExternalStreamClient(
+            HardwareEventRecorderGpu.StreamCallback callback) {
+        if (callback == null) return null;
+        streamLifecycleLock.lock();
+        try {
+            HardwareEventRecorderGpu encoder = streamEncoder;
+            com.overdrive.app.streaming.WebSocketStreamServer server = wsStreamServer;
+            if (!streamingEnabled || encoder == null || server == null) {
+                return null;
+            }
+            encoder.addStreamCallback(callback);
+            server.registerExternalClient();
+            return new ExternalStreamClientSubscription(encoder, server, callback);
+        } catch (Throwable t) {
+            logger.warn("registerExternalStreamClient failed: " + t.getMessage());
+            return null;
+        } finally {
+            streamLifecycleLock.unlock();
+        }
+    }
+
+    /** Remove the exact subscription that was previously registered. */
+    public void unregisterExternalStreamClient(ExternalStreamClientSubscription subscription) {
+        if (subscription == null) return;
+        streamLifecycleLock.lock();
+        try {
+            subscription.encoder.removeStreamCallback(subscription.callback);
+            // disableStreaming shuts down and clears the current server under
+            // this same lock. Do not restart an idle timer on that retired
+            // server while cleaning up a socket that lost the race.
+            if (wsStreamServer == subscription.server) {
+                subscription.server.unregisterExternalClient();
+            }
+        } catch (Throwable t) {
+            logger.warn("unregisterExternalStreamClient failed: " + t.getMessage());
+        } finally {
+            streamLifecycleLock.unlock();
+        }
+    }
     
     /**
      * Sets the stream view mode (which camera to show).
@@ -6263,6 +7831,7 @@ public class GpuSurveillancePipeline {
         logger.info("Blind-spot merge mode set to " + mode);
     }
 
+<<<<<<< HEAD
     /** Forward blind-spot card clarity (views 7/8) to the scaler(s): contrast
      *  pivot (1.0 = neutral) and unsharp amount (0.0 = off). Pushes to BOTH the
      *  shared stream scaler (browser preview) and the dedicated BS lane's scaler
@@ -6272,6 +7841,22 @@ public class GpuSurveillancePipeline {
         if (ss != null) ss.setBlindSpotClarity(contrast, sharpen);
         com.overdrive.app.streaming.GpuStreamScaler bs = bsScaler;
         if (bs != null) bs.setBlindSpotClarity(contrast, sharpen);
+=======
+    /**
+     * Fisheye/lens-dewarp strength (0..100) for the single-camera blind-spot views
+     * (side/rear). Separate knob from recording.rectifyStrength. Pushes to BOTH the
+     * shared stream scaler (browser preview) and the dedicated BS lane's scaler (what
+     * the overlay renders), mirroring {@link #setBlindSpotMergeMode}. The dewarp is a
+     * no-op in the merged 'both' view (shader only samples it in the merge 1/2
+     * passthrough). No-op-safe when a lane isn't up.
+     */
+    public void setBlindSpotRectifyStrength(int strength) {
+        com.overdrive.app.streaming.GpuStreamScaler ss = streamScaler;
+        if (ss != null) ss.setBlindSpotRectifyStrength((float) strength);
+        com.overdrive.app.streaming.GpuStreamScaler bs = bsScaler;
+        if (bs != null) bs.setBlindSpotRectifyStrength((float) strength);
+        logger.info("Blind-spot fisheye strength set to " + strength);
+>>>>>>> upstream/main
     }
 
     /** Map the persisted string merge mode to the scaler's int code. */
@@ -6292,6 +7877,13 @@ public class GpuSurveillancePipeline {
     public void refreshBlindSpotRotation() {
         bsLifecycleLock.lock();
         try {
+            // Not while a CAMERA VIEW owns the shared lane. resolveBsGeometry() rewrites both
+            // bsGeomRect and bsTarget from the BLIND-SPOT config, so a blindspot rotation /
+            // mergeMode settings write used to shrink the on-screen camera view to the card's rect
+            // — and on a cluster camview it also flipped bsTarget back to head_unit, so the
+            // isClusterTarget() guard went false and later re-notifies stopped working
+            // (audit 2026-08). Blind-spot re-resolves its own geometry when it takes the lane back.
+            if (camViewOwnsLane()) return;
             resolveBsGeometry();
             com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
             if (layer != null && layer.isCreated() && bsLayerVisible) {
@@ -6426,6 +8018,34 @@ public class GpuSurveillancePipeline {
     // only true on→off / off→on transitions reach RecordingModeManager.
     private volatile boolean bsLastNotifiedVisible = false;
 
+    // Last (showing, target) the BS close-button ✕ broadcast was fired for. Keyed on
+    // the COMPOSITE card-showing predicate (not bare bsLayerVisible, which is shared
+    // with camview), so the ✕ edge tracks the blind-spot card specifically. Evaluated
+    // lock-free at the top of every turn tick + on the disable teardown.
+    private volatile boolean bsLastNotifiedCardShowing = false;
+    private volatile String bsLastNotifiedCardTarget = null;
+
+    /**
+     * Fire the blind-spot ✕ edge broadcast IFF the card's on-screen presence (or its
+     * target) changed since the last notification. Idempotent + edge-detected, so it is
+     * safe to call every 250ms tick; only real transitions reach the app overlay.
+     *
+     * <p>MUST be called WITHOUT holding {@link #bsLifecycleLock}: {@link #emitBsCardState}
+     * spawns an {@code am broadcast} exec, and the camera-view path deliberately keeps
+     * that off the lane lock. The turn tick (the primary caller) runs lock-free.
+     */
+    private void fireBsCardStateChanged() {
+        boolean showing = isBlindSpotCardShowing();
+        String target = showing ? getBsTargetString() : null;
+        if (showing == bsLastNotifiedCardShowing
+                && java.util.Objects.equals(target, bsLastNotifiedCardTarget)) {
+            return;
+        }
+        bsLastNotifiedCardShowing = showing;
+        bsLastNotifiedCardTarget = target;
+        emitBsCardState(showing, target);
+    }
+
     /** Fire the BS-visibility listener IFF bsLayerVisible actually changed since
      *  the last notification. Safe to call from every BS show/hide site (turn-
      *  tick, cluster show/close, disable). Never throws into the caller. */
@@ -6523,6 +8143,18 @@ public class GpuSurveillancePipeline {
     public boolean hasActiveSurveillanceMotion() {
         SurveillanceEngineGpu s = sentry;
         return s != null && s.hasActiveMotion();
+    }
+
+    /**
+     * @return milliseconds of sustained no-motion since the sentry last saw
+     * active motion (issue #174), or 0 while motion is active / the sentry is
+     * absent. RMM uses this to step the parked-idle AI cadence down into the
+     * quiet tier after a long no-motion period. Falls through to 0 (never
+     * triggers the tier) when the sentry is not wired.
+     */
+    public long getSurveillanceQuietDurationMs() {
+        SurveillanceEngineGpu s = sentry;
+        return s != null ? s.getQuietDurationMs() : 0L;
     }
 
     /**
@@ -6629,8 +8261,16 @@ public class GpuSurveillancePipeline {
             logger.warn("attachExternalStreamCallback: streaming not enabled — ignoring");
             return false;
         }
-        if (oemPipeline == null || !oemPipeline.isRunning()) {
-            logger.warn("attachExternalStreamCallback: OEM pipeline not running — ignoring");
+        // A lifecycle pass that started for a prior DVR selection can finish
+        // after the user selects an AVM camera. Check the persisted intent
+        // while holding the stream lifecycle lock so that stale pass cannot
+        // bind the OEM source after the newer selection has detached it.
+        if (com.overdrive.app.server.StreamingApiHandler.getLastDesiredViewMode() != 6) {
+            logger.info("attachExternalStreamCallback: DVR is no longer the desired view");
+            return false;
+        }
+        if (oemPipeline == null || !oemPipeline.isRouteReady()) {
+            logger.warn("attachExternalStreamCallback: OEM route not ready — ignoring");
             return false;
         }
         // Capture the live scaler under the monitor.
@@ -6664,9 +8304,40 @@ public class GpuSurveillancePipeline {
                 + t.getMessage());
             return false;
         }
+        if (!externalStreamSourceActive) {
+            // This generation remains pending until OEM teardown has
+            // finished every pano draw that could sample this texture. A
+            // normal view-0..5 switch may unbind it before the OEM lifecycle
+            // worker stops the camera, so the later stop still needs a fence.
+            oemSourceFenceGeneration++;
+        }
         externalStreamSourceActive = true;
         logger.info("Stream sink switched: pano → OEM Dashcam");
         return true;
+    }
+
+    /**
+     * Select view 6 only after the attached OEM producer has published its
+     * first frame transform. A bound texture without a transform has
+     * {@code uOemActive=0}; selecting view 6 in that interval falls through
+     * to the AVM mosaic shader branch and visibly flashes the pano feed.
+     *
+     * @return true when view 6 is active now; false when the scaler will
+     *         promote it automatically on the producer's first frame, or when
+     *         streaming/source state was torn down.
+     */
+    public boolean activateOemStreamViewWhenReady() {
+        streamLifecycleLock.lock();
+        try {
+            if (!streamingEnabled || !externalStreamSourceActive || streamScaler == null
+                    || com.overdrive.app.server.StreamingApiHandler
+                            .getLastDesiredViewMode() != 6) {
+                return false;
+            }
+            return streamScaler.requestOemViewWhenReady();
+        } finally {
+            streamLifecycleLock.unlock();
+        }
     }
 
     /**
@@ -6678,6 +8349,46 @@ public class GpuSurveillancePipeline {
      */
     private volatile boolean externalStreamSourceActive = false;
 
+    /** True only while the live stream scaler is bound to the OEM source. */
+    public boolean isOemStreamSourceActive() {
+        return externalStreamSourceActive;
+    }
+
+    // Guarded by streamLifecycleLock. A generation advances only when an OEM
+    // source becomes active; teardown acknowledges it after the pano GL fence
+    // completes. Keeping this separate from externalStreamSourceActive covers
+    // an already-detached source whose final GPU draw is still in flight.
+    private long oemSourceFenceGeneration = 0L;
+    private long oemSourceFencedGeneration = 0L;
+
+    /**
+     * Return the latest OEM source generation that still needs a pano GL
+     * fence before its texture may be deleted, or 0 if pano never sampled an
+     * OEM source since the last successful fence.
+     */
+    public long getPendingOemSourceFenceGeneration() {
+        streamLifecycleLock.lock();
+        try {
+            return oemSourceFenceGeneration > oemSourceFencedGeneration
+                ? oemSourceFenceGeneration : 0L;
+        } finally {
+            streamLifecycleLock.unlock();
+        }
+    }
+
+    /** Record successful completion of a pano GL fence for an OEM source. */
+    public void completeOemSourceFence(long generation) {
+        if (generation <= 0L) return;
+        streamLifecycleLock.lock();
+        try {
+            if (generation > oemSourceFencedGeneration) {
+                oemSourceFencedGeneration = generation;
+            }
+        } finally {
+            streamLifecycleLock.unlock();
+        }
+    }
+
     /**
      * Restore the AVM mosaic as the streamScaler's source. Called by the
      * existing /api/stream/view/{0..4} path after the scaler view-mode is
@@ -6686,7 +8397,7 @@ public class GpuSurveillancePipeline {
      * feeding the WS sink throughout. We only tell the scaler to stop
      * sampling the OEM OES texture and resume reading the AVM mosaic.
      */
-    public void reattachOwnStreamCallback() {
+    public boolean reattachOwnStreamCallback() {
         // Held under streamLifecycleLock so a concurrent disableStreaming
         // can't null streamScaler between our null-check and the
         // unbindOemSource call (R8 regression #2). Lock is cheap — no
@@ -6699,8 +8410,8 @@ public class GpuSurveillancePipeline {
             // peers, but keep the local reference so a concurrent disable
             // that nulls streamScaler post-capture can't NPE us.
             final com.overdrive.app.streaming.GpuStreamScaler scaler = streamScaler;
-            if (!streamingEnabled || scaler == null) return;
-            if (!externalStreamSourceActive) return;
+            if (!streamingEnabled || scaler == null) return false;
+            if (!externalStreamSourceActive) return false;
             externalStreamSourceActive = false;
             try {
                 scaler.unbindOemSource();
@@ -6716,6 +8427,7 @@ public class GpuSurveillancePipeline {
                 if (oem != null) oem.setStreamScalerForOemPublish(null);
             } catch (Throwable ignored) {}
             logger.info("Stream source: OEM → AVM mosaic");
+            return true;
         } finally {
             streamLifecycleLock.unlock();
         }
@@ -6730,6 +8442,10 @@ public class GpuSurveillancePipeline {
      * state keeps every start/stop pair balanced regardless of mode.
      */
     private boolean overlayPollingHeld = false;
+    // Dedicated poll-hold flag for the ACC-off surveillance overlay flow, kept
+    // separate from the pano overlayPollingHeld so the two flows' start/stop
+    // pairs on the shared TelemetryDataCollector can never underflow each other.
+    private boolean surveillanceOverlayPollingHeld = false;
 
     /**
      * Select the DASHCAM recording composition layout (0 = standard 360
@@ -6839,8 +8555,134 @@ public class GpuSurveillancePipeline {
      * issues an unmatched decrement that the collector's atomic floor
      * absorbs but that steals the next legitimate consumer's release.
      */
+    // The overlay flow the recorder is CURRENTLY configured for. The shared
+    // recorder serves both normal/manual clips (pano) and sentry event clips
+    // (surveillance) but only one at a time; this tracks which selection is
+    // loaded so a live field edit knows whether it applies. Written only from
+    // the overlay-apply paths.
+    private volatile String activeOverlayFlow = "pano";
+
+    /**
+     * Resolve a specific overlay flow ("pano" or "surveillance"), push its
+     * master-enable + field selection to the shared recorder, and reconcile the
+     * telemetry-collector polling hold. Centralizes what the scattered
+     * record-start sites used to do inline.
+     *
+     * <p>The flow is chosen by the CALL SITE (normal-recording sites pass
+     * "pano"; the sentry-event path passes "surveillance"), NOT by ACC state —
+     * so manual recording while parked stays on the pano flow exactly as before.
+     *
+     * <p>No-regression: for "pano" with the legacy toggle on and no explicit
+     * field list, this resolves to exactly {@code overlayEnabledConfig} + the
+     * legacy eight fields — identical to before. Surveillance is a separate
+     * opt-in that defaults off.
+     */
+    /**
+     * Push a flow's field selection to the shared recorder WITHOUT touching the
+     * polling refcount or the master-enable bit. Called from the record-start
+     * sites (pano) and the sentry-event hook (surveillance) so the drawn field
+     * set matches the clip being written. This is deliberately additive — the
+     * original polling mechanics at each site are left exactly as they were, so
+     * no refcount balance changes.
+     */
+    private void pushOverlayFieldsForFlow(String flow) {
+        boolean surv = "surveillance".equals(flow);
+        this.activeOverlayFlow = surv ? "surveillance" : "pano";
+        if (recorder != null) {
+            recorder.setOverlayDemandKey("pano"); // shared recorder → single demand key
+            recorder.setOverlayFields(resolveFieldsForFlow(activeOverlayFlow));
+        }
+    }
+
+    /** Load the persisted field selection for a flow, or the legacy default. */
+    private com.overdrive.app.telemetry.TelemetryFields resolveFieldsForFlow(String flow) {
+        try {
+            org.json.JSONArray arr = com.overdrive.app.config.UnifiedConfigManager
+                    .getTelemetryOverlayFields(flow);
+            return com.overdrive.app.telemetry.TelemetryFields.fromJsonArray(arr);
+        } catch (Throwable t) {
+            return com.overdrive.app.telemetry.TelemetryFields.legacyDefault();
+        }
+    }
+
+    /**
+     * Enable/disable the telemetry overlay for a sentry EVENT clip, called by
+     * the surveillance engine around {@link SurveillanceEngineGpu} event
+     * recording. Opt-in and default-off, so event clips are unchanged until the
+     * user turns the surveillance overlay on. Compositing/polling only runs for
+     * the actual event window — never while merely armed.
+     *
+     * @param recordingActive true at event start, false at event stop
+     */
+    void applySurveillanceOverlayForEvent(boolean recordingActive) {
+        if (recorder == null) return;
+        if (recordingActive && surveillanceOverlayEnabledConfig) {
+            // Push surveillance field selection + enable the master + open the
+            // composite gate for this event clip.
+            pushOverlayFieldsForFlow("surveillance");
+            recorder.setOverlayEnabled(true);
+            recorder.setOverlayRecordingModeAllowed(true);
+            // Start telemetry polling for the event window. Uses a DEDICATED
+            // surveillance hold flag (not the pano overlayPollingHeld) so the
+            // two flows' start/stop pairs can never underflow each other on the
+            // shared collector — the sentry event and an ACC-on clip never
+            // overlap in practice, but the separate flag makes it safe if the
+            // pipeline is torn down/rebuilt across an ACC edge mid-event.
+            if (telemetryCollector != null && !surveillanceOverlayPollingHeld) {
+                telemetryCollector.setOverlayRecordingActive(true);
+                telemetryCollector.startPolling();
+                surveillanceOverlayPollingHeld = true;
+            }
+        } else {
+            recorder.setOverlayRecordingModeAllowed(false);
+            // Restore the recorder's master-enable bit to the PANO config. The
+            // recorder is SHARED and persists across the ACC-off→ACC-on edge
+            // (onAccOn reuses it, never recreates it). Without this reset, a
+            // sentry event that set overlayEnabled=true would leave it true, and
+            // a later ACC-on pano/dashcam clip (which only sets
+            // overlayRecordingModeAllowed, never overlayEnabled) would open the
+            // composite gate and burn in the overlay even with the pano toggle
+            // OFF. Resetting to overlayEnabledConfig keeps the two masters
+            // independent as documented.
+            recorder.setOverlayEnabled(overlayEnabledConfig);
+            if (telemetryCollector != null && surveillanceOverlayPollingHeld) {
+                telemetryCollector.setOverlayRecordingActive(false);
+                telemetryCollector.stopPolling();
+                surveillanceOverlayPollingHeld = false;
+            }
+        }
+    }
+
+    /**
+     * Set the ACC-off surveillance overlay master. Independent of the ACC-on
+     * (pano) master. Takes effect at the next sentry event's record-start via
+     * {@link #applySurveillanceOverlayForEvent}; if a surveillance clip is
+     * already recording, apply live.
+     */
+    public void setSurveillanceOverlayEnabled(boolean enabled) {
+        this.surveillanceOverlayEnabledConfig = enabled;
+        if ("surveillance".equals(activeOverlayFlow)
+                && recorder != null && recorder.isRecording()) {
+            applySurveillanceOverlayForEvent(enabled);
+        }
+    }
+
+    /**
+     * Push a live field-selection change for a flow to the recorder if that
+     * flow is the one currently loaded. Lets the settings API update the drawn
+     * fields mid-clip without a restart. No-op when the changed flow isn't live.
+     */
+    public void refreshOverlayFields(String flow) {
+        if (recorder != null && activeOverlayFlow.equals(flow)) {
+            recorder.setOverlayFields(resolveFieldsForFlow(flow));
+        }
+    }
+
     public void setOverlayEnabled(boolean enabled) {
         this.overlayEnabledConfig = enabled;
+        // Push the pano field selection to the recorder (additive — does not
+        // alter polling). Then reproduce the EXACT legacy polling mechanics.
+        pushOverlayFieldsForFlow("pano");
         if (recorder != null) {
             recorder.setOverlayEnabled(enabled);
         }

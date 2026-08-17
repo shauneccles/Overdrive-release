@@ -16,7 +16,7 @@
 var CHARGING = {
     // ---- State ----
     currentOffset: 0,
-    currentDays: 30,
+    currentDays: 7,
     // Custom date range (epoch-ms). When _rangeFrom != null the session list +
     // period summary query by range instead of currentDays. _rangeFrom/_rangeTo
     // null = use currentDays (0 = all time).
@@ -30,17 +30,55 @@ var CHARGING = {
     pageSize: 20,
     sessions: [],
     currentSessionId: null,
+    _detailSessionId: null,
+    _detailGeneration: 0,
+    _detailInProgress: false,
     samplesCache: null,       // samples for the open detail session
     socHistoryCache: null,    // SoC-over-time series
+    _socCacheHours: null,
     summaryCache: null,
+    _summaryPeriodKey: null,
     _liveSession: null,       // the open in-progress session row, if any
     electricityRate: 0,
     currency: '$',
     dcRate: 0,
+    // Location-aware tariffs. `matchedTariffId` is the one that would price a
+    // charge started at the CURRENT position (server-computed, so the UI can't
+    // disagree with what pricing will actually do); `defaultTariffId` is the
+    // pinned fallback for charges that match no circle.
+    tariffs: [],
+    defaultTariffId: '',
+    matchedTariffId: '',
+    maxTariffs: 40,
+    tariffGpsLat: null,
+    tariffGpsLng: null,
+    _editingTariff: null,
+    // Default match radius for a new tariff, in metres. Mirrors
+    // TariffProfile.DEFAULT_RADIUS_M — tight enough to mean "this charger"
+    // rather than "this neighbourhood", while covering normal GPS scatter.
+    TARIFF_DEFAULT_RADIUS_M: 50,
     fastSampleSec: 12,
     isPhev: false,
     nominalKwh: 0,
     _writing: false,          // true while a settings save is in-flight (gates revisit refresh)
+    _configWriting: false,
+    _configBaseline: null,
+    _configDirty: {},
+    _configGeneration: 0,
+    _configSaveGeneration: 0,
+    _bootstrapGeneration: 0,
+    _summaryGeneration: 0,
+    _socGeneration: 0,
+    _sessionsGeneration: 0,
+    _tariffsGeneration: 0,
+    _sessionsRequestSerial: 0,
+    _sessionsPeriodKey: null,
+    _sessionsLoadMorePending: false,
+    _liveRefreshTimer: null,
+    _liveRefreshInFlight: null,
+    _liveRefreshGeneration: 0,
+    _liveLoadGeneration: 0,
+    LIVE_REFRESH_INTERVAL_MS: 15000,
     _socGeom: null,           // cached SoC-chart geometry for hover hit-testing
     _socHoverIdx: null,       // active hovered sample index (null = no crosshair)
     // Per-session detail-chart hover (power / ramp / temp) keeps its state on
@@ -70,6 +108,11 @@ var CHARGING = {
     init: function () {
         this._refreshPalette();
         this._setupThemeObserver();
+        // Establish a first-paint baseline before any asynchronous config
+        // response. An edit made while bootstrap is pending is then recognized
+        // as dirty and cannot be overwritten by that older response.
+        this._configBaseline = this._readConfigForm();
+        this._refreshConfigDirty();
 
         // Hide the detail view when the tab bar switches (mirrors trips).
         var self = this;
@@ -83,8 +126,12 @@ var CHARGING = {
             var id = (ev && ev.detail) ? ev.detail.id : null;
             if (id === 'stats') {
                 setTimeout(function () {
-                    if (self.summaryCache) self._renderSummaryCharts(self.summaryCache);
-                    if (self.socHistoryCache) {
+                    if (self.summaryCache
+                            && self._summaryPeriodKey === self._periodKey()) {
+                        self._renderSummaryCharts(self.summaryCache);
+                    }
+                    if (self.socHistoryCache
+                            && self._socCacheHours === self.socHours) {
                         var c = document.getElementById('socChart');
                         if (c) self.renderSocOverTime(c, self.socHistoryCache);
                     }
@@ -105,13 +152,12 @@ var CHARGING = {
         // show stale first-paint values. Mirrors core.js/road-sense.js. Guarded
         // by _writing so it can't clobber an in-flight save.
         document.addEventListener('visibilitychange', function () {
-            if (document.visibilityState === 'visible' && !self._writing) {
-                self.bootstrap();
-            }
+            if (document.visibilityState === 'hidden') self._stopVisibleRefresh();
+            else self._restartVisibleRefresh(true);
         });
 
         this._showSkeleton();
-        this.bootstrap();
+        this._restartVisibleRefresh(true);
     },
 
     _refreshPalette: function () {
@@ -149,13 +195,17 @@ var CHARGING = {
         var self = this;
         var tryPaint = function (fn) { try { fn(); } catch (e) {} };
         tryPaint(function () {
-            if (self.socHistoryCache) {
+            if (self.socHistoryCache
+                    && self._socCacheHours === self.socHours) {
                 var c = document.getElementById('socChart');
                 if (c) self.renderSocOverTime(c, self.socHistoryCache);
             }
         });
         tryPaint(function () {
-            if (self.summaryCache) self._renderSummaryCharts(self.summaryCache);
+            if (self.summaryCache
+                    && self._summaryPeriodKey === self._periodKey()) {
+                self._renderSummaryCharts(self.summaryCache);
+            }
         });
         tryPaint(function () {
             if (self.currentSessionId && self.samplesCache) self._renderDetailCharts(self.samplesCache);
@@ -164,39 +214,300 @@ var CHARGING = {
 
     // ==================== DATA LOADING ====================
 
+    _fetchJson: function (url, options) {
+        return fetch(url, options).then(function (response) {
+            if (!response.ok) throw new Error(url + ' ' + response.status);
+            return response.json();
+        });
+    },
+
+    _payload: function (data, key, expectArray, requireSuccess) {
+        if (!data || data.error || data.success === false) return null;
+        if (requireSuccess && data.success !== true) return null;
+        if (!Object.prototype.hasOwnProperty.call(data, key)) return null;
+        var value = data[key];
+        if (value == null || value.error || value.success === false) return null;
+        if (expectArray) return Array.isArray(value) ? value : null;
+        return (typeof value === 'object' && !Array.isArray(value)) ? value : null;
+    },
+
+    _periodKey: function () {
+        return this._periodQuery();
+    },
+
+    _bootstrapUrl: function (periodKey, hours) {
+        return '/api/charging/bootstrap?' + periodKey
+            + '&hours=' + hours
+            + '&points=300&limit=' + this.pageSize;
+    },
+
+    _pageIsVisible: function () {
+        var state = document.visibilityState;
+        return !state || state === 'visible';
+    },
+
+    _stopVisibleRefresh: function () {
+        this._liveRefreshGeneration++;
+        this._liveLoadGeneration++;
+        if (this._liveRefreshTimer != null) {
+            clearTimeout(this._liveRefreshTimer);
+            this._liveRefreshTimer = null;
+        }
+        this._liveRefreshInFlight = null;
+        // Invalidate every first-paint/live response that could otherwise land
+        // after a hidden -> visible generation has published newer state.
+        this._bootstrapGeneration++;
+        this._configGeneration++;
+        this._summaryGeneration++;
+        this._socGeneration++;
+        this._sessionsGeneration++;
+        this._tariffsGeneration++;
+        this._sessionsLoadMorePending = false;
+    },
+
+    _restartVisibleRefresh: function (useBootstrap) {
+        this._stopVisibleRefresh();
+        if (!this._pageIsVisible()) return Promise.resolve();
+        var generation = this._liveRefreshGeneration;
+        if (this._writing) {
+            this._scheduleVisibleRefresh(generation, 1000);
+            return Promise.resolve();
+        }
+        var request = useBootstrap
+            ? this.bootstrap()
+            : this._loadCurrentLivePair();
+        return this._trackVisibleRefresh(request, generation);
+    },
+
+    _trackVisibleRefresh: function (request, generation) {
+        var self = this;
+        if (!request || typeof request.then !== 'function') {
+            request = Promise.resolve();
+        }
+        this._liveRefreshInFlight = request;
+        var settled = function () {
+            if (generation !== self._liveRefreshGeneration
+                    || self._liveRefreshInFlight !== request) return;
+            self._liveRefreshInFlight = null;
+            self._scheduleVisibleRefresh(
+                generation, self.LIVE_REFRESH_INTERVAL_MS);
+        };
+        request.then(settled, settled);
+        return request;
+    },
+
+    _scheduleVisibleRefresh: function (generation, delayMs) {
+        var self = this;
+        if (generation !== this._liveRefreshGeneration
+                || !this._pageIsVisible()) return;
+        if (this._liveRefreshTimer != null) {
+            clearTimeout(this._liveRefreshTimer);
+        }
+        this._liveRefreshTimer = setTimeout(function () {
+            self._liveRefreshTimer = null;
+            self._runPeriodicRefresh(generation);
+        }, delayMs);
+    },
+
+    _runPeriodicRefresh: function (generation) {
+        if (generation !== this._liveRefreshGeneration
+                || !this._pageIsVisible()) {
+            return Promise.resolve();
+        }
+        if (this._liveRefreshInFlight) return this._liveRefreshInFlight;
+        if (this._writing) {
+            this._scheduleVisibleRefresh(generation, 1000);
+            return Promise.resolve();
+        }
+        return this._trackVisibleRefresh(
+            this._loadCurrentLivePair(),
+            generation);
+    },
+
+    _loadCurrentLivePair: function () {
+        var self = this;
+        var generation = ++this._liveLoadGeneration;
+        var periodKey = this._periodKey();
+        var summaryGeneration = ++this._summaryGeneration;
+        var sessionsGeneration = ++this._sessionsGeneration;
+        this._sessionsPeriodKey = periodKey;
+        this._sessionsLoadMorePending = false;
+        var url = '/api/charging/overview?' + periodKey
+            + '&limit=' + this.pageSize;
+        return this._fetchJson(url).then(function (d) {
+            if (generation !== self._liveLoadGeneration
+                    || summaryGeneration !== self._summaryGeneration
+                    || sessionsGeneration !== self._sessionsGeneration
+                    || periodKey !== self._periodKey()
+                    || periodKey !== self._sessionsPeriodKey) return null;
+            var summary = self._payload(
+                d, 'summary', false, true);
+            var sessions = self._payload(
+                d, 'sessions', true, true);
+            if (summary === null || sessions === null) {
+                throw new Error('invalid overview payload');
+            }
+            // Both payloads were parsed and generation-checked before either is
+            // published, so one browser task installs one coherent live view.
+            self._applySummary(summary, periodKey);
+            self._applySessions(sessions, 0);
+            return true;
+        }).catch(function () {
+            if (generation !== self._liveLoadGeneration
+                    || summaryGeneration !== self._summaryGeneration
+                    || sessionsGeneration !== self._sessionsGeneration
+                    || periodKey !== self._periodKey()
+                    || periodKey !== self._sessionsPeriodKey) return null;
+            self._hideSkeleton();
+            self._failCloseLivePresentation();
+            return false;
+        });
+    },
+
+    _failCloseLivePresentation: function () {
+        this._liveSession = null;
+        if (this.summaryCache) {
+            this.summaryCache.live = {
+                charging: false,
+                plugged: false,
+                full: false,
+                fault: false,
+                powerKw: 0,
+                isEstimated: false,
+                powerSource: 'none',
+                powerObservedAtMs: 0,
+                powerQuality: 'UNKNOWN',
+                powerConfidence: 0,
+                socPercent: null,
+                sessionKwh: null,
+                timeToFullMin: null
+            };
+            // Force only the rendering pass when the visible period changed while this request was
+            // in flight. The cache key remains untouched, so old totals cannot masquerade as the new
+            // period, but any live additions from that cache are removed immediately.
+            this._applySummary(
+                this.summaryCache, this._summaryPeriodKey, true);
+        }
+
+        var detailRow = null;
+        for (var i = 0; i < this.sessions.length; i++) {
+            var row = this.sessions[i];
+            if (!row || row.inProgress !== true) continue;
+            row.chargingNow = false;
+            row.livePowerKw = null;
+            row.timeToFullMin = null;
+            row.isEstimated = false;
+            if (this.currentSessionId != null
+                    && String(row.id) === String(this.currentSessionId)) {
+                detailRow = row;
+            }
+        }
+        this._renderSessionCards();
+        if (detailRow) {
+            this._fillDetailHeader(detailRow, detailRow.id);
+        }
+    },
+
     bootstrap: function () {
         var self = this;
+        var periodKey = this._periodKey();
+        var hours = this.socHours || 168;
+        var bootstrapGeneration = ++this._bootstrapGeneration;
+        var liveLoadGeneration = ++this._liveLoadGeneration;
+        var configGeneration = ++this._configGeneration;
+        var summaryGeneration = ++this._summaryGeneration;
+        var socGeneration = ++this._socGeneration;
+        var sessionsGeneration = ++this._sessionsGeneration;
+        var tariffsGeneration = ++this._tariffsGeneration;
+        this._sessionsPeriodKey = periodKey;
+        this._sessionsLoadMorePending = false;
         // Single composite call; fall back to the sequential loaders if the
         // bootstrap endpoint is unavailable (older daemon).
-        fetch('/api/charging/bootstrap').then(function (r) {
-            if (!r.ok) throw new Error('bootstrap ' + r.status);
-            return r.json();
-        }).then(function (data) {
+        return this._fetchJson(this._bootstrapUrl(periodKey, hours)).then(function (data) {
+            if (bootstrapGeneration !== self._bootstrapGeneration
+                    || liveLoadGeneration !== self._liveLoadGeneration) return;
             var b = (data && data.bootstrap) ? data.bootstrap : null;
-            if (!b) throw new Error('no bootstrap payload');
+            if (!b || data.success !== true || data.error) {
+                throw new Error('no bootstrap payload');
+            }
             // Each bootstrap section keeps its own named wrapper (the server
             // builds them from the same per-section handlers used by the
             // sequential loaders, stripping only success/_status). So unwrap the
-            // same way the loaders do — b.config = {config:{...}}, etc. Passing
-            // the wrapper straight to _applyConfig left cfg.enabled/rate
-            // undefined, which is why the rate + toggle never loaded.
-            if (b.config)   self._applyConfig(b.config.config || b.config);
-            if (b.summary)  self._applySummary(b.summary.summary || b.summary);
-            if (b.soc)      self._applySoc(b.soc.soc || b.soc);
-            if (b.sessions) self._applySessions((b.sessions.sessions || b.sessions), 0);
+            // same way the loaders do. Error sections are deliberately ignored
+            // so a transient read failure cannot erase the last rendered state.
+            var config = self._payload(b.config, 'config', false, false);
+            var summary = self._payload(b.summary, 'summary', false, false);
+            var soc = self._payload(b.soc, 'soc', true, false);
+            var sessions = self._payload(b.sessions, 'sessions', true, false);
+            var followups = [];
+            if (configGeneration === self._configGeneration) {
+                if (config !== null) self._applyConfig(config);
+                else followups.push(self.loadConfig());
+            }
+            if (summaryGeneration === self._summaryGeneration
+                    && periodKey === self._periodKey()) {
+                if (summary !== null) {
+                    self._applySummary(summary, periodKey);
+                }
+            }
+            if (socGeneration === self._socGeneration
+                    && hours === self.socHours) {
+                if (soc !== null) self._applySoc(soc, hours);
+                else followups.push(self.loadSoc());
+            }
+            if (sessionsGeneration === self._sessionsGeneration
+                    && periodKey === self._periodKey()
+                    && periodKey === self._sessionsPeriodKey) {
+                if (sessions !== null) {
+                    self._applySessions(sessions, 0);
+                } else {
+                    // A composite endpoint can succeed while this section
+                    // fails. Remove the first-load skeleton immediately.
+                    self._hideSkeleton();
+                }
+            }
+            if (summary === null || sessions === null) {
+                self._failCloseLivePresentation();
+                // Re-read the pair together. Recovering only the failed half could combine a current
+                // positive with the other section's older stopped/active state.
+                followups.push(self._loadCurrentLivePair());
+            }
+            // Tariffs ship in the bootstrap on current daemons; an older one
+            // omits the section, so fetch it separately rather than leaving the
+            // list blank.
+            if (tariffsGeneration === self._tariffsGeneration) {
+                if (b.tariffs && !b.tariffs.error
+                        && b.tariffs.success !== false
+                        && Array.isArray(b.tariffs.tariffs)) {
+                    self._applyTariffs(b.tariffs);
+                } else {
+                    followups.push(self.loadTariffs());
+                }
+            }
+            return Promise.all(followups);
         }).catch(function () {
+            if (bootstrapGeneration !== self._bootstrapGeneration
+                    || liveLoadGeneration !== self._liveLoadGeneration) return;
             // Sequential fallback.
-            self.loadConfig();
-            self.loadSummary();
-            self.loadSoc();
-            self.loadSessions(0);
+            return Promise.all([
+                self.loadConfig(),
+                self.loadSoc(),
+                self._loadCurrentLivePair(),
+                self.loadTariffs()
+            ]);
         });
     },
 
     loadConfig: function () {
         var self = this;
-        fetch('/api/charging/config').then(function (r) { return r.json(); })
-            .then(function (d) { self._applyConfig(d.config || d); })
+        var generation = ++this._configGeneration;
+        return this._fetchJson('/api/charging/config')
+            .then(function (d) {
+                if (generation !== self._configGeneration) return;
+                var config = self._payload(d, 'config', false, true);
+                if (config === null) throw new Error('invalid config payload');
+                self._applyConfig(config);
+            })
             .catch(function () {});
     },
 
@@ -213,16 +524,35 @@ var CHARGING = {
 
     loadSummary: function () {
         var self = this;
-        fetch('/api/charging/summary?' + this._periodQuery()).then(function (r) { return r.json(); })
-            .then(function (d) { self._applySummary(d.summary || d); })
-            .catch(function () {});
+        var periodKey = this._periodKey();
+        var generation = ++this._summaryGeneration;
+        return this._fetchJson('/api/charging/summary?' + periodKey)
+            .then(function (d) {
+                if (generation !== self._summaryGeneration
+                        || periodKey !== self._periodKey()) return null;
+                var summary = self._payload(d, 'summary', false, true);
+                if (summary === null) throw new Error('invalid summary payload');
+                self._applySummary(summary, periodKey);
+                return true;
+            })
+            .catch(function () {
+                return generation === self._summaryGeneration
+                        && periodKey === self._periodKey() ? false : null;
+            });
     },
 
     loadSoc: function () {
         var self = this;
         var hours = this.socHours || 168;
-        fetch('/api/charging/soc?hours=' + hours + '&points=300').then(function (r) { return r.json(); })
-            .then(function (d) { self._applySoc(d.soc || d); })
+        var generation = ++this._socGeneration;
+        return this._fetchJson('/api/charging/soc?hours=' + hours + '&points=300')
+            .then(function (d) {
+                if (generation !== self._socGeneration
+                        || hours !== self.socHours) return;
+                var soc = self._payload(d, 'soc', true, true);
+                if (soc === null) throw new Error('invalid SoC payload');
+                self._applySoc(soc, hours);
+            })
             .catch(function () {});
     },
 
@@ -238,40 +568,185 @@ var CHARGING = {
 
     loadSessions: function (offset) {
         var self = this;
-        var url = '/api/charging?' + this._periodQuery() + '&limit=' + this.pageSize + '&offset=' + offset;
-        fetch(url).then(function (r) { return r.json(); })
-            .then(function (d) { self._applySessions(d.sessions || [], offset); })
-            .catch(function () { self._hideSkeleton(); });
+        var periodKey = this._periodKey();
+        var generation;
+        if (offset === 0) {
+            generation = ++this._sessionsGeneration;
+            this._sessionsPeriodKey = periodKey;
+            this._sessionsLoadMorePending = false;
+        } else {
+            generation = this._sessionsGeneration;
+            if (this._sessionsLoadMorePending
+                    || periodKey !== this._sessionsPeriodKey
+                    || offset !== this.currentOffset + this.pageSize) {
+                return Promise.resolve(null);
+            }
+            this._sessionsLoadMorePending = true;
+        }
+        var requestSerial = ++this._sessionsRequestSerial;
+        var url = '/api/charging?' + periodKey + '&limit=' + this.pageSize + '&offset=' + offset;
+        return this._fetchJson(url)
+            .then(function (d) {
+                if (generation !== self._sessionsGeneration
+                        || periodKey !== self._periodKey()
+                        || periodKey !== self._sessionsPeriodKey) return null;
+                if (offset > 0
+                        && offset !== self.currentOffset + self.pageSize) return null;
+                var sessions = self._payload(d, 'sessions', true, true);
+                if (sessions === null) throw new Error('invalid sessions payload');
+                self._applySessions(sessions, offset);
+                return true;
+            })
+            .catch(function () {
+                if (generation === self._sessionsGeneration
+                        && periodKey === self._periodKey()
+                        && offset === 0) {
+                    self._hideSkeleton();
+                    return false;
+                }
+                return null;
+            })
+            .then(function (result) {
+                if (offset > 0
+                        && generation === self._sessionsGeneration
+                        && requestSerial === self._sessionsRequestSerial) {
+                    self._sessionsLoadMorePending = false;
+                }
+                return result;
+            });
     },
 
     // ==================== APPLY PAYLOADS ====================
 
+    _readConfigForm: function () {
+        return {
+            enabled: this._getChecked('chargingEnabled'),
+            electricityRate: this._getNum('rateInput'),
+            dcRate: this._getNum('dcRateInput'),
+            currency: this._getStr('currencySelect')
+                || this.currency
+                || '$'
+        };
+    },
+
+    _setConfigControl: function (key, value) {
+        if (key === 'enabled') {
+            this._setVal('chargingEnabled', value, true);
+        } else if (key === 'electricityRate') {
+            this._setInput('rateInput', value > 0 ? value : '');
+        } else if (key === 'dcRate') {
+            this._setInput('dcRateInput', value > 0 ? value : '');
+        } else if (key === 'currency') {
+            this._setInput('currencySelect', value || '$');
+        }
+    },
+
+    _configValueEqual: function (left, right) {
+        if (typeof left === 'number' || typeof right === 'number') {
+            return Number(left) === Number(right);
+        }
+        return left === right;
+    },
+
+    _refreshConfigDirty: function () {
+        var current = this._readConfigForm();
+        var baseline = this._configBaseline || current;
+        var keys = ['enabled', 'electricityRate', 'dcRate', 'currency'];
+        var dirty = {};
+        var any = false;
+        for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            if (!this._configValueEqual(current[key], baseline[key])) {
+                dirty[key] = true;
+                any = true;
+            }
+        }
+        this._configDirty = dirty;
+        if (!this._configWriting) {
+            var btn = document.getElementById('chargingApplyBtn');
+            if (btn) {
+                btn.disabled = !any;
+                btn.textContent = this._t(
+                    'common.apply_changes', 'Apply Changes');
+            }
+        }
+        return dirty;
+    },
+
+    _dirtyConfigBody: function () {
+        this._refreshConfigDirty();
+        var current = this._readConfigForm();
+        var body = {};
+        var keys = ['enabled', 'electricityRate', 'dcRate', 'currency'];
+        for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            if (this._configDirty[key]) body[key] = current[key];
+        }
+        return body;
+    },
+
     _applyConfig: function (cfg) {
         if (!cfg) return;
-        if (cfg.electricityRate !== undefined) this.electricityRate = cfg.electricityRate || 0;
-        if (cfg.currency) this.currency = cfg.currency || '$';
-        if (cfg.dcRate !== undefined) this.dcRate = cfg.dcRate || 0;
+        this._refreshConfigDirty();
+        var dirtyBeforeResponse = this._configDirty;
+        var incoming = {};
+        if (cfg.enabled !== undefined) incoming.enabled = !!cfg.enabled;
+        if (cfg.electricityRate !== undefined) {
+            this.electricityRate = Number(cfg.electricityRate) || 0;
+            incoming.electricityRate = this.electricityRate;
+        }
+        if (cfg.currency !== undefined) {
+            this.currency = cfg.currency || '$';
+            incoming.currency = this.currency;
+        }
+        if (cfg.dcRate !== undefined) {
+            this.dcRate = Number(cfg.dcRate) || 0;
+            incoming.dcRate = this.dcRate;
+        }
         if (cfg.fastSampleSec !== undefined) this.fastSampleSec = cfg.fastSampleSec || 12;
         if (cfg.isPhev !== undefined) this.isPhev = !!cfg.isPhev;
         if (cfg.nominalKwh) this.nominalKwh = cfg.nominalKwh;
 
-        this._setVal('chargingEnabled', cfg.enabled, true);
-        this._setInput('rateInput', this.electricityRate > 0 ? this.electricityRate : '');
-        this._setInput('dcRateInput', this.dcRate > 0 ? this.dcRate : '');
-        this._setInput('currencySelect', this.currency);
-
-        // Programmatic input population doesn't fire onchange, so the Apply
-        // button stays disabled until the user actually edits something.
-        this.resetApplyButton();
+        if (!this._configBaseline) {
+            this._configBaseline = this._readConfigForm();
+        }
+        var keys = ['enabled', 'electricityRate', 'dcRate', 'currency'];
+        for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            if (!Object.prototype.hasOwnProperty.call(incoming, key)) continue;
+            this._configBaseline[key] = incoming[key];
+            if (!dirtyBeforeResponse[key]) {
+                this._setConfigControl(key, incoming[key]);
+            }
+        }
+        this._refreshConfigDirty();
 
         // If summary arrived before config (sequential fallback can race),
         // re-render the hero so the cost/kWh fallback picks up the rate.
-        if (this.summaryCache) this._applySummary(this.summaryCache);
+        if (this.summaryCache) {
+            this._applySummary(
+                this.summaryCache, this._summaryPeriodKey);
+        }
+
+        // The fallback note quotes the global rate + currency symbol, and tariff
+        // rows fall back to this.currency for a profile with no currency of its
+        // own — so both must be redrawn when either changes. Use the note-only
+        // path when there are no tariffs, to avoid flashing #tariffEmpty during
+        // bootstrap before the tariff payload has landed.
+        if ((this.tariffs || []).length) this.renderTariffs();
+        else this._renderTariffFallbackNote();
     },
 
-    _applySummary: function (s) {
+    _applySummary: function (s, periodKey, forceRender) {
         if (!s) return;
-        this.summaryCache = s;
+        var effectivePeriodKey = periodKey
+            || this._summaryPeriodKey
+            || this._periodKey();
+        if (effectivePeriodKey !== this._periodKey() && !forceRender) return;
+        if (!forceRender) {
+            this.summaryCache = s;
+            this._summaryPeriodKey = effectivePeriodKey;
+        }
 
         // Hero gauges.
         var live = s.live || {};
@@ -382,9 +857,14 @@ var CHARGING = {
         if (el) el.style.display = show ? '' : 'none';
     },
 
-    _applySoc: function (soc) {
+    _applySoc: function (soc, hours) {
         if (!soc) return;
+        var effectiveHours = hours != null
+            ? hours : this._socCacheHours;
+        if (effectiveHours == null) effectiveHours = this.socHours;
+        if (effectiveHours !== this.socHours) return;
         this.socHistoryCache = soc;
+        this._socCacheHours = effectiveHours;
         var c = document.getElementById('socChart');
         if (c) this.renderSocOverTime(c, soc);
     },
@@ -399,13 +879,32 @@ var CHARGING = {
         // can classify its DC/AC tier without re-querying.
         this._liveSession = null;
         for (var li = 0; li < this.sessions.length; li++) {
-            if (this.sessions[li] && this.sessions[li].inProgress === true) { this._liveSession = this.sessions[li]; break; }
+            if (this.sessions[li]
+                    && this.sessions[li].inProgress === true
+                    && this.sessions[li].chargingNow !== false) {
+                this._liveSession = this.sessions[li];
+                break;
+            }
         }
         // If the session list arrived after the summary, re-apply the summary so
         // the live-augmented period tiles pick up _liveSession.
-        if (this.summaryCache) this._applySummary(this.summaryCache);
+        if (this.summaryCache) {
+            this._applySummary(
+                this.summaryCache, this._summaryPeriodKey);
+        }
 
         this._renderSessionCards();
+        if (this.currentSessionId != null) {
+            for (var di = 0; di < this.sessions.length; di++) {
+                var detailRow = this.sessions[di];
+                if (detailRow
+                        && String(detailRow.id)
+                            === String(this.currentSessionId)) {
+                    this._fillDetailHeader(detailRow, detailRow.id);
+                    break;
+                }
+            }
+        }
 
         // "Load more" visible only when the last page was full.
         var more = document.getElementById('loadMoreBtn');
@@ -443,7 +942,13 @@ var CHARGING = {
                 // 1-decimal so a 6.1 kW charge doesn't round to a misleading "6"/"7".
                 var chipKw = (s.peakPower != null && s.peakPower > 0) ? s.peakPower : 0;
                 var peakStr = chipKw > 0 ? chipKw.toFixed(1) + ' kW' : '';
-                var energy = (s.energyAdded && s.energyAdded > 0) ? '+' + s.energyAdded.toFixed(1) + ' kWh' : '--';
+                // '~' marks a total the daemon knows is missing a segment (the vehicle's energy
+                // counter reset mid-charge, or the charge continued while the daemon was down and
+                // the gap could not be attributed). Showing it as an exact figure would overstate
+                // what we actually measured.
+                var energy = (s.energyAdded && s.energyAdded > 0)
+                    ? (s.energyIncomplete ? '~' : '+') + s.energyAdded.toFixed(1) + ' kWh'
+                    : '--';
                 var socRange = (s.startSoc != null && s.endSoc != null && s.endSoc > 0)
                     ? Math.round(s.startSoc) + '% → ' + Math.round(s.endSoc) + '%'
                     : '';
@@ -453,13 +958,15 @@ var CHARGING = {
                 var odoStr = (s.startOdometerKm != null && s.startOdometerKm > 0) ? self._dist(s.startOdometerKm) : '';
                 var locStr = self._locationLabel(s);   // place name, else coords, else ''
                 var inProgress = s.inProgress === true;
+                var chargingNow = inProgress && s.chargingNow !== false;
 
                 // Time range: "start → end" (clock times), or "start → now" while
                 // charging. Shown in the meta row alongside duration.
                 var startClock = self._fmtClock(s.startTime);
-                var endClock = inProgress
+                var endClock = chargingNow
                     ? self._t('charge.now', 'now')
-                    : (s.endTime && s.endTime > s.startTime ? self._fmtClock(s.endTime) : '');
+                    : (!inProgress && s.endTime && s.endTime > s.startTime
+                        ? self._fmtClock(s.endTime) : '');
                 var timeRange = startClock + (endClock ? ' → ' + endClock : '');
 
                 // Always show the power chip in the pill (peak for finished, live
@@ -471,7 +978,7 @@ var CHARGING = {
                             self._typeIcon(kind) + '<span>' + typeLabel + '</span>' +
                             (powerChip ? '<span class="session-type-peak">' + powerChip + '</span>' : '') +
                         '</span>' +
-                        (inProgress
+                        (chargingNow
                             ? '<span class="session-live"><span class="session-live-dot"></span>' + self._esc(self._t('charge.in_progress', 'Charging now')) + '</span>'
                             : '<span class="session-date">' + self._fmtDate(s.startTime) + '</span>') +
                     '</div>' +
@@ -489,10 +996,15 @@ var CHARGING = {
                         (timeRange ? '<span>' + self._esc(timeRange) + '</span>' : '') +
                         (dur ? '<span>' + dur + '</span>' : '') +
                         (odoStr ? '<span>' + self._t('charge.odometer_short', 'ODO') + ' ' + odoStr + '</span>' : '') +
+                        // Which tariff priced this charge. Only when a named
+                        // tariff owns it — a session on the global rate shows
+                        // nothing, exactly as before.
+                        (s.tariffLabel ? '<span>⚡ ' + self._esc(s.tariffLabel) + '</span>' : '') +
                     '</div>' +
-                    '<button class="session-delete-btn" title="' + self._t('charge.delete_session_title', 'Delete session') + '">' +
-                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
-                    '</button>';
+                    (inProgress ? '' :
+                        '<button class="session-delete-btn" title="' + self._t('charge.delete_session_title', 'Delete session') + '">' +
+                            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
+                        '</button>');
 
                 card.addEventListener('click', function () { self.showDetail(s.id); });
                 card.addEventListener('keydown', function (e) {
@@ -519,8 +1031,7 @@ var CHARGING = {
         if (row) row.classList.remove('open');
         this.currentOffset = 0;
         this._showSkeleton();
-        this.loadSessions(0);
-        this.loadSummary();
+        this._loadCurrentLivePair();
     },
 
     // Reveal/hide the custom From → To range row (height+fade via the .open
@@ -556,8 +1067,7 @@ var CHARGING = {
         this._rangeTo = toMs;   // null = open-ended (daemon treats as no upper bound)
         this.currentOffset = 0;
         this._showSkeleton();
-        this.loadSessions(0);
-        this.loadSummary();
+        this._loadCurrentLivePair();
     },
 
     // ---- Shared calendar (range picker) — ported from events.js ----------
@@ -677,9 +1187,22 @@ var CHARGING = {
 
     showDetail: function (id) {
         var self = this;
+        var generation = ++this._detailGeneration;
         this.currentSessionId = id;
+        this._detailSessionId = null;
+        // Fail closed until the cached or fetched row proves this session is
+        // complete. This also covers a detail opened before its list page loads.
+        this._detailInProgress = true;
+        var deleteBtn = document.getElementById('detailDeleteBtn');
+        if (deleteBtn) {
+            deleteBtn.disabled = true;
+            deleteBtn.style.display = 'none';
+            deleteBtn.setAttribute('aria-hidden', 'true');
+        }
         // Clear any crosshair carried from a prior session's detail charts.
         this._clearDetailHoverState();
+        this.samplesCache = [];
+        this._renderDetailCharts([]);
 
         var list = document.getElementById('sessionListView');
         var detail = document.getElementById('chargingDetail');
@@ -691,18 +1214,42 @@ var CHARGING = {
         for (var i = 0; i < this.sessions.length; i++) {
             if (this.sessions[i].id === id) { row = this.sessions[i]; break; }
         }
-        if (row) this._fillDetailHeader(row);
+        if (row) this._fillDetailHeader(row, id);
 
-        fetch('/api/charging/' + id).then(function (r) { return r.json(); })
-            .then(function (d) { if (d && d.session) self._fillDetailHeader(d.session); })
+        this._fetchJson('/api/charging/' + id)
+            .then(function (d) {
+                if (!self._isCurrentDetail(id, generation)) return;
+                var session = self._payload(
+                    d, 'session', false, true);
+                if (session === null) {
+                    throw new Error('invalid detail payload');
+                }
+                self._fillDetailHeader(session, id);
+            })
             .catch(function () {});
 
-        fetch('/api/charging/' + id + '/samples').then(function (r) { return r.json(); })
+        this._fetchJson('/api/charging/' + id + '/samples')
             .then(function (d) {
-                self.samplesCache = (d && d.samples) ? d.samples : [];
+                if (!self._isCurrentDetail(id, generation)) return;
+                var samples = self._payload(
+                    d, 'samples', true, true);
+                if (samples === null) {
+                    throw new Error('invalid samples payload');
+                }
+                self.samplesCache = samples;
                 self._renderDetailCharts(self.samplesCache);
             })
-            .catch(function () { self.samplesCache = []; self._renderDetailCharts([]); });
+            .catch(function () {
+                if (!self._isCurrentDetail(id, generation)) return;
+                self.samplesCache = [];
+                self._renderDetailCharts([]);
+            });
+    },
+
+    _isCurrentDetail: function (id, generation) {
+        return generation === this._detailGeneration
+            && this.currentSessionId != null
+            && String(this.currentSessionId) === String(id);
     },
 
     hideDetail: function () {
@@ -710,7 +1257,10 @@ var CHARGING = {
         var detail = document.getElementById('chargingDetail');
         if (detail) { detail.classList.add('hidden'); detail.classList.remove('active'); }
         if (list) list.classList.remove('hidden');
+        this._detailGeneration++;
         this.currentSessionId = null;
+        this._detailSessionId = null;
+        this._detailInProgress = false;
         this.samplesCache = null;
         this._clearDetailHoverState();
     },
@@ -725,11 +1275,23 @@ var CHARGING = {
         }
     },
 
-    _fillDetailHeader: function (s) {
+    _fillDetailHeader: function (s, sessionId) {
+        if (this.currentSessionId == null
+                || String(this.currentSessionId)
+                !== String(sessionId)) return;
+        this._detailSessionId = sessionId;
         var inProgress = s.inProgress === true;
+        var chargingNow = inProgress && s.chargingNow !== false;
+        this._detailInProgress = inProgress;
+        var deleteBtn = document.getElementById('detailDeleteBtn');
+        if (deleteBtn) {
+            deleteBtn.disabled = inProgress;
+            deleteBtn.style.display = inProgress ? 'none' : '';
+            deleteBtn.setAttribute('aria-hidden', inProgress ? 'true' : 'false');
+        }
         this._setText('detailTitle', this._typeLabel(s) + ' · ' + this._fmtDate(s.startTime));
         var sub = [];
-        if (inProgress) sub.push(this._t('charge.in_progress', 'Charging now'));
+        if (chargingNow) sub.push(this._t('charge.in_progress', 'Charging now'));
         // While charging, endSoc is the LIVE soc (filled server-side); show the
         // ramp as "start% → live%". A completed session shows start → end.
         if (s.startSoc != null && s.endSoc != null && s.endSoc > 0) sub.push(Math.round(s.startSoc) + '% → ' + Math.round(s.endSoc) + '%');
@@ -737,18 +1299,37 @@ var CHARGING = {
         if (s.durationMinutes != null) sub.push(this._fmtDuration(s.durationMinutes));
         this._setText('detailSubtitle', sub.join('  ·  '));
 
-        this._setText('detailEnergy', (s.energyAdded && s.energyAdded > 0) ? '+' + s.energyAdded.toFixed(1) + ' kWh' : '--');
+        // Same '~' convention as the list row: an incomplete total is not presented as exact.
+        this._setText('detailEnergy', (s.energyAdded && s.energyAdded > 0)
+            ? (s.energyIncomplete ? '~' : '+') + s.energyAdded.toFixed(1) + ' kWh' : '--');
         this._setText('detailAvgPower', (s.avgPower != null && s.avgPower > 0) ? s.avgPower.toFixed(1) + ' kW' : '--');
         this._setText('detailPeakPower', (s.peakPower != null && s.peakPower > 0) ? s.peakPower.toFixed(1) + ' kW' : '--');
         this._setText('detailRangeGained', (s.rangeGained != null && s.rangeGained > 0) ? this._dist(s.rangeGained) : '--');
         this._setText('detailOdometer', (s.startOdometerKm != null && s.startOdometerKm > 0) ? this._dist(s.startOdometerKm) : '--');
         this._setText('detailCost', (s.cost != null && s.cost > 0) ? this._money(s.cost) : '--');
         this._setText('detailType', this._typeLabel(s));
-        this._setText('detailTimeToFull', (s.timeToFullMin != null && s.timeToFullMin > 0)
+        this._setText('detailTimeToFull', (chargingNow
+                && s.timeToFullMin != null && s.timeToFullMin > 0)
             ? this._fmtDuration(s.timeToFullMin) : '--');
         var temp = (s.tempAvg != null) ? s.tempAvg
                  : (s.tempHigh != null ? s.tempHigh : null);
         this._setText('detailTemp', (temp != null) ? Math.round(temp) + '°C' : '--');
+
+        // Tariff provenance: name the tariff that priced this charge and the rate
+        // it used, so a cost is always explainable. Sessions on the global rate
+        // (including every session recorded before tariffs existed) hide the tile
+        // rather than showing a bare rate with no source.
+        var tariffStat = document.getElementById('detailTariffStat');
+        if (tariffStat) {
+            if (s.tariffLabel) {
+                var rateTxt = (s.electricityRate != null && s.electricityRate > 0)
+                    ? ' · ' + this._money(s.electricityRate) + '/kWh' : '';
+                this._setText('detailTariff', s.tariffLabel + rateTxt);
+                tariffStat.style.display = '';
+            } else {
+                tariffStat.style.display = 'none';
+            }
+        }
 
         // Location row: place name (or coords) + a "view on map" button when we
         // have coordinates. Hidden entirely when no location was captured.
@@ -808,49 +1389,70 @@ var CHARGING = {
     // Enable the Apply button when any setting changes (mirrors trips' dirty
     // flag so it doesn't sit always-active / misaligned).
     showApplyNeeded: function () {
-        var btn = document.getElementById('chargingApplyBtn');
-        if (btn) { btn.disabled = false; btn.textContent = this._t('common.apply_changes', 'Apply Changes'); }
+        this._refreshConfigDirty();
     },
     resetApplyButton: function () {
-        var btn = document.getElementById('chargingApplyBtn');
-        if (btn) { btn.disabled = true; btn.textContent = this._t('common.apply_changes', 'Apply Changes'); }
+        this._refreshConfigDirty();
     },
 
     saveSettings: function () {
         var self = this;
+        var body = this._dirtyConfigBody();
+        if (Object.keys(body).length === 0) {
+            this._refreshConfigDirty();
+            return;
+        }
+        var generation = ++this._configSaveGeneration;
         var btn = document.getElementById('chargingApplyBtn');
         if (btn) { btn.disabled = true; btn.textContent = self._t('charge.applying', 'Applying…'); }
         self._writing = true;  // block the visibilitychange refresh mid-save
-        var body = {
-            enabled: this._getChecked('chargingEnabled'),
-            electricityRate: this._getNum('rateInput'),
-            dcRate: this._getNum('dcRateInput'),
-            currency: this._getStr('currencySelect') || '$'
-            // fastSampleSec is an internal tuning knob (not user-facing); the
-            // daemon keeps its default. Omitted here intentionally.
-        };
+        self._configWriting = true;
         fetch('/api/charging/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
-        }).then(function (r) { return r.json(); })
+        }).then(function (r) {
+            return r.json().then(function (d) {
+                if (!r.ok || !d || d.success !== true) {
+                    throw new Error('config save rejected');
+                }
+                return d;
+            });
+        })
           .then(function (d) {
-              if (d && d.success) self._toast(self._t('charge.saved', 'Charging settings saved'));
-              else self._toast(self._t('charge.save_failed', 'Could not save charging settings'), 'error');
+              if (generation !== self._configSaveGeneration) return;
+              var keys = Object.keys(body);
+              for (var i = 0; i < keys.length; i++) {
+                  self._configBaseline[keys[i]] = body[keys[i]];
+              }
               self._writing = false;
-              self.resetApplyButton();
+              self._configWriting = false;
+              self._refreshConfigDirty();
+              self._toast(self._t('charge.saved', 'Charging settings saved'));
+              // Reconcile values merged by another client, while preserving
+              // edits made locally after this request began.
               self.loadConfig();
-              self.loadSummary();
+              self._loadCurrentLivePair();
           })
           .catch(function () {
+              if (generation !== self._configSaveGeneration) return;
               self._writing = false;
+              self._configWriting = false;
               self._toast(self._t('charge.save_failed', 'Could not save charging settings'), 'error');
-              self.showApplyNeeded();
+              // Keep the rejected values and original durable baseline. They
+              // remain dirty and the user can correct/retry in place.
+              self._refreshConfigDirty();
           });
     },
 
     deleteCurrent: function () {
-        if (this.currentSessionId != null) this.deleteSession(this.currentSessionId);
+        if (this.currentSessionId != null
+                && this._detailSessionId != null
+                && String(this.currentSessionId)
+                === String(this._detailSessionId)
+                && !this._detailInProgress) {
+            this.deleteSession(this._detailSessionId);
+        }
     },
 
     deleteSession: function (id) {
@@ -874,7 +1476,7 @@ var CHARGING = {
                     self._renderSessionCards();
                     var empty = document.getElementById('sessionEmptyState');
                     if (empty) empty.style.display = (self.sessions.length === 0) ? '' : 'none';
-                    self.loadSummary();
+                    self._loadCurrentLivePair();
                 } else {
                     self._toast(self._t('charge.delete_failed', 'Could not delete session'), 'error');
                 }
@@ -888,13 +1490,20 @@ var CHARGING = {
         if (!window.confirm(msg)) return;
         // POST variant (some WebViews drop DELETE) — the daemon accepts both.
         fetch('/api/charging/history/clear', { method: 'POST' })
-            .then(function (r) { return r.json(); })
+            .then(function (r) {
+                return r.json().then(function (body) {
+                    if (!r.ok || !body || body.success !== true) throw new Error('clear failed');
+                    return body;
+                });
+            })
             .then(function () {
                 self._toast(self._t('charge.cleared', 'Charging history cleared'));
                 self.currentOffset = 0;
-                self.bootstrap();
+                self._restartVisibleRefresh(true);
             })
-            .catch(function () {});
+            .catch(function () {
+                self._toast(self._t('charge.clear_failed', 'Could not clear charging history'), 'error');
+            });
     },
 
     // ==================== CHART RENDERERS (Canvas2D, DPR-scaled) ====================
@@ -1853,6 +2462,499 @@ var CHARGING = {
         return { list: list, tMin: tMin, tMax: tMax };
     },
 
+    // ==================== TARIFFS (location-aware rates) ====================
+
+    loadTariffs: function () {
+        var self = this;
+        var generation = ++this._tariffsGeneration;
+        return this._fetchJson('/api/charging/tariffs')
+            .then(function (d) {
+                if (generation !== self._tariffsGeneration) return null;
+                if (!d || d.success !== true || d.error
+                        || !Array.isArray(d.tariffs)) {
+                    throw new Error('invalid tariffs payload');
+                }
+                self._applyTariffs(d);
+                return true;
+            })
+            .catch(function () {
+                return generation === self._tariffsGeneration
+                    ? false : null;
+            });
+    },
+
+    /**
+     * Absorb a /api/charging/tariffs payload (or the matching bootstrap slice).
+     * `meta` carries the default id, the live GPS fix and which tariff matches
+     * it — that's what drives the "auto here" pill without a second request.
+     */
+    _applyTariffs: function (d) {
+        if (!d) return;
+        // A failed endpoint/bootstrap section yields {error:...} (or success:false),
+        // which has no `tariffs` array. Treating that as an empty list wiped the
+        // rendered rows AND closed an open editor on a transient failure. Keep the
+        // last good state instead.
+        if (d.error || d.success === false) return;
+        if (!d.tariffs && !(d.meta && d.meta.tariffs)) return;
+        var meta = d.meta || d;
+        this.tariffs = d.tariffs || meta.tariffs || [];
+        this.defaultTariffId = meta.defaultTariffId || '';
+        this.matchedTariffId = meta.matchedTariffId || '';
+        this.maxTariffs = meta.maxTariffs || 40;
+        // Remember the fix so "add for this location" can show coordinates before
+        // the POST, and so the editor can say when there's no fix to pin to.
+        this.tariffGpsLat = (meta.lat != null) ? meta.lat : null;
+        this.tariffGpsLng = (meta.lng != null) ? meta.lng : null;
+        this.renderTariffs();
+        // Keep the chip honest about the fix the save will actually use.
+        var ed = document.getElementById('tariffEditor');
+        if (ed && ed.style.display !== 'none') this._renderTariffLocChip();
+    },
+
+    renderTariffs: function () {
+        var list = document.getElementById('tariffList');
+        var empty = document.getElementById('tariffEmpty');
+        if (!list) return;
+
+        var rows = this.tariffs || [];
+        // Drop the editor if the tariff it is bound to no longer exists (deleted
+        // here, or removed by another client between refreshes). Otherwise Save
+        // would PUT a dead id, 404, and look like a random failure.
+        if (this._editingTariff) {
+            var stillThere = false;
+            for (var k = 0; k < rows.length; k++) {
+                if (rows[k].id === this._editingTariff.id) { stillThere = true; break; }
+            }
+            if (!stillThere) this.closeTariffEditor();
+        }
+        list.innerHTML = '';
+        if (rows.length === 0) {
+            if (empty) empty.style.display = '';
+            this._updateTariffAddBtn();
+            this._renderTariffFallbackNote();
+            return;
+        }
+        if (empty) empty.style.display = 'none';
+
+        var self = this;
+        for (var i = 0; i < rows.length; i++) {
+            list.appendChild(self._tariffRow(rows[i]));
+        }
+        this._updateTariffAddBtn();
+        this._renderTariffFallbackNote();
+    },
+
+    /**
+     * State the fallback: what prices a charge that matches no tariff circle.
+     * Only rendered when there IS a fallback to name — with no tariffs, no
+     * default and no global rate there is nothing true to say, so we stay silent
+     * rather than explaining a mechanism that isn't doing anything yet.
+     */
+    _renderTariffFallbackNote: function () {
+        var host = document.getElementById('tariffFallbackNote');
+        if (!host) return;
+        var def = null;
+        var rows = this.tariffs || [];
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].id === this.defaultTariffId) { def = rows[i]; break; }
+        }
+        // resolve() requires the default to actually price the gun, and rateFor()
+        // falls back to acRate — so a default with no acRate cannot price a normal
+        // AC charge. Don't promise it covers everything in that case.
+        if (def && def.enabled !== false && def.acRate > 0) {
+            var label = (def.label && def.label !== '')
+                ? def.label : this._t('charge.tariff_unnamed', 'Unnamed tariff');
+            host.textContent = this._t('charge.tariff_fallback_default',
+                'Charges outside every tariff use "' + label + '".', { label: label });
+            host.style.display = '';
+            return;
+        }
+        if (this.electricityRate > 0) {
+            var rate = this._money(this.electricityRate);
+            host.textContent = this._t('charge.tariff_fallback_global',
+                'Charges outside every tariff use ' + rate + '/kWh.', { rate: rate });
+            host.style.display = '';
+            return;
+        }
+        host.style.display = 'none';
+    },
+
+    /** Disable "add" at the cap so the user learns the limit before a failed POST. */
+    _updateTariffAddBtn: function () {
+        var btn = document.getElementById('tariffAddBtn');
+        if (!btn) return;
+        var atCap = (this.tariffs || []).length >= (this.maxTariffs || 40);
+        btn.disabled = atCap;
+        btn.title = atCap
+            ? this._t('charge.tariff_limit', 'Tariff limit reached')
+            : '';
+    },
+
+    _tariffRow: function (t) {
+        var self = this;
+        var row = document.createElement('div');
+        row.className = 'tariff-row'
+            + (t.id === this.matchedTariffId ? ' matched' : '')
+            + (t.enabled === false ? ' disabled' : '');
+
+        var cur = (t.currency && t.currency !== '') ? t.currency : (this.currency || '$');
+        // Rate line: AC always, DC only when this place bills it separately.
+        var rateBits = [];
+        if (t.acRate > 0) {
+            rateBits.push('<span class="mono">' + this._esc(cur) + t.acRate.toFixed(2) + '</span>'
+                + ' ' + this._esc(this._t('charge.tariff_ac_short', 'AC')));
+        }
+        if (t.dcRate > 0) {
+            rateBits.push('<span class="mono">' + this._esc(cur) + t.dcRate.toFixed(2) + '</span>'
+                + ' ' + this._esc(this._t('charge.tariff_dc_short', 'DC')));
+        }
+        if (rateBits.length === 0) {
+            rateBits.push(this._esc(this._t('charge.tariff_no_rate', 'No rate set')));
+        }
+
+        // Sub line: match radius + how often this tariff has actually priced a
+        // charge (provenance beats a bare coordinate pair for recognising a place).
+        var subBits = [Math.round(t.radiusM || 0) + ' m'];
+        if (t.useCount > 0) {
+            subBits.push(this._esc(this._t('charge.tariff_used_count',
+                t.useCount + '×', { count: t.useCount })));
+        }
+        if (t.lat != null && t.lng != null) {
+            subBits.push(t.lat.toFixed(3) + ', ' + t.lng.toFixed(3));
+        }
+
+        var label = (t.label && t.label !== '')
+            ? t.label
+            : this._t('charge.tariff_unnamed', 'Unnamed tariff');
+
+        var pills = '';
+        if (t.id === this.matchedTariffId) {
+            pills += '<span class="tariff-pill here">' + this._esc(this._t('charge.tariff_pill_here', 'auto here')) + '</span>';
+        }
+        if (t.id === this.defaultTariffId) {
+            pills += '<span class="tariff-pill default">' + this._esc(this._t('charge.tariff_pill_default', 'default')) + '</span>';
+        }
+
+        row.innerHTML =
+            '<div class="tariff-info">' +
+                '<div class="tariff-name-row">' +
+                    '<span class="tariff-name">' + this._esc(label) + '</span>' + pills +
+                '</div>' +
+                '<div class="tariff-meta">' + rateBits.join(' · ') + '</div>' +
+                '<div class="tariff-sub">' + subBits.join(' · ') + '</div>' +
+            '</div>' +
+            '<div class="tariff-actions">' +
+                '<button class="tariff-icon-btn' + (t.id === this.defaultTariffId ? ' on' : '') + '" data-act="default" ' +
+                    'title="' + this._esc(this._t('charge.tariff_set_default', 'Use when nothing matches')) + '">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>' +
+                '</button>' +
+                '<button class="tariff-icon-btn" data-act="edit" ' +
+                    'title="' + this._esc(this._t('common.edit', 'Edit')) + '">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>' +
+                '</button>' +
+                '<button class="tariff-icon-btn danger" data-act="delete" ' +
+                    'title="' + this._esc(this._t('common.delete', 'Delete')) + '">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
+                '</button>' +
+            '</div>';
+
+        // Listeners rather than inline onclick: the id is data, and building
+        // handler strings from it invites a quoting bug.
+        var btns = row.querySelectorAll('.tariff-icon-btn');
+        for (var i = 0; i < btns.length; i++) {
+            (function (btn) {
+                btn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    var act = btn.getAttribute('data-act');
+                    if (act === 'edit') self.openTariffEditor(t);
+                    else if (act === 'delete') self.deleteTariff(t);
+                    else if (act === 'default') self.setDefaultTariff(t);
+                });
+            })(btns[i]);
+        }
+        return row;
+    },
+
+    /**
+     * Open the add/edit panel. `t` null = create at the current position; an
+     * object = edit that tariff (its stored location is kept as-is, so editing a
+     * rate from the couch can't move the tariff to wherever the car is parked).
+     */
+    openTariffEditor: function (t) {
+        var editor = document.getElementById('tariffEditor');
+        if (!editor) return;
+        this._editingTariff = t || null;
+        // Creating pins to the CURRENT position, so refresh the snapshot rather than
+        // showing whatever fix happened to exist at page load. Async: the chip below
+        // renders from the cached value now and _applyTariffs redraws it on arrival.
+        if (!t) this.loadTariffs();
+
+        this._setInput('tariffLabelInput', t ? (t.label || '') : '');
+        // On CREATE, seed the rates from the existing global settings. Those are
+        // the rates the user already pays, so "save a tariff for here" is usually
+        // just naming a place — pre-filling saves re-typing a number the app
+        // already knows, and the fields stay editable. Left blank when no global
+        // rate is configured (nothing to suggest).
+        this._setInput('tariffAcRateInput',
+            t ? (t.acRate > 0 ? t.acRate : '') : (this.electricityRate > 0 ? this.electricityRate : ''));
+        this._setInput('tariffDcRateInput',
+            t ? (t.dcRate > 0 ? t.dcRate : '') : (this.dcRate > 0 ? this.dcRate : ''));
+        this._setInput('tariffRadiusInput', t ? (t.radiusM || this.TARIFF_DEFAULT_RADIUS_M) : this.TARIFF_DEFAULT_RADIUS_M);
+
+        this._renderTariffLocChip();
+        this._setTariffError('');
+        editor.style.display = '';
+        var labelInput = document.getElementById('tariffLabelInput');
+        if (labelInput) { try { labelInput.focus(); } catch (e) {} }
+    },
+
+    /**
+     * Paint the editor's location chip from the tariff being edited, else the live
+     * fix. Factored out so the async loadTariffs() refresh can REPAINT it — the chip
+     * previously showed the page-load snapshot while the save sent a newer fix, so
+     * the tariff could be pinned somewhere the user never confirmed.
+     */
+    _renderTariffLocChip: function () {
+        var locText = document.getElementById('tariffLocText');
+        if (!locText) return;
+        var t = this._editingTariff;
+        if (t && t.lat != null && t.lng != null) {
+            locText.textContent = t.lat.toFixed(5) + ', ' + t.lng.toFixed(5);
+        } else if (this.tariffGpsLat != null && this.tariffGpsLng != null) {
+            locText.textContent = this.tariffGpsLat.toFixed(5) + ', ' + this.tariffGpsLng.toFixed(5);
+        } else {
+            locText.textContent = this._t('charge.tariff_no_gps', 'Waiting for GPS…');
+        }
+    },
+
+    closeTariffEditor: function () {
+        var editor = document.getElementById('tariffEditor');
+        if (editor) editor.style.display = 'none';
+        this._editingTariff = null;
+        this._setTariffError('');
+    },
+
+    _setTariffError: function (msg) {
+        var el = document.getElementById('tariffError');
+        if (!el) return;
+        if (!msg) { el.style.display = 'none'; el.textContent = ''; return; }
+        el.textContent = msg;
+        el.style.display = '';
+    },
+
+    saveTariff: function () {
+        var self = this;
+        var editing = this._editingTariff;
+        var label = this._getStr('tariffLabelInput').trim();
+        var acRate = this._getNum('tariffAcRateInput');
+        var dcRate = this._getNum('tariffDcRateInput');
+        var radiusM = this._getNum('tariffRadiusInput') || this.TARIFF_DEFAULT_RADIUS_M;
+
+        // Validate before POSTing so the user gets the reason inline. The server
+        // re-checks all of this (never trust the client), but failing here avoids
+        // a round-trip and keeps the message next to the field at fault.
+        //
+        // A tariff with no rate would match a charge and then price it at
+        // nothing, which reads as a bug. Require at least one rate up front.
+        if (acRate <= 0 && dcRate <= 0) {
+            this._setTariffError(this._t('charge.tariff_err_no_rate', 'Enter an AC or DC rate'));
+            return;
+        }
+        if (acRate < 0 || dcRate < 0 || acRate >= 100000 || dcRate >= 100000) {
+            this._setTariffError(this._t('charge.tariff_err_rate_range',
+                'Rates must be between 0 and 100000'));
+            return;
+        }
+        // A radius below GPS scatter can never match; an oversized one would
+        // swallow neighbouring sites on different tariffs.
+        if (radiusM < 25 || radiusM > 2000) {
+            this._setTariffError(this._t('charge.tariff_err_radius',
+                'Match radius must be between 25 and 2000 m'));
+            return;
+        }
+        if (label.length > 48) {
+            this._setTariffError(this._t('charge.tariff_err_label', 'Label is too long'));
+            return;
+        }
+        // Two tariffs with the same name are indistinguishable in the list and on
+        // a session card, which defeats the point of labelling them.
+        var dupe = (this.tariffs || []).some(function (t) {
+            return t.label && label && t.label.toLowerCase() === label.toLowerCase()
+                && (!editing || t.id !== editing.id);
+        });
+        if (dupe) {
+            this._setTariffError(this._t('charge.tariff_err_dupe_label',
+                'A tariff with that label already exists'));
+            return;
+        }
+        // No client-side GPS gate. tariffGpsLat is a snapshot taken at page load;
+        // gating on it permanently blocked "Add tariff" for anyone who opened the
+        // page before the first fix, with no in-page way to refresh. The server
+        // takes its OWN live fix at POST time and returns a 400 with a readable
+        // reason when it genuinely has none — which saveTariff already renders
+        // into #tariffError below.
+        this._setTariffError('');
+
+        var body = {
+            label: label,
+            acRate: acRate,
+            dcRate: dcRate,
+            radiusM: radiusM,
+            currency: this.currency || '$'
+        };
+        if (editing) {
+            body.id = editing.id;
+        } else if (this.tariffGpsLat != null && this.tariffGpsLng != null) {
+            // Pin to the fix the user was shown in the location chip. Otherwise the
+            // server re-reads GPS at POST time and the tariff can land somewhere the
+            // user never confirmed (they may have driven off since opening the form).
+            body.lat = this.tariffGpsLat;
+            body.lng = this.tariffGpsLng;
+        }
+
+        var btn = document.getElementById('tariffSaveBtn');
+        if (btn) { btn.disabled = true; btn.textContent = this._t('common.saving', 'Saving…'); }
+        this._writing = true;
+
+        fetch('/api/charging/tariffs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        }).then(function (r) { return r.json(); })
+          .then(function (d) {
+              self._writing = false;
+              if (btn) { btn.disabled = false; btn.textContent = self._t('common.save', 'Save'); }
+              if (!d || (!d.success && !d.tariffSaved)) {
+                  self._setTariffError((d && d.error) || self._t('charge.tariff_err_save', 'Could not save tariff'));
+                  return;
+              }
+              self.closeTariffEditor();
+              // Confirm the automatic behaviour explicitly on save — the whole
+              // point of a tariff is that the user never touches it again, so
+              // say so once with the actual radius rather than leaving them to
+              // infer it.
+              if (!editing) {
+                  self._toast(self._t('charge.tariff_auto_hint',
+                      'Saved. Charges within ' + radiusM + ' m of here will use this tariff automatically.',
+                      { radius: radiusM }));
+              }
+              self._afterTariffChange(d, null, !editing);
+          })
+          .catch(function () {
+              self._writing = false;
+              if (btn) { btn.disabled = false; btn.textContent = self._t('common.save', 'Save'); }
+              self._setTariffError(self._t('charge.tariff_err_save', 'Could not save tariff'));
+          });
+    },
+
+    deleteTariff: function (t) {
+        var self = this;
+        var label = (t.label && t.label !== '') ? t.label : this._t('charge.tariff_unnamed', 'Unnamed tariff');
+        var ask = this._t('charge.tariff_confirm_delete', 'Delete this tariff? Charges priced with it will fall back to your other rates.');
+        var proceed = function (ok) {
+            if (!ok) return;
+            self._writing = true;
+            fetch('/api/charging/tariffs/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: t.id })
+            }).then(function (r) { return r.json(); })
+              .then(function (d) {
+                  self._writing = false;
+                  if (d && (d.success || d.tariffSaved)) {
+                      self._afterTariffChange(d, label);
+                  }
+                  else self._toast(self._t('charge.tariff_err_delete', 'Could not delete tariff'), 'error');
+              })
+              .catch(function () {
+                  self._writing = false;
+                  self._toast(self._t('charge.tariff_err_delete', 'Could not delete tariff'), 'error');
+              });
+        };
+        if (window.BYD && BYD.utils && typeof BYD.utils.confirmDialog === 'function') {
+            BYD.utils.confirmDialog({
+                title: this._t('common.delete', 'Delete'),
+                body: ask,
+                confirmLabel: this._t('common.delete', 'Delete'),
+                cancelLabel: this._t('common.cancel', 'Cancel'),
+                danger: true
+            }).then(proceed);
+        } else {
+            proceed(window.confirm(ask));
+        }
+    },
+
+    setDefaultTariff: function (t) {
+        var self = this;
+        // Tapping the star on the current default clears it — one control, both
+        // directions, no separate "unset" affordance to discover.
+        var next = (t.id === this.defaultTariffId) ? '' : t.id;
+        this._writing = true;
+        fetch('/api/charging/tariffs/default', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: next })
+        }).then(function (r) { return r.json(); })
+          .then(function (d) {
+              self._writing = false;
+              if (d && (d.success || d.tariffSaved)) {
+                  self._afterTariffChange(d);
+              }
+              else self._toast(self._t('charge.tariff_err_save', 'Could not save tariff'), 'error');
+          })
+          .catch(function () {
+              self._writing = false;
+              self._toast(self._t('charge.tariff_err_save', 'Could not save tariff'), 'error');
+          });
+    },
+
+    /**
+     * Shared post-mutation refresh. A tariff change re-prices history server-side,
+     * so the session list, the summary tiles and the cost hero all have to reload
+     * — otherwise the page keeps showing costs at the old rate. `repriced` is
+     * surfaced so the user sees that past charges were corrected, not just the
+     * next one.
+     */
+    _afterTariffChange: function (d, deletedLabel, suppressSavedToast) {
+        var n = (d && d.repriced) ? d.repriced : 0;
+        if (n > 0) {
+            // plural() picks one/other; it also returns the raw key on a miss, so
+            // guard the same way _t does.
+            var msg = null;
+            if (window.BYD && BYD.i18n && typeof BYD.i18n.plural === 'function') {
+                var pv = BYD.i18n.plural('charge.tariff_repriced', n, { count: n });
+                if (pv && pv !== 'charge.tariff_repriced') msg = pv;
+            }
+            this._toast(msg || (n + (n === 1 ? ' past charge re-priced' : ' past charges re-priced')));
+        } else if (deletedLabel) {
+            this._toast(this._t('charge.tariff_deleted', 'Tariff deleted'));
+        } else if (!suppressSavedToast) {
+            // The create path already toasted the auto-apply hint; don't stack a
+            // second, less informative "Tariff saved" on top of it.
+            this._toast(this._t('charge.tariff_saved', 'Tariff saved'));
+        }
+        if (d && d.repricingStatus
+                && d.repricingStatus !== 'complete') {
+            var warning;
+            var warningType = 'warning';
+            if (d.repricingStatus === 'pending') {
+                warning = this._t('charge.tariff_reprice_pending',
+                    'Tariff saved. Past charges will be re-priced automatically when storage is ready.');
+            } else if (d.repricingStatus === 'failed') {
+                warning = (d && d.error) || this._t(
+                    'charge.tariff_reprice_failed',
+                    'Tariff saved, but past-charge repricing could not be queued.');
+                warningType = 'error';
+            } else {
+                warning = this._t('charge.tariff_reprice_unconfirmed',
+                    'Tariff saved, but past-charge repricing could not be confirmed.');
+            }
+            this._toast(warning, warningType);
+        }
+        this.loadTariffs();
+        this._loadCurrentLivePair();
+    },
+
     // ==================== FORMAT / DOM HELPERS ====================
 
     _money: function (v) {
@@ -1919,29 +3021,44 @@ var CHARGING = {
     _typeKind: function (s) {
         if (!s) return 'unk';
         var peak = (s.peakPower != null && s.peakPower > 0) ? s.peakPower : 0;
-        // Honour a DC gun flag ONLY if the peak is physically consistent with DC.
-        // A DC flag with a sub-DC peak is a gun-state misread — fall through to the
-        // power-based AC split instead of blindly showing "DC fast".
-        if ((s.isDc === true && peak >= this.DC_MIN_PEAK_KW) || peak >= this.DC_KW) return 'dc';
+        // A TRUE isDc flag is already peak-guarded: the backend's deriveIsDc only
+        // returns 1 when the gun says DC *and* the peak cleared DC_MIN_PEAK_KW, and
+        // it is the same call that selects dcRate. Re-testing the peak here was a
+        // SECOND, independent application of that guard against a peak that can come
+        // from a different source (the served peakPower is the max of CPS samples,
+        // while pricing used the in-memory running max) — so a session in the
+        // 15..25 kW band could be priced DC yet fall through to the power-only split
+        // and render "AC fast". Trust the flag; the guard lives in one place.
+        if (s.isDc === true || peak >= this.DC_KW) return 'dc';
         if (s.isDc === false) return peak >= this.AC_FAST_KW ? 'fast' : 'slow';
-        // DC flag but implausibly-low peak, or unknown gun state — bucket by power
-        // so old/partial rows and misread-gun rows still classify sensibly.
+        // Unknown gun state (isDc null: legacy/partial rows, AC_DC/V2L, or a
+        // peak-downgraded misread) — bucket by power so they still classify sensibly.
         if (peak >= this.DC_KW) return 'dc';
         if (peak >= this.AC_FAST_KW) return 'fast';
         if (peak > 0) return 'slow';
         return 'unk';
     },
 
-    // Effective per-kWh rate for the LIVE in-progress session: the separate DC
-    // tariff when the open session is CONFIDENTLY DC and a dcRate is set, else
-    // the base rate. Mirrors the backend deriveIsDc()+effectiveRate() pricing
-    // path EXACTLY (gun==3 AND peak ≥ DC_MIN_PEAK_KW) — NOT the lenient, peak-only
-    // _typeKind() DISPLAY classifier — so this live "Cost this session" estimate
-    // agrees with the session-card cost (backend-computed) shown alongside it and
-    // with the value persisted at session end. Pricing is intentionally stricter
-    // than the label: we only apply the DC premium when the gun confirms DC.
+    // Effective per-kWh rate for the LIVE in-progress session.
+    //
+    // PREFER THE SERVER'S OWN NUMBER. chargingRowToJson stamps the open row's
+    // `electricityRate` with the result of priceSession(deriveIsDc(...)) — the
+    // SAME call that prices the row when it closes — which resolves the
+    // LOCATION-TARIFF layer (TariffManager circles) before falling back to the
+    // global DC/base rate. Re-deriving the rate here could only ever replicate
+    // that fallback: a client-side mirror has no lat/lng, so a charge inside a
+    // tariff circle showed the hero cost at the global rate while the card
+    // beside it showed the tariff-priced cost, and the mismatch resolved only
+    // when the session closed. Reading the served value removes the whole class
+    // of drift, and keeps this in step with deriveIsDc automatically — including
+    // its I5 rule that an unmeasured peak must NOT be read as "trust the gun".
+    //
+    // The local fallback below is retained ONLY for the pre-first-sample window,
+    // where energyAdded is still 0 so the backend has not stamped a rate yet
+    // (and the hero is gated on liveKwh > 0 anyway), and for older daemons.
     _liveRate: function () {
         var s = this._liveSession;
+        if (s && s.electricityRate != null && s.electricityRate > 0) return s.electricityRate;
         if (this.dcRate > 0 && s && s.gunState === 3
                 && s.peakPower != null && s.peakPower >= this.DC_MIN_PEAK_KW) {
             return this.dcRate;
@@ -1990,9 +3107,14 @@ var CHARGING = {
     },
 
     // Minimal HTML escape for interpolated text (place names can contain & < >).
+    // Escapes for BOTH text nodes and quoted attribute values. Quotes matter:
+    // tariff labels are user text and are interpolated into title="..." on the
+    // row action buttons, so a label containing " would otherwise break out of
+    // the attribute and inject markup.
     _esc: function (str) {
         if (str == null) return '';
-        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                          .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     },
 
     _rgba: function (color, alpha) {
@@ -2012,10 +3134,15 @@ var CHARGING = {
         return color;
     },
 
-    _t: function (key, fallback) {
+    // BYD.i18n.t() has THREE returns: the translation, null while the catalog is
+    // still loading, or THE RAW KEY when the key is missing from both the active
+    // and the en catalog. A bare truthiness test treats that raw key as a hit, so
+    // the caller's fallback is dead and the UI renders "charge.tariff_pill_here".
+    // Reject the sentinel explicitly. `vars` forwards {placeholder} values.
+    _t: function (key, fallback, vars) {
         if (window.BYD && BYD.i18n && typeof BYD.i18n.t === 'function') {
-            var v = BYD.i18n.t(key);
-            if (v) return v;
+            var v = BYD.i18n.t(key, vars);
+            if (v && v !== key) return v;
         }
         return fallback;
     },

@@ -130,7 +130,7 @@ public class GpuMosaicRecorder {
     private final Object producerCornerMapLock = new Object();
 
     // Last SurfaceTexture transform matrix published by the camera thread.
-    // Initialised to identity so non-esco paths keep working as before.
+    // Initialised to identity so non-oem paths keep working as before.
     // Volatile because the camera thread writes via setTextureMatrix and
     // the encoder GL thread reads in drawFrame.
     private final float[] currentTexMatrix = {
@@ -169,7 +169,7 @@ public class GpuMosaicRecorder {
     // startRecording. Null = no override (default behaviour).
     private volatile java.io.File pendingOutputDirOverride = null;
     private volatile boolean apaMode = false;  // APA mode: passthrough instead of mosaic split
-    private volatile int cameraLayout = 0;  // 0=4-cam, 1=APA passthrough, 2=3-cam, 3=esco-parity passthrough
+    private volatile int cameraLayout = 0;  // 0=4-cam, 1=APA passthrough, 2=3-cam, 3=oem-parity passthrough
     // Set when setCameraLayout flips on a non-GL thread; consumed inside
     // drawFrame on the encoder GL thread to push the new uniform exactly
     // once. Per GLES2 spec, uniform values are part of the program object,
@@ -220,6 +220,15 @@ public class GpuMosaicRecorder {
     private volatile boolean overlayEnabled = false;
     private OverlayBitmapRenderer overlayRenderer;
     private TelemetryDataCollector telemetryCollector;
+    // Which telemetry fields the overlay draws for THIS recorder's active flow.
+    // Defaults to the legacy eight-field set so an unconfigured recorder is
+    // visually identical to the pre-feature overlay. Pushed to the renderer and
+    // used to report overlay-only field demand to the collector.
+    private volatile com.overdrive.app.telemetry.TelemetryFields overlayFields =
+        com.overdrive.app.telemetry.TelemetryFields.legacyDefault();
+    // Stable key identifying this recorder as an overlay-field-demand consumer
+    // on the shared TelemetryDataCollector ("pano" — the OEM pipeline uses "oem").
+    private String overlayDemandKey = "pano";
     private int overlayFrameCounter = 0;
     // Frame stride between telemetry-overlay bitmap re-rasters, derived from
     // encoder fps in init() to land near 2 Hz (matches TelemetryDataCollector
@@ -285,11 +294,21 @@ public class GpuMosaicRecorder {
     // This per-stage timer logs the worst frame in a 30s window (matching
     // the parent stage timer's cadence) and breaks out:
     //   - mc:    makeCurrent
-    //   - cls:   clear
+    //   - vp:    glViewport (near-free client-side state)
+    //   - rt:    glClear = the FIRST GL command after makeCurrent, so the
+    //            driver's lazy producer-side dequeueBuffer on the encoder's
+    //            BufferQueue lands here. glClear is ~free on tiled Adreno; a
+    //            non-trivial rt is encoder-input backpressure (the render
+    //            target could not be acquired), NOT clearing cost. (This was
+    //            previously mislabeled "cls" — see issue #176.)
     //   - shd:   mosaic shader bind + draw
     //   - ovl:   overlay (texSubImage2D upload + composite draw)
-    //   - swap:  eglSwapBuffersWithTimestamp itself (this is what blocks
-    //            on encoder input-pool backpressure)
+    //   - swap:  eglSwapBuffersWithTimestamp itself (also blocks on encoder
+    //            input-pool backpressure)
+    //
+    // Encoder backpressure therefore surfaces in EITHER rt (dequeue) or swap
+    // (queue), depending on when MediaCodec returns an input buffer — treat
+    // rt+swap together as the encoder-queue wait.
     //
     // Once a stutter event is captured, the dominant sub-stage tells us
     // where to look — overlay upload vs shader draw vs encoder backpressure
@@ -298,7 +317,8 @@ public class GpuMosaicRecorder {
     private long drawStageWindowStartMs = 0;
     private long drawStageWorstTotalNs = 0;
     private long drawStageWorstMakeCurrentNs = 0;
-    private long drawStageWorstClearNs = 0;
+    private long drawStageWorstViewportNs = 0;
+    private long drawStageWorstRenderTargetNs = 0;
     private long drawStageWorstShaderNs = 0;
     private long drawStageWorstOverlayNs = 0;
     private long drawStageWorstSwapNs = 0;
@@ -349,7 +369,7 @@ public class GpuMosaicRecorder {
         1.0f, 1.0f   // Top-right vertex → top of texture
     };
     
-    // Vertex shader. esco-parity: applies the SurfaceTexture transform
+    // Vertex shader. oem-parity: applies the SurfaceTexture transform
     // matrix (uTexMatrix) so the consumer samples whatever sub-region the
     // BYD HAL marked as "live frame" — without it we sample the whole
     // producer surface including any HAL chrome (calibration text, letter-
@@ -539,27 +559,6 @@ public class GpuMosaicRecorder {
                     logger.warn("Segment-rotated listener threw: " + t.getMessage());
                 }
             }
-            
-            // SOTA: Trigger storage cleanup after each file is saved
-            try {
-                com.overdrive.app.storage.StorageManager storageManager =
-                    com.overdrive.app.storage.StorageManager.getInstance();
-                
-                // Determine if this was a surveillance or manual recording based on output path
-                // Surveillance files go to surveillance dir, manual recordings to recordings dir
-                if (encoder != null) {
-                    String lastPath = encoder.getCurrentOutputPath();
-                    if (lastPath != null) {
-                        if (lastPath.contains("/surveillance/") || lastPath.contains("event_")) {
-                            storageManager.onSurveillanceFileSaved();
-                        } else {
-                            storageManager.onRecordingFileSaved();
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                logger.warn("Storage cleanup after file close failed: " + e.getMessage());
-            }
         });
         
         // Get encoder's input surface
@@ -676,6 +675,19 @@ public class GpuMosaicRecorder {
         // Same EGL-recovery discipline for the recording composition layout:
         // re-push uRecordLayout on the next frame of the fresh program object.
         recordLayoutUniformDirty.set(true);
+        // ...and for the quasi-static uniform block. This was MISSING, and on
+        // DiLink 4 it is a correctness bug, not just a cosmetic one: that block
+        // carries uProducerFor*/uFlipFor* (the per-role 2x2 corner remap),
+        // uApplyManualYFlip, uRedMaskStrength and uApaCenterInset. A fresh
+        // program object starts with all of them at 0.0, so after any
+        // release→init cycle (EGL recovery, or reinitializeEncoder swapping in a
+        // new GpuMosaicRecorder on a codec/quality/fps change) the recorder
+        // would composite with corner map {0,0} for every role — i.e. all four
+        // output quadrants sampling the producer's top-left — and with the
+        // manual Y-flip wrongly disabled on legacy. uniformsDirty is initialised
+        // true at the field, so cold start was fine and only the re-init path
+        // was affected, which is exactly why this went unnoticed.
+        uniformsDirty.set(true);
 
         logger.info("GpuMosaicRecorder initialized (encoder codec=" +
             (encoder.isHevcCodec() ? "H.265" : "H.264") + ")");
@@ -726,9 +738,19 @@ public class GpuMosaicRecorder {
      */
     public void drawFrame(int cameraTextureId, int windshieldTextureId,
                           boolean windshieldReady, long frameTimestampNs) {
-        // Check if initialized
-        if (eglCore == null || encoderSurface == null) {
-            // Not initialized yet - skip silently
+        // Check if initialized.
+        //
+        // programId/vertexBuffer are checked alongside eglCore/encoderSurface
+        // because init() assigns the EGL fields BEFORE it compiles the shader
+        // (encoderSurface at createWindowSurface, programId after). A shader
+        // compile failure throws out of init() with eglCore + encoderSurface
+        // already set but programId == 0 and vertexBuffer == null, so an
+        // eglCore-only guard lets us fall through to glVertexAttribPointer
+        // with a null Buffer — an NPE per frame (~4/s) for the life of the
+        // process, drowning the log and hiding the real compile error.
+        if (eglCore == null || encoderSurface == null
+                || programId == 0 || vertexBuffer == null || texCoordBuffer == null) {
+            // Not initialized (or init failed) - skip silently
             return;
         }
 
@@ -765,10 +787,16 @@ public class GpuMosaicRecorder {
 
         // Set viewport to encoder resolution (profile-driven: Seal=2560x1920, Tang=2560x1440)
         GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
+        long tAfterViewportNs = System.nanoTime();
 
         // Clear. glClearColor was hoisted to init() — it's GL context state
         // that persists; the encoder's EGL context is exclusive to this
         // recorder so no other code path can change it under us.
+        //
+        // NB: this is the FIRST GL command after makeCurrent, so the driver
+        // lazily dequeues the encoder-input buffer HERE. On encoder
+        // backpressure the block is charged to this segment ("rt"), not to a
+        // clearing cost (glClear is ~free on tiled Adreno). See issue #176.
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
         long tAfterClearNs = System.nanoTime();
 
@@ -1003,38 +1031,46 @@ public class GpuMosaicRecorder {
         // timer in PanoramicCameraGpu sees this whole method as
         // "mosaic+swap"; if its worst frame exceeds the per-frame budget,
         // this log will tell us which sub-stage was responsible (overlay
-        // upload? swap blocking on encoder backpressure? shader draw?).
-        long stageTotalNs   = tAfterSwapNs       - t0;
-        long stageMakeNs    = tAfterMakeCurrentNs - t0;
-        long stageClearNs   = tAfterClearNs      - tAfterMakeCurrentNs;
-        long stageShaderNs  = tAfterShaderNs     - tAfterClearNs;
-        long stageOverlayNs = tAfterOverlayNs    - tAfterShaderNs;
-        long stageSwapNs    = tAfterSwapNs       - tAfterOverlayNs;
+        // upload? encoder backpressure in rt/swap? shader draw?).
+        //
+        // rt = glClear span = first GL cmd after makeCurrent, where the
+        // encoder-input buffer is dequeued; treat rt+swap together as the
+        // encoder-queue wait. See issue #176 (was previously labeled "cls").
+        long stageTotalNs    = tAfterSwapNs       - t0;
+        long stageMakeNs     = tAfterMakeCurrentNs - t0;
+        long stageViewportNs = tAfterViewportNs   - tAfterMakeCurrentNs;
+        long stageRtNs       = tAfterClearNs      - tAfterViewportNs;
+        long stageShaderNs   = tAfterShaderNs     - tAfterClearNs;
+        long stageOverlayNs  = tAfterOverlayNs    - tAfterShaderNs;
+        long stageSwapNs     = tAfterSwapNs       - tAfterOverlayNs;
         drawStageWindowFrames++;
         if (stageTotalNs > drawStageWorstTotalNs) {
-            drawStageWorstTotalNs       = stageTotalNs;
-            drawStageWorstMakeCurrentNs = stageMakeNs;
-            drawStageWorstClearNs       = stageClearNs;
-            drawStageWorstShaderNs      = stageShaderNs;
-            drawStageWorstOverlayNs     = stageOverlayNs;
-            drawStageWorstSwapNs        = stageSwapNs;
+            drawStageWorstTotalNs        = stageTotalNs;
+            drawStageWorstMakeCurrentNs  = stageMakeNs;
+            drawStageWorstViewportNs     = stageViewportNs;
+            drawStageWorstRenderTargetNs = stageRtNs;
+            drawStageWorstShaderNs       = stageShaderNs;
+            drawStageWorstOverlayNs      = stageOverlayNs;
+            drawStageWorstSwapNs         = stageSwapNs;
         }
         long nowMsForStage = System.currentTimeMillis();
         if (drawStageWindowStartMs == 0) {
             drawStageWindowStartMs = nowMsForStage;
         } else if (nowMsForStage - drawStageWindowStartMs >= DRAW_STAGE_LOG_INTERVAL_MS) {
             logger.info(String.format(
-                    "DrawStage(worst/30s): total=%dms mc=%dms cls=%dms shd=%dms ovl=%dms swap=%dms (frames=%d)",
-                    drawStageWorstTotalNs       / 1_000_000,
-                    drawStageWorstMakeCurrentNs / 1_000_000,
-                    drawStageWorstClearNs       / 1_000_000,
-                    drawStageWorstShaderNs      / 1_000_000,
-                    drawStageWorstOverlayNs     / 1_000_000,
-                    drawStageWorstSwapNs        / 1_000_000,
+                    "DrawStage(worst/30s): total=%dms mc=%dms vp=%dms rt=%dms shd=%dms ovl=%dms swap=%dms (frames=%d)",
+                    drawStageWorstTotalNs        / 1_000_000,
+                    drawStageWorstMakeCurrentNs  / 1_000_000,
+                    drawStageWorstViewportNs     / 1_000_000,
+                    drawStageWorstRenderTargetNs / 1_000_000,
+                    drawStageWorstShaderNs       / 1_000_000,
+                    drawStageWorstOverlayNs      / 1_000_000,
+                    drawStageWorstSwapNs         / 1_000_000,
                     drawStageWindowFrames));
             drawStageWorstTotalNs = 0;
             drawStageWorstMakeCurrentNs = 0;
-            drawStageWorstClearNs = 0;
+            drawStageWorstViewportNs = 0;
+            drawStageWorstRenderTargetNs = 0;
             drawStageWorstShaderNs = 0;
             drawStageWorstOverlayNs = 0;
             drawStageWorstSwapNs = 0;
@@ -1065,6 +1101,16 @@ public class GpuMosaicRecorder {
             if (recording) {
                 logger.warn("Already recording");
                 return true;
+            }
+
+            // OWNERSHIP PRE-CHECK (audit R11-1 / ExtD-2): same guard as
+            // triggerEventRecordingExclusive — the encoder's already-writing
+            // no-op leg must not be reported as a successful start of OUR
+            // outputPath (the file would never get a muxer).
+            if (encoder != null && encoder.isWritingToFile()) {
+                logger.warn("Encoder busy with a non-GMR session — refusing start for "
+                        + outputPath);
+                return false;
             }
 
             // Start encoder recording (with pre-record buffer flush)
@@ -1100,10 +1146,50 @@ public class GpuMosaicRecorder {
      *         existing recording satisfies the caller's intent.
      */
     public boolean triggerEventRecording(String outputPath, long postRecordDurationMs) {
+        return triggerEventRecordingExclusive(outputPath, postRecordDurationMs)
+                != TriggerResult.REFUSED;
+    }
+
+    /** Ownership-explicit result of {@link #triggerEventRecordingExclusive}. */
+    public enum TriggerResult { STARTED, ALREADY_RECORDING, REFUSED }
+
+    /**
+     * Ownership-explicit variant of {@link #triggerEventRecording} (audit R6
+     * lifecycle #1). The boolean form reports "already recording" as TRUE —
+     * fine for fire-and-forget callers, but a caller that must UNWIND on a
+     * failed commit (SurveillanceEngineGpu's epoch-checked start commits)
+     * then believes it OWNS a session another caller opened, and its unwind
+     * stop kills the other session's live recording (worst case: a stale
+     * pre-bounce start stopping the successor arm session's recorder while
+     * the engine reports recording — whole-session silent video loss).
+     *
+     * @return STARTED iff THIS call opened the recorder session (caller owns
+     *         it and may stop it); ALREADY_RECORDING when another session
+     *         owns it (caller must neither commit nor unwind); REFUSED on
+     *         encoder refusal (savedFormat barrier / null encoder).
+     */
+    public TriggerResult triggerEventRecordingExclusive(String outputPath, long postRecordDurationMs) {
         synchronized (recordingLock) {
             if (recording) {
                 logger.warn("Already recording");
-                return true;
+                return TriggerResult.ALREADY_RECORDING;
+            }
+
+            // OWNERSHIP PRE-CHECK (audit R11-1 / ExtD-2, defense-in-depth
+            // under the stop-path locking above). The encoder's trigger has
+            // an "already writing → return true" no-op leg that this wrapper
+            // cannot distinguish from a genuine open — the false STARTED it
+            // produced meant a session that never got a muxer. With GMR's
+            // stops now serialized on recordingLock, wrapper recording==false
+            // with the encoder still writing can only mean a NON-GMR session
+            // owns the encoder (e.g. a driving-mode file still mid-close on
+            // a mode transition). REFUSE rather than adopt: the caller's
+            // retry paths (continuous retry chain; next motion tick in smart
+            // mode) re-attempt against a settled encoder.
+            if (encoder != null && encoder.isWritingToFile()) {
+                logger.warn("Encoder busy with a non-GMR session — refusing trigger for "
+                        + outputPath);
+                return TriggerResult.REFUSED;
             }
 
             // Start encoder recording (with pre-record buffer flush)
@@ -1111,10 +1197,10 @@ public class GpuMosaicRecorder {
                 recording = true;
                 frameCount = 0;
                 logger.info("Recording started: " + outputPath);
-                return true;
+                return TriggerResult.STARTED;
             }
             logger.error("Failed to start encoder recording");
-            return false;
+            return TriggerResult.REFUSED;
         }
     }
     
@@ -1295,24 +1381,47 @@ public class GpuMosaicRecorder {
     
     /**
      * Stops recording.
+     *
+     * <p>LOCK (audit R11-1 / ExtD-2): the whole body runs under
+     * {@code recordingLock} — the SAME lock the start paths hold. Both stop
+     * paths used to flip {@code recording=false} and close the encoder
+     * lock-free; a concurrent {@code triggerEventRecordingExclusive} could
+     * then pass its {@code recording==false} check, win the encoder's
+     * {@code startStopLock} BEFORE the stop's close, hit the encoder's
+     * "already writing → return true" no-op leg, and report a false STARTED
+     * for a session that never got a muxer (the stop then closed the
+     * encoder): one event silently unrecorded behind a success signal.
+     * Serializing stops with starts makes the flag flip + encoder close
+     * atomic against a start — a start now sees either recording==true
+     * (ALREADY_RECORDING) or a fully-closed encoder (genuine open). Lock
+     * order recordingLock → startStopLock matches the start paths; the
+     * encoder's callbacks (fileClosedCallback / writer-abort) never take
+     * recordingLock, so no inversion. Holding the lock across the encoder
+     * close (drainer join, ≤2s finalizer wait) intentionally blocks a
+     * racing start for the duration — that start would have been a false
+     * STARTED before; now it waits and opens against clean state.
      */
     public void stopRecording() {
         if (!recording) {
             return;
         }
-        
-        recording = false;
-        
-        // SOTA: Notify StorageManager that recording is inactive
-        try {
-            com.overdrive.app.storage.StorageManager.getInstance().setRecordingActive(false);
-        } catch (Exception e) {
-            logger.warn("Could not set recording inactive state: " + e.getMessage());
-        }
-        
-        // Stop encoder recording
-        if (encoder != null) {
-            encoder.stopRecording();
+        synchronized (recordingLock) {
+            if (!recording) {
+                return; // lost the race to another stop — nothing to do
+            }
+            recording = false;
+
+            // SOTA: Notify StorageManager that recording is inactive
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance().setRecordingActive(false);
+            } catch (Exception e) {
+                logger.warn("Could not set recording inactive state: " + e.getMessage());
+            }
+
+            // Stop encoder recording
+            if (encoder != null) {
+                encoder.stopRecording();
+            }
         }
     }
     
@@ -1325,22 +1434,29 @@ public class GpuMosaicRecorder {
         if (!recording) {
             return;
         }
-        
-        recording = false;
-        
-        // SOTA: Notify StorageManager that recording is inactive
-        try {
-            com.overdrive.app.storage.StorageManager.getInstance().setRecordingActive(false);
-        } catch (Exception e) {
-            logger.warn("Could not set recording inactive state: " + e.getMessage());
+        // LOCK (audit R11-1 / ExtD-2): serialized with the start paths —
+        // see stopRecording()'s doc for the false-STARTED interleave this
+        // closes and the lock-order/deadlock analysis.
+        synchronized (recordingLock) {
+            if (!recording) {
+                return; // lost the race to another stop — nothing to do
+            }
+            recording = false;
+
+            // SOTA: Notify StorageManager that recording is inactive
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance().setRecordingActive(false);
+            } catch (Exception e) {
+                logger.warn("Could not set recording inactive state: " + e.getMessage());
+            }
+
+            // Stop encoder recording
+            if (encoder != null) {
+                encoder.stopEventRecording(immediate, postRecordDurationMs);
+            }
+
+            logger.info(String.format("Recording stopped. Total frames: %d", frameCount));
         }
-        
-        // Stop encoder recording
-        if (encoder != null) {
-            encoder.stopEventRecording(immediate, postRecordDurationMs);
-        }
-        
-        logger.info(String.format("Recording stopped. Total frames: %d", frameCount));
     }
     
     /**
@@ -1421,11 +1537,53 @@ public class GpuMosaicRecorder {
     private void reconcileOverlayWorker() {
         OverlayBitmapRenderer r = overlayRenderer;
         if (r == null) return;
-        if (overlayEnabled && overlayRecordingModeAllowed && telemetryCollector != null) {
+        // Keep the renderer's field selection current whenever the worker exists.
+        r.setActiveFields(overlayFields);
+        boolean active = overlayEnabled && overlayRecordingModeAllowed && telemetryCollector != null;
+        if (active) {
+            // Report which overlay-only signals this flow actually draws, so the
+            // collector can skip the reflective turn-signal / seatbelt reads when
+            // unused. Reported only while the overlay is genuinely compositing.
+            telemetryCollector.setOverlayFieldDemand(
+                overlayDemandKey,
+                overlayFields.has(com.overdrive.app.telemetry.TelemetryFields.Field.TURN_SIGNALS),
+                overlayFields.hasAny(
+                    com.overdrive.app.telemetry.TelemetryFields.Field.SEATBELT_DRIVER,
+                    com.overdrive.app.telemetry.TelemetryFields.Field.SEATBELT_PASSENGER));
+            // Beams come from BydDataCollector's 5 s poll (NOT the telemetry
+            // collector), and that poll is otherwise automation-gated — without
+            // this the beam glyphs stay frozen at their boot state.
+            com.overdrive.app.byd.BydDataCollector.setOverlayBeamDemand(
+                overlayDemandKey,
+                overlayFields.hasAny(
+                    com.overdrive.app.telemetry.TelemetryFields.Field.LOW_BEAM,
+                    com.overdrive.app.telemetry.TelemetryFields.Field.HIGH_BEAM));
             r.startWorker(telemetryCollector);
         } else {
+            if (telemetryCollector != null) {
+                telemetryCollector.clearOverlayFieldDemand(overlayDemandKey);
+            }
+            com.overdrive.app.byd.BydDataCollector.setOverlayBeamDemand(overlayDemandKey, false);
             r.stopWorker();
         }
+    }
+
+    /**
+     * Set the field selection this recorder's overlay draws (per recording
+     * flow). {@code null} resets to the legacy default. Applied to the renderer
+     * immediately and re-reported as field demand on the next reconcile. Safe
+     * off-GL-thread (renderer publishes via volatile; reconcile is idempotent).
+     */
+    public void setOverlayFields(com.overdrive.app.telemetry.TelemetryFields fields) {
+        this.overlayFields = (fields != null)
+            ? fields
+            : com.overdrive.app.telemetry.TelemetryFields.legacyDefault();
+        reconcileOverlayWorker();
+    }
+
+    /** Identify this recorder's overlay-demand key on the shared collector. */
+    public void setOverlayDemandKey(String key) {
+        if (key != null) this.overlayDemandKey = key;
     }
 
     /**
@@ -1460,7 +1618,7 @@ public class GpuMosaicRecorder {
      * 0 = 4-camera mosaic (Seal: pano_h/pano_l, surfaceMode=0)
      * 1 = APA passthrough (single pre-composited image, surfaceMode=1 with apa/byd_apa tag)
      * 2 = 3-camera mosaic (Atto 3 default: Rear, Side, Front)
-     * 3 = esco-parity passthrough — sample camera as-is, no rearrangement;
+     * 3 = oem-parity passthrough — sample camera as-is, no rearrangement;
      *     pairs with uTexMatrix from SurfaceTexture.getTransformMatrix().
      */
     public void setCameraLayout(int layout) {
@@ -1475,7 +1633,7 @@ public class GpuMosaicRecorder {
         this.uniformsDirty.set(true);
         String[] names = {
             "4-camera mosaic", "APA passthrough", "3-camera mosaic",
-            "esco-parity passthrough"
+            "oem-parity passthrough"
         };
         logger.info("Camera layout: " + (layout < names.length ? names[layout] : "unknown(" + layout + ")"));
     }
@@ -1571,17 +1729,40 @@ public class GpuMosaicRecorder {
      *  don't appear in recordings. Cosmetic only — doesn't fix the
      *  underlying calibration. Off by default. */
     /**
-     * Sets the APA center inset (esco APACropFilter parity).
+     * Sets the APA center inset (oem APACropFilter parity).
      *
-     * <p>Inset is in producer-UV units, applied to each role's local
-     * {@code [0, 0.5]} sample window: {@code [0, 0.5] -> [inset, 0.5 - inset]}.
-     * The chrome lives at the producer center seams (where the four roles
-     * meet), so trimming each role inward eliminates the red bars.
+     * <p><b>What it actually does — read this before tuning it.</b> The shader
+     * applies a GLOBAL remap of the final sample x, AFTER the per-role corner
+     * offset has been added ({@code samplePos = producerCorner + sampledLocal},
+     * then {@code APA_CENTER_INSET_GLSL} maps {@code [0,1] -> [inset, 1-inset]}).
+     * That is an OUTER-EDGE trim of the whole producer, NOT a per-role trim:
+     * x=0 maps to {@code inset}, x=1 maps to {@code 1-inset}, and x=0.5 — the
+     * inner 2x2 seam where the four roles meet — is an exact FIXED POINT and is
+     * left completely untouched.
      *
-     * <p>Suggested value for the BYD byd_apa firmware (esco mirror):
-     * {@code 240 / (producer_width / 2) / 2 = 240 / W} where {@code W} is
-     * the FULL producer width (2560 typical). On Seal/Tang dilink4 cars
-     * this is {@code 240/2560 = 0.09375}.
+     * <p>An earlier version of this javadoc claimed the opposite ("applied to
+     * each role's local [0,0.5] window … trimming each role inward eliminates
+     * the red bars"). That was wrong, and it matters: if chrome genuinely lives
+     * on the centre seams, this control cannot remove it at any value. It only
+     * trims the outermost left/right columns of the mosaic.
+     *
+     * <p>OEM comparison ({@code ml/b.java:170-176}, {@code el/a.java:313}): the
+     * reference app's {@code APACropFilter.h(150, 0)} is also a whole-surface
+     * outer-edge crop, computed as genuine float division — verified in smali
+     * ({@code int-to-float} on both operands, then {@code div-float}), so it is
+     * NOT the integer-division no-op it can look like in decompiled Java. At its
+     * surface width of 1920 that is {@code 150/1920 = 0.078}. Note it lives in
+     * the RTMP publisher chain; both OEM recorder lanes ({@code el/b.java:293},
+     * {@code el/i.java:282}) discard the byd_apa discriminator and add overlay
+     * only, i.e. they apply no crop at all.
+     *
+     * <p>Our default is {@code 240/2560 = 0.09375}, which has no OEM basis — the
+     * OEM constant is 150, not 240. Left as-is rather than retuned because the
+     * two lanes are not comparable (different surface dims, and the OEM's crop
+     * sits after a 90° pre-rotation so its "horizontal" is our vertical), and
+     * because no device frame has yet been captured to show what the trim is
+     * actually doing on a real car. Tune it from a device frame, not from this
+     * arithmetic.
      *
      * <p>Default 0 = no crop (legacy and unconfigured paths bit-exact).
      * Clamped to [0, 0.20] so the visible window never collapses to zero.
@@ -1845,10 +2026,10 @@ public class GpuMosaicRecorder {
         //   1.0  APA passthrough: sample camera surface as-is.
         //   2.0  3-camera mosaic (Atto 3): rear=left half, front=top-right,
         //        left+right=bottom-right.
-        //   3.0  esco-parity passthrough: HAL emits the final 2x2 layout
+        //   3.0  oem-parity passthrough: HAL emits the final 2x2 layout
         //        natively; we sample with uTexMatrix in the vertex shader.
         //        Per-quadrant 180° rotation on TR (Right) and BL (Rear)
-        //        mirrors esco's APARotateFilter (C7610c quadrantAngles
+        //        mirrors oem's APARotateFilter (C7610c quadrantAngles
         //        {0, 180, 180, 0}). Toggle via uRotateNonZeroQuads:
         //          1.0 → rotate TR+BL by 180°
         //          0.0 → no rotation (debug / variant fallback)
@@ -1929,10 +2110,10 @@ public class GpuMosaicRecorder {
             "}\n" +
             "void main() {\n" +
             "    vec2 samplePos;\n" +
-            "    float frontOffset = %.5ff;\n" +
-            "    float rightOffset = %.5ff;\n" +
-            "    float rearOffset  = %.5ff;\n" +
-            "    float leftOffset  = %.5ff;\n" +
+            "    float frontOffset = %.5f;\n" +
+            "    float rightOffset = %.5f;\n" +
+            "    float rearOffset  = %.5f;\n" +
+            "    float leftOffset  = %.5f;\n" +
             "    if (uApaMode > 2.5) {\n" +
             "        // DiLink 4 passthrough with per-output-corner producer\n" +
             "        // remap + per-role X/Y flip. Each of the four output\n" +
@@ -1994,7 +2175,7 @@ public class GpuMosaicRecorder {
             // (vertically cropped to the band aspect via cropY) and skip the
             // 360 front slice. Otherwise fall through to the 360 front slice.
             "            if (uWindshieldReady > 0.5) {\n" +
-            "                float cropY = %.5ff;\n" +
+            "                float cropY = %.5f;\n" +
             "                vec2 wuv = vec2(vTexCoord.x, cropY + ly * (1.0 - cropY * 2.0));\n" +
             "                gl_FragColor = texture2D(uWindshieldTex, wuv);\n" +
             "                return;\n" +

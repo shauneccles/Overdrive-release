@@ -4,8 +4,9 @@
  * Features: Interactive crosshair tooltips, smooth animations, value tracking
  * 
  * ON-DEMAND ARCHITECTURE:
- * - Connects to backend when page loads, disconnects when leaving
- * - Sends heartbeats every 5 seconds to maintain connection
+ * - Connects only while the visible System or Live subview needs live metrics
+ * - Samples Android top only while the visible System subview owns the panel
+ * - Stops timers, heartbeats and backend clients on tab or page hide
  * - Backend only polls CPU/GPU/Memory when clients are connected
  */
 
@@ -17,6 +18,7 @@ BYD.performance = {
     UPDATE_INTERVAL: 1000,
     SOC_UPDATE_INTERVAL: 60000, // SOC updates every minute
     HEARTBEAT_INTERVAL: 5000,   // Heartbeat every 5 seconds
+    TOP_UPDATE_INTERVAL: 2500,  // One bounded top snapshot every 2.5 seconds
     
     // State
     pollInterval: null,
@@ -24,6 +26,14 @@ BYD.performance = {
     heartbeatInterval: null,
     clientId: null,              // Assigned by server on connect
     isConnected: false,
+    _activeTab: null,
+    _lifecycleGeneration: 0,
+    _connectAttempt: 0,
+    _lifecycleHandlersSetup: false,
+    _initialDataLoaded: false,
+    topPollInterval: null,
+    _topRequestGeneration: 0,
+    _topRequestInFlight: false,
     charts: {},
     history: {
         cpuSystem: [],
@@ -140,11 +150,11 @@ BYD.performance = {
         // a later successful fetch upgrades it to the live state.
         try { this.applyDataUsageState(); } catch (e) {}
 
-        // SOTA: Connect to backend (starts monitoring if first client)
-        await this.connect();
-        
-        // Start polling for real-time metrics
-        this.startPolling();
+        // Install visibility/tab listeners before any async fetches. The
+        // lifecycle synchronizer starts only the work owned by the currently
+        // visible subview.
+        this.setupLifecycleHandlers();
+        this.syncViewLifecycle();
         
         // Fetch initial SOC data
         await this.fetchSocHistory();
@@ -177,23 +187,14 @@ BYD.performance = {
         // Fetch initial data-usage (also reflects the enabled/disabled state)
         await this.fetchDataUsage();
 
-        // Start SOC polling (less frequent)
-        this.socPollInterval = setInterval(() => this.fetchSocHistory(), this.SOC_UPDATE_INTERVAL);
-
-        // Data-usage polling (every 2 minutes — matches the sampler cadence)
-        this.dataUsagePollInterval = setInterval(() => this.fetchDataUsage(), this.SOC_UPDATE_INTERVAL);
-        
-        // Battery health polling (every 2 minutes — same as SOC)
-        this.batteryHealthPollInterval = setInterval(() => this.fetchBatteryHealth(), this.SOC_UPDATE_INTERVAL);
-        
-        // SOH detail polling (every 2 minutes)
-        this.sohPollInterval = setInterval(() => this.fetchSohStatus(), this.SOC_UPDATE_INTERVAL);
+        this._initialDataLoaded = true;
 
         // Handle resize
         window.addEventListener('resize', () => this.resizeCharts());
-        
-        // SOTA: Handle page visibility and unload for clean disconnect
-        this.setupLifecycleHandlers();
+
+        // app-tabs mounts on DOMContentLoaded. Re-sync once the current stack
+        // unwinds in case performance.init() raced that mount.
+        setTimeout(() => this.syncViewLifecycle(), 0);
         
         console.log('[Performance] Initialized');
     },
@@ -202,35 +203,101 @@ BYD.performance = {
      * SOTA: Setup page lifecycle handlers for clean connect/disconnect
      */
     setupLifecycleHandlers() {
+        if (this._lifecycleHandlersSetup) return;
+        this._lifecycleHandlersSetup = true;
+
         // Handle page unload (close tab, navigate away)
         window.addEventListener('beforeunload', () => {
-            this.disconnect();
+            this.stopPolling();
         });
-        
+
+        // Internal Performance bottom-tab changes. The event is emitted after
+        // app-tabs has applied [hidden], so chart sizing and visibility tests
+        // observe the new layout.
+        document.addEventListener('ot-tabs:active-changed', (event) => {
+            const id = event && event.detail ? event.detail.id : null;
+            this.syncViewLifecycle(id);
+            requestAnimationFrame(() => this.resizeCharts());
+        });
+
         // Handle visibility change (tab switch, minimize)
         document.addEventListener('visibilitychange', () => {
-            if (document.hidden) {
-                // Page hidden - disconnect to save resources
-                console.log('[Performance] Page hidden - disconnecting');
-                this.disconnect();
-            } else {
-                // Page visible again - reconnect
-                console.log('[Performance] Page visible - reconnecting');
-                this.connect();
-            }
+            console.log('[Performance] Visibility:', document.hidden ? 'hidden' : 'visible');
+            this.syncViewLifecycle();
         });
-        
+
         // Handle page hide (mobile browsers)
         window.addEventListener('pagehide', () => {
-            this.disconnect();
+            this.stopPolling();
         });
+        window.addEventListener('pageshow', () => {
+            this.syncViewLifecycle();
+        });
+    },
+
+    _detectActiveTab() {
+        const activeButton = document.querySelector(
+            '.bottom-tabs .bottom-tab.is-active[data-tab-target]');
+        if (activeButton) return activeButton.getAttribute('data-tab-target');
+        const visiblePanel = document.querySelector('[data-tab]:not([hidden])');
+        return visiblePanel ? visiblePanel.getAttribute('data-tab') : 'battery';
+    },
+
+    _pageIsVisible() {
+        return !document.hidden;
+    },
+
+    _shouldRunRealtime() {
+        return this._pageIsVisible()
+            && (this._activeTab === 'system' || this._activeTab === 'live');
+    },
+
+    _shouldRunTop() {
+        return this._pageIsVisible() && this._activeTab === 'system';
+    },
+
+    syncViewLifecycle(activeTab) {
+        this._activeTab = activeTab || this._detectActiveTab();
+        const generation = ++this._lifecycleGeneration;
+
+        if (!this._pageIsVisible()) {
+            this.stopRealtimePolling();
+            this.stopAncillaryPolling();
+            this.stopTopPolling();
+            this.disconnect();
+            return;
+        }
+
+        this.startAncillaryPolling();
+
+        if (this._shouldRunRealtime()) {
+            this.startRealtimeForGeneration(generation);
+        } else {
+            this.stopRealtimePolling();
+            this.disconnect();
+            this.setMonitoringStatus(false);
+        }
+
+        if (this._shouldRunTop()) this.startTopPolling();
+        else this.stopTopPolling();
+    },
+
+    async startRealtimeForGeneration(generation) {
+        const connected = await this.connect(generation);
+        if (!connected
+                || generation !== this._lifecycleGeneration
+                || !this._shouldRunRealtime()) {
+            return;
+        }
+        this.startPolling();
     },
     
     /**
      * SOTA: Connect to backend - registers client and starts monitoring
      */
-    async connect() {
-        if (this.isConnected) return;
+    async connect(lifecycleGeneration) {
+        if (this.isConnected) return true;
+        const attempt = ++this._connectAttempt;
         
         try {
             const res = await fetch('/api/performance/connect', {
@@ -241,6 +308,14 @@ BYD.performance = {
             
             if (res.ok) {
                 const data = await res.json();
+                const stillWanted = attempt === this._connectAttempt
+                    && (lifecycleGeneration === undefined
+                        || lifecycleGeneration === this._lifecycleGeneration)
+                    && this._shouldRunRealtime();
+                if (!stillWanted) {
+                    this._sendDisconnect(data.clientId);
+                    return false;
+                }
                 this.clientId = data.clientId;
                 this.isConnected = true;
                 
@@ -249,41 +324,48 @@ BYD.performance = {
                 
                 console.log('[Performance] Connected as:', this.clientId, 
                     '(active clients:', data.activeClients + ')');
+                return true;
             }
         } catch (e) {
             console.error('[Performance] Connect failed:', e);
         }
+        return false;
     },
     
     /**
      * SOTA: Disconnect from backend - unregisters client
      */
     async disconnect() {
-        if (!this.isConnected || !this.clientId) return;
+        // Invalidate a connect response that may still be in flight.
+        this._connectAttempt++;
         
         // Stop heartbeat
         this.stopHeartbeat();
-        
+
+        if (!this.isConnected || !this.clientId) return;
+        const clientId = this.clientId;
+        this.isConnected = false;
+        this._sendDisconnect(clientId);
+        console.log('[Performance] Disconnected:', clientId);
+    },
+
+    _sendDisconnect(clientId) {
+        if (!clientId) return;
         try {
-            // Use sendBeacon for reliable delivery during page unload
-            const data = JSON.stringify({ clientId: this.clientId });
+            const data = JSON.stringify({ clientId: clientId });
             if (navigator.sendBeacon) {
                 navigator.sendBeacon('/api/performance/disconnect', data);
             } else {
-                // Fallback to fetch (may not complete during unload)
                 fetch('/api/performance/disconnect', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: data,
                     keepalive: true
-                });
+                }).catch(() => {});
             }
-            console.log('[Performance] Disconnected:', this.clientId);
         } catch (e) {
             console.error('[Performance] Disconnect failed:', e);
         }
-        
-        this.isConnected = false;
     },
     
     /**
@@ -293,7 +375,7 @@ BYD.performance = {
         if (this.heartbeatInterval) return;
         
         this.heartbeatInterval = setInterval(async () => {
-            if (!this.clientId) return;
+            if (!this.clientId || !this.isConnected || !this._shouldRunRealtime()) return;
             
             try {
                 await fetch('/api/performance/heartbeat', {
@@ -608,15 +690,60 @@ BYD.performance = {
     },
 
     startPolling() {
+        if (this.pollInterval || !this._shouldRunRealtime()) return;
         this.fetchData();
-        this.pollInterval = setInterval(() => this.fetchData(), this.UPDATE_INTERVAL);
+        this.pollInterval = setInterval(() => {
+            if (this._shouldRunRealtime()) this.fetchData();
+            else this.syncViewLifecycle();
+        }, this.UPDATE_INTERVAL);
     },
-    
-    stopPolling() {
+
+    stopRealtimePolling() {
         if (this.pollInterval) {
             clearInterval(this.pollInterval);
             this.pollInterval = null;
         }
+    },
+
+    startAncillaryPolling() {
+        if (!this._pageIsVisible()) return;
+        const wasStopped = !this.socPollInterval
+            && !this.batteryHealthPollInterval
+            && !this.dataUsagePollInterval
+            && !this.sohPollInterval;
+
+        if (!this.socPollInterval) {
+            this.socPollInterval = setInterval(
+                () => this._pageIsVisible() && this.fetchSocHistory(),
+                this.SOC_UPDATE_INTERVAL);
+        }
+        if (!this.dataUsagePollInterval) {
+            this.dataUsagePollInterval = setInterval(
+                () => this._pageIsVisible() && this.fetchDataUsage(),
+                this.SOC_UPDATE_INTERVAL);
+        }
+        if (!this.batteryHealthPollInterval) {
+            this.batteryHealthPollInterval = setInterval(
+                () => this._pageIsVisible() && this.fetchBatteryHealth(),
+                this.SOC_UPDATE_INTERVAL);
+        }
+        if (!this.sohPollInterval) {
+            this.sohPollInterval = setInterval(
+                () => this._pageIsVisible() && this.fetchSohStatus(),
+                this.SOC_UPDATE_INTERVAL);
+        }
+
+        // Returning from a hidden page should refresh immediately instead of
+        // waiting up to a minute for the next timer.
+        if (wasStopped && this._initialDataLoaded) {
+            this.fetchSocHistory();
+            this.fetchBatteryHealth();
+            this.fetchSohStatus();
+            this.fetchDataUsage();
+        }
+    },
+
+    stopAncillaryPolling() {
         if (this.socPollInterval) {
             clearInterval(this.socPollInterval);
             this.socPollInterval = null;
@@ -629,11 +756,249 @@ BYD.performance = {
             clearInterval(this.dataUsagePollInterval);
             this.dataUsagePollInterval = null;
         }
-        // SOTA: Disconnect from backend when stopping
+        if (this.sohPollInterval) {
+            clearInterval(this.sohPollInterval);
+            this.sohPollInterval = null;
+        }
+    },
+
+    stopPolling() {
+        this._lifecycleGeneration++;
+        this.stopRealtimePolling();
+        this.stopAncillaryPolling();
+        this.stopTopPolling();
         this.disconnect();
+    },
+
+    startTopPolling() {
+        if (this.topPollInterval || !this._shouldRunTop()) return;
+        this._setTopLiveState(true);
+        this.fetchTopSnapshot();
+        this.topPollInterval = setInterval(() => {
+            if (this._shouldRunTop()) this.fetchTopSnapshot();
+            else this.syncViewLifecycle();
+        }, this.TOP_UPDATE_INTERVAL);
+    },
+
+    stopTopPolling() {
+        if (this.topPollInterval) {
+            clearInterval(this.topPollInterval);
+            this.topPollInterval = null;
+        }
+        this._topRequestGeneration++;
+        this._topRequestInFlight = false;
+        this._setTopLiveState(false);
+        const refresh = document.getElementById('topRefreshButton');
+        if (refresh) refresh.disabled = !this._shouldRunTop();
+    },
+
+    refreshTopNow() {
+        if (!this._shouldRunTop()) return;
+        this.fetchTopSnapshot();
+    },
+
+    async fetchTopSnapshot() {
+        if (!this._shouldRunTop() || this._topRequestInFlight) return;
+        const generation = this._topRequestGeneration;
+        this._topRequestInFlight = true;
+        const refresh = document.getElementById('topRefreshButton');
+        if (refresh) refresh.disabled = true;
+
+        try {
+            const response = await fetch('/api/performance/top?limit=14', {
+                cache: 'no-store'
+            });
+            const data = response.ok ? await response.json() : null;
+            if (generation !== this._topRequestGeneration || !this._shouldRunTop()) return;
+            if (!data || data.available === false) {
+                this.renderTopUnavailable(data && data.error);
+                return;
+            }
+            this.renderTopSnapshot(data);
+        } catch (e) {
+            if (generation === this._topRequestGeneration && this._shouldRunTop()) {
+                this.renderTopUnavailable(e && e.message);
+            }
+        } finally {
+            if (generation === this._topRequestGeneration) {
+                this._topRequestInFlight = false;
+                if (refresh) refresh.disabled = !this._shouldRunTop();
+            }
+        }
+    },
+
+    _setTopLiveState(live) {
+        const badge = document.getElementById('topLiveBadge');
+        if (!badge) return;
+        badge.classList.toggle('is-live', !!live);
+        badge.textContent = live ? 'Live' : 'Paused';
+    },
+
+    renderTopUnavailable(error) {
+        this._setText('topCpuBusy', '--%');
+        this._setText('topCpuDetail', '--');
+        this._setText('topTasks', '--');
+        this._setText('topTasksDetail', '--');
+        this._setText('topMemory', '--');
+        this._setText('topMemoryDetail', '--');
+        this._setText('topSwap', '--');
+        this._setText('topSwapDetail', '--');
+        this._setText('topUpdated', error ? 'Unavailable' : 'Waiting');
+        const rows = document.getElementById('topProcessRows');
+        if (rows) {
+            rows.textContent = '';
+            const empty = document.createElement('div');
+            empty.className = 'process-empty';
+            empty.textContent = error || 'Process data unavailable';
+            rows.appendChild(empty);
+        }
+    },
+
+    renderTopSnapshot(data) {
+        const cpu = data.cpu || {};
+        const tasks = data.tasks || {};
+        const memory = data.memory || {};
+        const swap = data.swap || {};
+        const busy = Number(cpu.deviceBusyPercent);
+        const rawBusy = Number(cpu.busyPercent);
+        const capacity = Number(cpu.capacityPercent);
+
+        this._setText('topCpuBusy', isFinite(busy) ? this._formatOne(busy) + '%' : '--%');
+        this._setText(
+            'topCpuDetail',
+            isFinite(rawBusy) && isFinite(capacity)
+                ? this._formatOne(rawBusy) + ' / ' + this._formatOne(capacity) + '% top'
+                : '--');
+        this._setText(
+            'topTasks',
+            tasks.running != null && tasks.total != null
+                ? tasks.running + ' / ' + tasks.total
+                : '--');
+        this._setText(
+            'topTasksDetail',
+            tasks.sleeping != null
+                ? tasks.sleeping + ' sleeping'
+                    + (tasks.zombie ? ' · ' + tasks.zombie + ' zombie' : '')
+                : '--');
+        this._setText(
+            'topMemory',
+            memory.usedBytes != null ? this.formatBytes(memory.usedBytes) : '--');
+        this._setText(
+            'topMemoryDetail',
+            memory.totalBytes != null
+                ? this.formatBytes(memory.totalBytes) + ' total'
+                : '--');
+        this._setText(
+            'topSwap',
+            swap.usedBytes != null ? this.formatBytes(swap.usedBytes) : '--');
+        this._setText(
+            'topSwapDetail',
+            swap.totalBytes != null
+                ? this.formatBytes(swap.totalBytes) + ' total'
+                : '--');
+        this._setText('topSource', data.source || 'top -b -n 1');
+
+        const sampledAt = Number(data.timestamp);
+        const duration = Number(data.durationMs);
+        let updated = isFinite(sampledAt)
+            ? new Date(sampledAt).toLocaleTimeString()
+            : 'Updated';
+        if (isFinite(duration)) updated += ' · ' + Math.round(duration) + ' ms';
+        this._setText('topUpdated', updated);
+
+        const rows = document.getElementById('topProcessRows');
+        if (!rows) return;
+        rows.textContent = '';
+        const processes = Array.isArray(data.processes)
+            ? data.processes.filter((process) => !process.isSampler)
+            : [];
+        if (!processes.length) {
+            const empty = document.createElement('div');
+            empty.className = 'process-empty';
+            empty.textContent = 'No process rows returned';
+            rows.appendChild(empty);
+            return;
+        }
+
+        processes.forEach((process) => {
+            const row = document.createElement('div');
+            row.className = 'process-row' + (process.isOverdrive ? ' is-overdrive' : '');
+            row.setAttribute('role', 'row');
+
+            const main = document.createElement('div');
+            main.setAttribute('role', 'cell');
+            const command = document.createElement('div');
+            command.className = 'process-command';
+            command.textContent = process.command || 'unknown';
+            command.title = process.command || '';
+            const detail = document.createElement('div');
+            detail.className = 'process-detail';
+            detail.textContent = (process.state || '?')
+                + ' · ' + (process.cpuTime || '--')
+                + ' · ' + (process.user || '--')
+                + ' · PID ' + (process.pid != null ? process.pid : '--')
+                + ' · RES ' + this.formatBytes(process.residentBytes || 0);
+            main.appendChild(command);
+            main.appendChild(detail);
+
+            const cpuCell = document.createElement('div');
+            cpuCell.setAttribute('role', 'cell');
+            const cpuValue = document.createElement('div');
+            cpuValue.className = 'process-cpu-value';
+            const processCpu = Number(process.cpuPercent) || 0;
+            cpuValue.textContent = this._formatOne(processCpu) + '%';
+            const cpuTrack = document.createElement('div');
+            cpuTrack.className = 'process-cpu-track';
+            const cpuFill = document.createElement('div');
+            cpuFill.className = 'process-cpu-fill';
+            cpuFill.style.width = Math.max(2, Math.min(100, processCpu)) + '%';
+            if (processCpu >= 100) cpuFill.style.background = 'var(--danger)';
+            else if (processCpu >= 60) cpuFill.style.background = 'var(--warning)';
+            cpuTrack.appendChild(cpuFill);
+            cpuCell.appendChild(cpuValue);
+            cpuCell.appendChild(cpuTrack);
+
+            const memoryCell = this._processNumberCell(
+                this._formatOne(Number(process.memoryPercent) || 0) + '%',
+                'process-memory');
+            const residentCell = this._processNumberCell(
+                this.formatBytes(process.residentBytes || 0),
+                'process-resident');
+            const userCell = this._processNumberCell(process.user || '--', 'process-user');
+            const pidCell = this._processNumberCell(
+                process.pid != null ? String(process.pid) : '--',
+                'process-pid');
+
+            row.appendChild(main);
+            row.appendChild(cpuCell);
+            row.appendChild(memoryCell);
+            row.appendChild(residentCell);
+            row.appendChild(userCell);
+            row.appendChild(pidCell);
+            rows.appendChild(row);
+        });
+    },
+
+    _processNumberCell(text, className) {
+        const cell = document.createElement('div');
+        cell.className = 'process-number ' + className;
+        cell.setAttribute('role', 'cell');
+        cell.textContent = text;
+        return cell;
+    },
+
+    _setText(id, text) {
+        const element = document.getElementById(id);
+        if (element) element.textContent = text;
+    },
+
+    _formatOne(value) {
+        if (!isFinite(value)) return '--';
+        return value.toFixed(1).replace(/\.0$/, '');
     },
     
     async fetchData() {
+        if (!this._shouldRunRealtime()) return;
         try {
             // Try WebView bridge first
             if (typeof PerformanceBridge !== 'undefined') {
@@ -647,6 +1012,7 @@ BYD.performance = {
             const res = await fetch('/api/performance');
             if (res.ok) {
                 const data = await res.json();
+                if (!this._shouldRunRealtime()) return;
                 this.updateUI(data);
             }
         } catch (e) {
@@ -693,7 +1059,16 @@ BYD.performance = {
             this.updateMetric('cpuValue', systemWholeDevice, '');   // system, % of device
             this.updateMetric('cpuAppValue', appWholeDevice, '');   // app, % of device
             this.updateBar('cpuBar', appWholeDevice);
-            this.updateMetric('cpuFreq', data.cpu.freqMhz, ' MHz');
+            // Show current / max so thermal throttling is self-evident: when the
+            // current freq sits well below max under load (and temp is high) the
+            // SoC is throttling — which drags the whole head-unit UI on this
+            // shared SDM665, not just OverDrive. maxFreqMhz is the static hardware
+            // ceiling; omitted (0) on kernels that don't expose it.
+            if (data.cpu.maxFreqMhz) {
+                this.updateMetric('cpuFreq', data.cpu.freqMhz + ' / ' + data.cpu.maxFreqMhz, ' MHz');
+            } else {
+                this.updateMetric('cpuFreq', data.cpu.freqMhz, ' MHz');
+            }
             this.updateMetric('cpuTemp', data.cpu.tempC, '°C');
             this.setCardStatus('cpuCard', appWholeDevice);
 
@@ -740,6 +1115,21 @@ BYD.performance = {
         // Update GPU metrics
         if (data.gpu) {
             this.updateMetric('gpuValue', data.gpu.usage || 0, '');
+            // Honesty marker (issue #173): when the value is a hardcoded
+            // freq-ratio guess (no busy counter AND no readable max-freq, e.g.
+            // BYD 2602 firmware → gpuclk/650 = a constant 92.3%), flag it via a
+            // tooltip so a reader doesn't mistake the estimate for a real load.
+            // The displayed number is unchanged.
+            const gpuValueEl = document.getElementById('gpuValue');
+            if (gpuValueEl) {
+                if (data.gpu.usageSource === 'freq_ratio_hardcoded') {
+                    gpuValueEl.title = 'Estimated from clock ratio (no GPU busy counter available on this firmware) — not a measured load.';
+                    gpuValueEl.classList.add('estimated');
+                } else {
+                    gpuValueEl.removeAttribute('title');
+                    gpuValueEl.classList.remove('estimated');
+                }
+            }
             this.updateBar('gpuBar', data.gpu.usage || 0);
             this.updateMetric('gpuFreq', (data.gpu.freqMhz ? data.gpu.freqMhz.toFixed(0) : '--'), ' MHz');
             this.updateMetric('gpuTemp', data.gpu.tempC || '--', '°C');
@@ -1526,11 +1916,40 @@ BYD.performance = {
                 
                 this.updateSocStats();
                 this.renderSocChart();
+                this.socFetchFailures = 0;
             } else {
                 console.error('[Performance] SOC fetch failed:', res.status);
+                this.noteSocFetchFailure();
             }
         } catch (e) {
             console.error('[Performance] SOC fetch error:', e);
+            this.noteSocFetchFailure();
+        }
+    },
+
+    /**
+     * A failed poll leaves the previous chart frame on screen, which is indistinguishable from a
+     * frozen graph. Rather than blank a still-useful chart on one transport blip, mark the readouts
+     * stale only after several consecutive failures, and let a success clear it.
+     */
+    socFetchFailures: 0,
+    SOC_STALE_AFTER_FAILURES: 3,
+    noteSocFetchFailure() {
+        this.socFetchFailures = (this.socFetchFailures || 0) + 1;
+        if (this.socFetchFailures === this.SOC_STALE_AFTER_FAILURES) {
+            // Suffix the current readout rather than wiping it: the last known value is still the
+            // best information available, it just should not look live.
+            //
+            // BOTH readouts, because the page carries two SOC layouts — the stats card writes
+            // #socCurrent (updateSocStats) and the EV dashboard writes #evSocValue. Marking only
+            // the first left the cue invisible on whichever layout was showing the other, which
+            // defeats the point of the marker.
+            ['socCurrent', 'evSocValue'].forEach(function (id) {
+                const el = document.getElementById(id);
+                if (el && el.textContent && el.textContent.indexOf('\u2022') === -1) {
+                    el.textContent = el.textContent + ' \u2022 stale';
+                }
+            });
         }
     },
     
@@ -1671,7 +2090,13 @@ BYD.performance = {
         // Time range
         const timeStart = history[0].t;
         const timeEnd = history[history.length - 1].t;
-        const timeRange = timeEnd - timeStart;
+        // Defence-in-depth: every x is (t - timeStart) / timeRange, so a non-ascending series
+        // (possible only if a clock correction slipped past the backend's upper time bound and
+        // monotonicity guard) would divide by <= 0 and produce Infinity/NaN coordinates — a blank
+        // or garbage line that reads as a frozen graph. Fall back to 1 so the chart degenerates to
+        // a readable flat/left-anchored line instead of vanishing.
+        const rawRange = timeEnd - timeStart;
+        const timeRange = rawRange > 0 ? rawRange : 1;
         
         // Draw grid
         ctx.strokeStyle = this.colors.grid;
@@ -2143,7 +2568,10 @@ BYD.performance = {
 
         const timeStart = history[0].t;
         const timeEnd = history[history.length - 1].t;
-        const timeRange = timeEnd - timeStart || 1;
+        // `> 0 ? :` not `|| 1` — matches the SOC render and also guards a NEGATIVE range,
+        // which a non-monotonic series would produce (|| 1 only catches exactly 0).
+        const rawTimeRange = timeEnd - timeStart;
+        const timeRange = rawTimeRange > 0 ? rawTimeRange : 1;
 
         let minV = Infinity, maxV = -Infinity;
         history.forEach(p => { if (p.voltage < minV) minV = p.voltage; if (p.voltage > maxV) maxV = p.voltage; });
@@ -2235,7 +2663,10 @@ BYD.performance = {
 
         const timeStart = history[0].t;
         const timeEnd = history[history.length - 1].t;
-        const timeRange = timeEnd - timeStart || 1;
+        // `> 0 ? :` not `|| 1` — matches the SOC render and also guards a NEGATIVE range,
+        // which a non-monotonic series would produce (|| 1 only catches exactly 0).
+        const rawTimeRange = timeEnd - timeStart;
+        const timeRange = rawTimeRange > 0 ? rawTimeRange : 1;
 
         // Auto-scale Y
         let minT = Infinity, maxT = -Infinity;

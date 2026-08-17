@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 
 import com.overdrive.app.ui.daemon.DaemonStartupManager;
 
@@ -17,8 +18,9 @@ import com.overdrive.app.ui.daemon.DaemonStartupManager;
  * This gives our app the highest possible process priority — same tier as the
  * keyboard or phone call — preventing the 24-hour kill cycle on newer BYD firmware.
  *
- * The service itself is a no-op for accessibility events. Its sole purpose is
- * process keep-alive. The foreground notification provides user visibility.
+ * Accessibility events are used only to cache the active package for conditional
+ * key mappings; no window content is inspected. The foreground notification
+ * provides user visibility.
  *
  * Enable via ADB (one-time):
  *   settings put secure enabled_accessibility_services com.overdrive.app/com.overdrive.app.services.KeepAliveAccessibilityService
@@ -39,6 +41,23 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         super.onServiceConnected();
 
         Log.i(TAG, "AccessibilityService connected — process is now protected");
+
+        // Start the app-process signal monitors FIRST — BEFORE the setServiceInfo() block
+        // below, which early-returns if the info-set throws. These monitors are independent
+        // of key-filtering (they relay phone-call + Bluetooth state to the daemon, which
+        // can't read them from UID 2000); gating them behind a successful setServiceInfo
+        // meant a key-filter wiring failure ALSO silently killed call/BT automations. Both
+        // are idempotent + self-guarding, so starting them early is safe.
+        try {
+            CallStateMonitor.start(getApplicationContext());
+        } catch (Throwable t) {
+            Log.w(TAG, "CallStateMonitor start failed: " + t.getMessage());
+        }
+        try {
+            BluetoothStateMonitor.start(getApplicationContext());
+        } catch (Throwable t) {
+            Log.w(TAG, "BluetoothStateMonitor start failed: " + t.getMessage());
+        }
 
         // Config must match the WORKING shape proven on DiLink firmware (verified
         // against a known-good OEM app): a service that subscribes to ZERO event
@@ -80,21 +99,32 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         }
         instance = this;
 
+        // Seed the conditional-keymap foreground cache in case the active window
+        // was already open before this service connected. Future window changes
+        // update the same cache from onAccessibilityEvent().
+        AccessibilityNodeInfo root = null;
+        try {
+            root = getRootInActiveWindow();
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
+                    root != null ? stringValue(root.getPackageName()) : null);
+        } catch (Throwable t) {
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+            Log.w(TAG, "Unable to seed active package: " + t.getMessage());
+        } finally {
+            if (root != null) {
+                try {
+                    root.recycle();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+
         // Prime the key-mapping snapshot off-thread so the first hardware key
         // press already has its bindings (onKeyEvent never reads disk itself).
         try {
             KeyMapDispatcher.INSTANCE.warmUp();
         } catch (Throwable t) {
             Log.w(TAG, "KeyMapDispatcher warmUp failed: " + t.getMessage());
-        }
-
-        // Start the phone call-state monitor in this (app) process — the daemon can't
-        // observe telephony. Idempotent + self-gates on the READ_PHONE_STATE permission,
-        // so this cleanly no-ops when the permission isn't granted.
-        try {
-            CallStateMonitor.start(getApplicationContext());
-        } catch (Throwable t) {
-            Log.w(TAG, "CallStateMonitor start failed: " + t.getMessage());
         }
 
         // No foreground notification needed — DaemonKeepaliveService already has one.
@@ -110,7 +140,22 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // No-op — we don't process accessibility events
+        if (event == null
+                || event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            return;
+        }
+        try {
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
+                    stringValue(event.getPackageName()));
+        } catch (Throwable t) {
+            // Foreground detection is advisory. Unknown must fail open so a
+            // conditional mapping never suppresses the vehicle's default key action.
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+        }
+    }
+
+    private static String stringValue(CharSequence value) {
+        return value != null ? value.toString() : null;
     }
 
     /**
@@ -129,12 +174,18 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
     protected boolean onKeyEvent(KeyEvent event) {
         try {
             boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
-            // Unconditional diagnostic: proves whether the firmware actually
-            // dispatches hardware keys to our filter at all. Without this, an
-            // absent log is ambiguous (never-called vs called-but-unmapped).
-            // Cheap; keep until key mapping is field-confirmed on this firmware.
-            Log.i(TAG, "onKeyEvent keyCode=" + event.getKeyCode()
-                    + " down=" + down + " repeat=" + event.getRepeatCount());
+            // Bring-up diagnostic for "does this firmware dispatch hardware keys
+            // to our filter at all". Now gated behind isLoggable: this method runs
+            // on the PLATFORM INPUT-DISPATCH path, so an unconditional Log.i +
+            // string concat here taxes every hardware key press system-wide (and
+            // fires continuously while a key is held down, via getRepeatCount).
+            // Key mapping is field-confirmed, so the log stays available on demand
+            // (`setprop log.tag.KeepAliveA11y DEBUG`) without paying for it on
+            // every keystroke.
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                Log.d(TAG, "onKeyEvent keyCode=" + event.getKeyCode()
+                        + " down=" + down + " repeat=" + event.getRepeatCount());
+            }
             return KeyMapDispatcher.INSTANCE.onKey(
                     event.getKeyCode(), down, event.getRepeatCount());
         } catch (Throwable t) {

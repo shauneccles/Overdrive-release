@@ -11,11 +11,14 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 public class Conditions {
     // Create LinkedHashMap to maintain the insertion order of conditions to display in the frontend
     private final Map<String, EventCondition> conditions = new LinkedHashMap<>();
+    private final Set<String> hiddenConditions = new HashSet<>();
 
     /**
      * Initialize conditions list with possible events
@@ -66,6 +69,10 @@ public class Conditions {
                 "automation.battery_level_description",
                 new IntType(new Label("percent", "automation.percent"), 0, 100)));
         addCondition(new EventCondition(
+                new Label("targetSoc", "automation.target_soc"),
+                "automation.target_soc_description",
+                new IntType(new Label("percent", "automation.percent"), 0, 100)));
+        addCondition(new EventCondition(
                 new Label("estimatedRange", "automation.estimated_range"),
                 "automation.estimated_range_description",
                 new IntType(new Label("range", "automation.estimated_range"), 0, 1000)));
@@ -79,6 +86,14 @@ public class Conditions {
                         new Label("highBeam", "automation.lights_highbeam"),
                         new Label("hazard", "automation.lights_hazard"),
                         new Label("drl", "automation.lights_drl"))));
+        // Interior ambient light on/off. Fires only on a vehicle that actually reports the
+        // main-switch state (see BydEvent.AMBIENT_STATE).
+        addCondition(new EventCondition(
+                new Label("ambient", "automation.ambient_state"),
+                "automation.ambient_state_description",
+                new EnumType(new Label("state", "automation.state"),
+                        new Label("on", "automation.on"),
+                        new Label("off", "automation.off"))));
         addCondition(new EventCondition(
                 new Label("slw", "automation.slw"),
                 "automation.slw_description",
@@ -104,15 +119,27 @@ public class Conditions {
                         new Label("eco", "automation.mode_eco"),
                         new Label("sport", "automation.mode_sport"),
                         new Label("snow", "automation.mode_snow"))));
-        // Powertrain EV/HEV (PHEV only). Unseeded on pure-EV trims (energy_mode never
-        // reports HEV), so the condition simply never matches there.
+        // Powertrain EV/HEV (fuel-capable hybrids only). HEV and PHEV are intentionally treated
+        // as one capability because the available vehicle evidence cannot distinguish them.
         addCondition(new EventCondition(
                 new Label("powertrainMode", "automation.powertrain_mode"),
                 "automation.powertrain_mode_condition_description",
                 new EnumType(
                         new Label("state", "automation.state"),
+                        // All FIVE modes the energy device can report, matching
+                        // BydDataCollector.energyModeName and the set_powertrain_mode ACTION's
+                        // own option list. Offering only ev/hev was a silent killer: the
+                        // publisher emits force_ev/fuel/keep verbatim for modes 2/4/5, so a PHEV
+                        // running on the engine published "fuel", which no dropdown entry could
+                        // match — the condition compares lexically, so the rule never fired and
+                        // the live-value hint showed a word the user could not select. Folding
+                        // them onto ev/hev instead would have made "set fuel, then check we are
+                        // in fuel" impossible.
                         new Label("ev", "automation.mode_ev"),
-                        new Label("hev", "automation.mode_hev"))));
+                        new Label("force_ev", "automation.mode_force_ev"),
+                        new Label("hev", "automation.mode_hev"),
+                        new Label("fuel", "automation.mode_fuel"),
+                        new Label("keep", "automation.mode_keep"))));
         // Central lock as a trigger (on-change) and condition. The state IS the word
         // (locked/unlocked) published by CameraDaemon.applyLockEvent from the OTA-device
         // SDK read (BCM-cached, works parked) with cloud fallback. Delivered only on
@@ -152,18 +179,37 @@ public class Conditions {
                 new Label("ac", "automation.ac"),
                 "automation.ac_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
+        // Cabin temperature. The range must cover SUB-ZERO: a parked cabin in winter genuinely goes
+        // below 0, so a 0..100 floor made "cabin below freezing" impossible to express. The signal
+        // becomes unavailable if the vehicle does not report a measured cabin sensor; outside air
+        // and the AC dial remain separate signals. The ceiling stays above habitable because a car parked in the
+        // sun reaches 60-70 C.
+        //
+        // The ceiling stays at 100, NOT the sensor band's 90: only the LOWER bound moves. An
+        // existing automation saved with a threshold of 91..100 must keep validating — IntType
+        // rejects an out-of-range stored value, and the editor marks such a field .invalid,
+        // which disables Save for the whole form (a global '#formGrid .invalid' gate) and would
+        // leave that automation uneditable. Widening only downward is therefore strictly
+        // backward-compatible.
         addCondition(new EventCondition(
                 new Label("temperature", "automation.temperature"),
                 "automation.temperature_description",
-                new IntType(new Label("celsius", "automation.celsius"), 0, 100)));
-        // Outside/ambient temperature — allows sub-zero values (frost automations),
-        // hence the -40..60 range vs the cabin-oriented 0..100 above.
+                new IntType(new Label("celsius", "automation.celsius"), -40, 100)));
+        // Outside/ambient temperature — same sub-zero rationale (frost automations).
         addCondition(new EventCondition(
                 new Label("outsideTemp", "automation.outside_temperature"),
                 "automation.outside_temperature_description",
                 new IntType(new Label("celsius", "automation.celsius"), -40, 60)));
-        // Rain likelihood (%) over the next few hours (Open-Meteo by GPS). "raise the
-        // windows if rain > 60%". Forecast-ahead, unlike the reactive autoWiper proxy.
+        // AC dial SETPOINT — what the climate control was ASKED for, not what the cabin
+        // measures. Always CELSIUS (BydEvent normalizes a Fahrenheit dial), so a rule means the
+        // same thing on any car and the range is the Celsius dial band.
+        addCondition(new EventCondition(
+                new Label("acSetpoint", "automation.ac_setpoint"),
+                "automation.ac_setpoint_description",
+                new IntType(new Label("celsius", "automation.celsius"),
+                        com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_C,
+                        com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_C)));
+        // Rain likelihood (%) over the next few hours (Open-Meteo by GPS).
         addCondition(new EventCondition(
                 new Label("rainProbability", "automation.rain_probability"),
                 "automation.rain_probability_description",
@@ -280,13 +326,26 @@ public class Conditions {
                 new Label("locationZone", "automation.location_zone"),
                 "automation.location_zone_description",
                 new StringType(new Label("zone", "automation.location_zone"), 64)));
-        // ── Safety / ADAS events ─────────────────────────────────────────
-        // Emergency alarm — the closest "incident" signal this HAL exposes (no true
-        // collision/airbag event exists on this firmware).
-        addCondition(new EventCondition(
+        // Legacy compatibility only. The underlying raw enum reports the anti-theft/armed
+        // system on this firmware, not a collision or emergency. Keep its schema so an old
+        // saved rule still parses, but do not advertise or publish it as an incident trigger.
+        addHiddenCondition(new EventCondition(
                 new Label("emergencyAlarm", "automation.emergency_alarm"),
                 "automation.emergency_alarm_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
+        // ── Safety / ADAS events ─────────────────────────────────────────
+        // Radar blind-spot / lane-change / cross-traffic alert, per side. The OEM
+        // radar warning (not the side-camera overlay). Alerts are momentary pulses,
+        // so the publisher holds "on" briefly — see BlindSpotEvent. The `side`
+        // sub-variable selects left vs right so one schema serves both.
+        addCondition(new EventCondition(
+                new Label("blindSpot", "automation.blind_spot"),
+                "automation.blind_spot_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off")),
+                new EnumType(
+                        new Label("side", "automation.side"),
+                        new Label("left", "automation.side_left"),
+                        new Label("right", "automation.side_right"))));
         // Tyre pressure warning (worst wheel): normal / under / over.
         addCondition(new EventCondition(
                 new Label("tyrePressureWarn", "automation.tyre_pressure_warn"),
@@ -395,6 +454,13 @@ public class Conditions {
                 new Label("aux12vBattery", "automation.aux_12v_battery"),
                 "automation.aux_12v_battery_description",
                 new EnumType(new Label("state", "automation.state"), new Label("low", "automation.battery_low_state"), new Label("normal", "automation.battery_normal_state"))));
+        // The same rail as a NUMBER, in TENTHS of a volt (135 = 13.5V) — the resolution a
+        // "12V is getting low" rule needs, which the low/normal enum above cannot express.
+        // Range spans BatteryPowerData's validity window (9.0-16.0V).
+        addCondition(new EventCondition(
+                new Label("aux12vVoltage", "automation.aux_12v_voltage"),
+                "automation.aux_12v_voltage_description",
+                new IntType(new Label("decivolts", "automation.decivolts"), 90, 160)));
         // ── Fuel (PHEV) percent ──
         addCondition(new EventCondition(
                 new Label("fuelLevel", "automation.fuel_level"),
@@ -429,7 +495,7 @@ public class Conditions {
                         new Label("driver", "automation.driver"),
                         new Label("passenger", "automation.passenger"))));
         // ── Tier-2 sensors ──
-        // Auto-wiper engaged (the rain proxy — no rain-intensity sensor exists).
+        // Automatic rain-sensing MODE enabled/disabled; not current rain or blade movement.
         addCondition(new EventCondition(
                 new Label("autoWiper", "automation.auto_wiper"),
                 "automation.auto_wiper_description",
@@ -439,20 +505,31 @@ public class Conditions {
                 new Label("wiperActive", "automation.wiper_active"),
                 "automation.wiper_active_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
-        // Auto-headlights engaged (the "it's dark" proxy — no lux value exists).
+        // Automatic-headlight MODE enabled/disabled; not darkness or actual lamp output.
         addCondition(new EventCondition(
                 new Label("autoLights", "automation.auto_lights"),
                 "automation.auto_lights_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
-        // Seat occupancy (someone sitting), per seat.
+        // Seat occupancy (someone sitting).
+        //  - PASSENGER: getPassengerStatus area 1 when available; otherwise a disclosed
+        //    belt/reminder estimate (buckled/reminder=occupied, unbuckled=empty).
+        //  - DRIVER: no sensor exists; presence is INFERRED from the seatbelt-reminder mask
+        //    (bit 0) + the driver belt, and is POSITIVE-ONLY — it publishes "occupied" and never
+        //    "empty" (an unbuckled-but-present driver reads identically to an empty seat; see
+        //    BydDataCollector.readDriverOccupancyNow).
+        // The schema carries ONE value enum per condition, so "empty" is still offered for the
+        // driver seat in the picker. A driver+empty rule parses and loads, but can only ever be
+        // satisfied while the state is unseeded — it is documented as unsupported in the
+        // description rather than being silently dropped at load, which would delete the user's
+        // whole automation (see Automation.fromJson).
         addCondition(new EventCondition(
                 new Label("occupant", "automation.occupant"),
                 "automation.occupant_description",
                 new EnumType(new Label("state", "automation.state"), new Label("occupied", "automation.occupied"), new Label("empty", "automation.empty")),
                 new EnumType(
                         new Label("seat", "automation.seat"),
-                        new Label("driver", "automation.driver"),
-                        new Label("passenger", "automation.passenger"))));
+                        new Label("passenger", "automation.passenger"),
+                        new Label("driver", "automation.driver"))));
         // User variable / flag — free-text name + string value (eq/neq). Set by the
         // "Set Variable" action; lets an automation gate on its own or another's marker
         // ("if Parking_Mode != true"). VariableCondition handles the free-text name (not
@@ -475,6 +552,15 @@ public class Conditions {
      */
     private void addCondition(EventCondition condition) {
         conditions.put(condition.getLabel().getId(), condition);
+    }
+
+    private void addHiddenCondition(EventCondition condition) {
+        addCondition(condition);
+        hiddenConditions.add(condition.getLabel().getId());
+    }
+
+    boolean isAdvertised(String id) {
+        return conditions.containsKey(id) && !hiddenConditions.contains(id);
     }
 
     /**
@@ -504,7 +590,16 @@ public class Conditions {
             conditions.put("description", Messages.get("automation.conditions_description"));
             JSONArray triggersList = new JSONArray();
             JSONArray conditionsList = new JSONArray();
+            boolean includeHybridOnly =
+                    com.overdrive.app.automation.AutomationCategories
+                            .supportsHybridOnlyItemsOnCurrentVehicle();
             for (EventCondition condition : this.conditions.values()) {
+                if (!isAdvertised(condition.getLabel().getId())) continue;
+                if (!includeHybridOnly
+                        && com.overdrive.app.automation.AutomationCategories.isHybridOnly(
+                                condition.getLabel().getId())) {
+                    continue;
+                }
                 String category = com.overdrive.app.automation.AutomationCategories.forId(
                         condition.getLabel().getId());
                 JSONObject triggerJson = condition.toJson();

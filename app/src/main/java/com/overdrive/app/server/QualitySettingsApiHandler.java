@@ -10,6 +10,8 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.OutputStream;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Quality Settings API Handler - manages recording and streaming quality settings.
@@ -23,6 +25,10 @@ import java.io.OutputStream;
  * - POST /api/settings/storage - Update storage limit settings
  */
 public class QualitySettingsApiHandler {
+
+    private static final int MAX_ROAD_SENSE_VOLUME_WRITERS = 512;
+    private static final Map<String, Long> roadSenseVolumeSequences =
+            new LinkedHashMap<>();
     
     // Stored quality settings
     // Single user-facing recording quality tier (ECONOMY/STANDARD/HIGH/PREMIUM/MAX).
@@ -299,31 +305,49 @@ public class QualitySettingsApiHandler {
         response.put("recordingsStorageTypeActive", storage.getActiveRecordingsStorageType().name());
         response.put("surveillanceStorageTypeActive", storage.getActiveSurveillanceStorageType().name());
 
-        // SD card info
+        // SD card info. Each get*Space() builds a fresh StatFs (plus an
+        // exists()/isDirectory() pair), so the raw + formatted pairs below read
+        // each value ONCE into a local instead of calling the getter twice —
+        // this response used to issue ~17 StatFs constructions for 6 distinct
+        // numbers. Also keeps the raw and formatted fields internally
+        // consistent, which two separate reads don't guarantee.
         response.put("sdCardAvailable", storage.isSdCardAvailable());
         response.put("sdCardPath", storage.getSdCardPath());
         if (storage.isSdCardAvailable()) {
-            response.put("sdCardFreeSpace", storage.getSdCardFreeSpace());
-            response.put("sdCardTotalSpace", storage.getSdCardTotalSpace());
-            response.put("sdCardFreeFormatted", StorageManager.formatSize(storage.getSdCardFreeSpace()));
-            response.put("sdCardTotalFormatted", StorageManager.formatSize(storage.getSdCardTotalSpace()));
+            long sdFree = storage.getSdCardFreeSpace();
+            long sdTotal = storage.getSdCardTotalSpace();
+            response.put("sdCardFreeSpace", sdFree);
+            response.put("sdCardTotalSpace", sdTotal);
+            response.put("sdCardFreeFormatted", StorageManager.formatSize(sdFree));
+            response.put("sdCardTotalFormatted", StorageManager.formatSize(sdTotal));
         }
 
         // USB info
         response.put("usbAvailable", storage.isUsbAvailable());
         response.put("usbPath", storage.getUsbPath());
         if (storage.isUsbAvailable()) {
-            response.put("usbFreeSpace", storage.getUsbFreeSpace());
-            response.put("usbTotalSpace", storage.getUsbTotalSpace());
-            response.put("usbFreeFormatted", StorageManager.formatSize(storage.getUsbFreeSpace()));
-            response.put("usbTotalFormatted", StorageManager.formatSize(storage.getUsbTotalSpace()));
+            long usbFree = storage.getUsbFreeSpace();
+            long usbTotal = storage.getUsbTotalSpace();
+            response.put("usbFreeSpace", usbFree);
+            response.put("usbTotalSpace", usbTotal);
+            response.put("usbFreeFormatted", StorageManager.formatSize(usbFree));
+            response.put("usbTotalFormatted", StorageManager.formatSize(usbTotal));
         }
 
         // Internal storage info
-        response.put("internalFreeSpace", storage.getInternalFreeSpace());
-        response.put("internalTotalSpace", storage.getInternalTotalSpace());
-        response.put("internalFreeFormatted", StorageManager.formatSize(storage.getInternalFreeSpace()));
-        response.put("internalTotalFormatted", StorageManager.formatSize(storage.getInternalTotalSpace()));
+        long intFree = storage.getInternalFreeSpace();
+        long intTotal = storage.getInternalTotalSpace();
+        response.put("internalFreeSpace", intFree);
+        response.put("internalTotalSpace", intTotal);
+        response.put("internalFreeFormatted", StorageManager.formatSize(intFree));
+        response.put("internalTotalFormatted", StorageManager.formatSize(intTotal));
+
+        // Combined-limit advisory. Every category's slider tops out at the FULL volume
+        // and each picks its volume independently, so Σ(limits on one volume) can exceed
+        // that volume's capacity. Advisory only — computed once here (and echoed by
+        // /api/trips/storage) so all settings pages warn from one source of truth.
+        // Includes proximity, which has no slider of its own but does consume a limit.
+        response.put("storageBudget", storage.getStorageBudgetJson());
 
         HttpResponse.sendJson(out, response.toString());
     }
@@ -476,28 +500,6 @@ public class QualitySettingsApiHandler {
                 response.put("message", Messages.get("messages.quality_storage_settings_updated"));
             }
 
-            // Re-arm RecordingsIndex FileObservers against the new active dir
-            // set, AND walk the new active dir to populate the index. The
-            // refresh-only call would only catch live writes going forward —
-            // existing files on the new volume would be invisible to the
-            // index until the 1-hour periodic reconcile. Reconcile here fills
-            // them immediately. Run on a background thread so the HTTP
-            // response doesn't block on the FUSE walk.
-            if (storageTypeChanged) {
-                try {
-                    com.overdrive.app.daemon.RecordingsIndexFileWatcher.getInstance().refresh();
-                } catch (Throwable t) {
-                    CameraDaemon.log("RecordingsIndexFileWatcher refresh failed: " + t.getMessage());
-                }
-                new Thread(() -> {
-                    try {
-                        com.overdrive.app.server.RecordingsIndex.getInstance().reconcile();
-                    } catch (Throwable t) {
-                        CameraDaemon.log("Post-storage-switch reconcile failed: " + t.getMessage());
-                    }
-                }, "RecordingsIndexStorageSwitchReconcile").start();
-            }
-            
             HttpResponse.sendJson(out, response.toString());
             
         } catch (Exception e) {
@@ -582,12 +584,75 @@ public class QualitySettingsApiHandler {
                 return;
             }
 
-            // Route through UnifiedConfigManager so the in-memory cache stays
-            // consistent and registered listeners fire. The previous direct
-            // file-read/merge/write bypassed the cache: any other writer
-            // (StorageManager, ExternalStorageCleaner) within the same mtime
-            // second could merge into a stale cache and clobber this section.
-            boolean ok = com.overdrive.app.config.UnifiedConfigManager.updateSection(section, data);
+            // Blind-spot speed bounds: REJECT out-of-range / non-numeric input rather
+            // than persisting it. The daemon gate clamps defensively too, but silently
+            // storing e.g. 900 would show "900" back in the UI while the gate treated it
+            // as "no bound" — the setting would read armed and behave disarmed. An
+            // INVERTED pair (min > max) is an unsatisfiable window that would hide the
+            // card forever, so it's a validation error, not a value to store.
+            //
+            // Validated INSIDE the config file lock, and the write nested in the same
+            // lock: validateBsSpeedWindow resolves a bound the request omits from the
+            // PERSISTED sibling (updateSection merges), so a check outside the lock is a
+            // TOCTOU — two concurrent single-key POSTs ({min:90} and {max:30}) would each
+            // validate against the stored 0 and together commit an inverted window. The
+            // lock is per-thread reentrant, so updateSection's own acquire just nests.
+            boolean ok;
+            if ("roadSense".equals(section)
+                    && (data.has("warnAudioVolume")
+                    || data.has("warnAudioVolumeWriter")
+                    || data.has("warnAudioVolumeSequence"))) {
+                final String[] err = new String[1];
+                ok = com.overdrive.app.config.UnifiedConfigManager.runUnderConfigLock(() -> {
+                    try {
+                        err[0] = validateRoadSenseAudioSettings(data);
+                    } catch (Exception e) {
+                        err[0] = "Invalid RoadSense chime volume settings";
+                    }
+                    if (err[0] != null) return false;
+                    if (data.has("warnAudioVolumeWriter")) {
+                        String writer = data.optString("warnAudioVolumeWriter", "");
+                        long sequence = data.optLong("warnAudioVolumeSequence", 0L);
+                        data.remove("warnAudioVolumeWriter");
+                        data.remove("warnAudioVolumeSequence");
+                        synchronized (roadSenseVolumeSequences) {
+                            Long previous = roadSenseVolumeSequences.get(writer);
+                            // A duplicate/older request from this page is a successful
+                            // no-op: its newer request already carried the intended value.
+                            if (previous != null && sequence <= previous) return true;
+                            boolean saved = com.overdrive.app.config.UnifiedConfigManager
+                                    .updateSection(section, data);
+                            if (saved) rememberRoadSenseVolumeSequence(writer, sequence);
+                            return saved;
+                        }
+                    }
+                    return com.overdrive.app.config.UnifiedConfigManager
+                            .updateSection(section, data);
+                });
+                if (err[0] != null) {
+                    HttpResponse.sendJsonError(out, err[0]);
+                    return;
+                }
+            } else if ("blindspot".equals(section)
+                    && (data.has("minSpeedKmh") || data.has("maxSpeedKmh"))) {
+                final String[] err = new String[1];
+                ok = com.overdrive.app.config.UnifiedConfigManager.runUnderConfigLock(() -> {
+                    err[0] = validateBsSpeedWindow(data);
+                    if (err[0] != null) return false;
+                    return com.overdrive.app.config.UnifiedConfigManager.updateSection(section, data);
+                });
+                if (err[0] != null) {
+                    HttpResponse.sendJsonError(out, err[0]);
+                    return;
+                }
+            } else {
+                // Route through UnifiedConfigManager so the in-memory cache stays
+                // consistent and registered listeners fire. The previous direct
+                // file-read/merge/write bypassed the cache: any other writer
+                // (StorageManager, ExternalStorageCleaner) within the same mtime
+                // second could merge into a stale cache and clobber this section.
+                ok = com.overdrive.app.config.UnifiedConfigManager.updateSection(section, data);
+            }
             if (!ok) {
                 HttpResponse.sendJsonError(out, "updateSection returned false");
                 return;
@@ -655,10 +720,16 @@ public class QualitySettingsApiHandler {
             // fixed quarter turn (0/90/180/270) or "auto" (direction-of-travel); the
             // base angle for "auto" is the sibling "rotationBase". Only honoured for
             // single-view modes (the daemon gates it); persisted by updateSection
-            // above, then re-resolved onto the running SurfaceControl layer here. A
-            // rotationBase edit is also refreshed so an "auto" card re-orients live.
+            // above, then re-resolved onto the running GL scaler (vertex-shader output
+            // rotation — the SurfaceControl layer stays at identity, issue #164) here.
+            // A rotationBase edit is also refreshed so an "auto" card re-orients live.
+            // PER-SIDE: rotationLeft/rotationRight + rotationBaseLeft/rotationBaseRight
+            // edits must refresh too — resolveBsRotation reads the current view's key,
+            // so a right-side rotation change lands live while a right turn is active.
             // No-op when the lane isn't up (next enable re-applies it).
-            if ("blindspot".equals(section) && (data.has("rotation") || data.has("rotationBase"))) {
+            if ("blindspot".equals(section) && (data.has("rotation") || data.has("rotationBase")
+                    || data.has("rotationLeft") || data.has("rotationRight")
+                    || data.has("rotationBaseLeft") || data.has("rotationBaseRight"))) {
                 try {
                     com.overdrive.app.surveillance.GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
                     if (p != null) p.refreshBlindSpotRotation();
@@ -676,6 +747,32 @@ public class QualitySettingsApiHandler {
                     if (p != null) p.relayoutCluster();
                 } catch (Exception e) {
                     CameraDaemon.log("blindspot relayout dispatch failed: " + e.getMessage());
+                }
+            }
+            // A blind-spot FISHEYE (lens-dewarp) change must take effect live. Separate
+            // knob from recording.rectifyStrength; only shapes the single-camera
+            // (side/rear) passthrough. Persisted above; push to the running scalers.
+            if ("blindspot".equals(section) && data.has("rectifyStrength")) {
+                try {
+                    com.overdrive.app.surveillance.GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
+                    if (p != null) p.setBlindSpotRectifyStrength(data.optInt("rectifyStrength", 0));
+                } catch (Exception e) {
+                    CameraDaemon.log("blindspot fisheye dispatch failed: " + e.getMessage());
+                }
+            }
+            // A blind-spot GEOMETRY change (size%/corner, incl. the per-side
+            // cornerLeft/cornerRight) must take effect live. The preset is persisted by
+            // updateSection above; re-resolve the card rect from the live panel + the
+            // current view's per-side corner and re-place it. refreshBlindSpotRotation()
+            // re-runs resolveBsGeometry() (which picks the side's corner via
+            // resolveBsCorner) and re-applies the rect when shown — no ACC cycle needed.
+            // Covers no-bridge (tunnel/browser) clients. No-op when the lane isn't up.
+            if ("blindspot".equals(section) && (data.has("geometry") || data.has("geometryCluster"))) {
+                try {
+                    com.overdrive.app.surveillance.GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
+                    if (p != null) p.refreshBlindSpotRotation();
+                } catch (Exception e) {
+                    CameraDaemon.log("blindspot geometry dispatch failed: " + e.getMessage());
                 }
             }
             // A blind-spot ENABLE flip must take effect live for NO-BRIDGE clients
@@ -752,6 +849,121 @@ public class QualitySettingsApiHandler {
         } catch (Exception e) {
             CameraDaemon.log("Error updating unified config: " + e.getMessage());
             HttpResponse.sendJsonError(out, e.getMessage());
+        }
+    }
+
+    /**
+     * Validate a blind-spot speed-window delta. Returns an error string to reject
+     * the whole POST, or null when the values are storable.
+     *
+     * <p>Both bounds are whole km/h in 0..{@code BS_SPEED_MAX_KMH}, where 0 means "no
+     * bound on that end". Non-integers and out-of-range values are rejected outright
+     * rather than clamped, so the UI can never show a number the gate doesn't honor.
+     *
+     * <p>CROSS-KEY: {@code updateSection} MERGES the delta into the persisted section,
+     * so a POST carrying only {@code maxSpeedKmh} still has to be checked against the
+     * STORED {@code minSpeedKmh} — otherwise "set max=20" against a stored min=60
+     * would commit an inverted, unsatisfiable window that hides the card forever.
+     * Resolve each missing side from the persisted config before comparing.
+     *
+     * <p>MUST be called while holding the config file lock (see the call site): the
+     * cross-key read below is only sound if no peer write can land between it and the
+     * merge. Equal bounds are ALLOWED — min==max is a coherent (if narrow) window.
+     */
+    private static String validateBsSpeedWindow(JSONObject data) {
+        final int cap = com.overdrive.app.config.UnifiedConfigManager.BS_SPEED_MAX_KMH;
+        // forceReload for an under-lock read: the sibling bound may have been written by
+        // the app/web UID, and the mtime-gated cache could otherwise serve it stale.
+        com.overdrive.app.config.UnifiedConfigManager.forceReload();
+        org.json.JSONObject stored = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+        int[] bounds = new int[2];
+        String[] keys = { "minSpeedKmh", "maxSpeedKmh" };
+        for (int i = 0; i < keys.length; i++) {
+            if (data.has(keys[i])) {
+                Object raw = data.opt(keys[i]);
+                // Reject a fractional/garbage value instead of truncating it silently.
+                if (!(raw instanceof Number) || ((Number) raw).doubleValue() != ((Number) raw).intValue()) {
+                    return Messages.get("errors.bs_speed_range", "0", String.valueOf(cap));
+                }
+                int v = ((Number) raw).intValue();
+                if (v < 0 || v > cap) {
+                    return Messages.get("errors.bs_speed_range", "0", String.valueOf(cap));
+                }
+                bounds[i] = v;
+                // Normalise the value we accepted back into the delta so the merge
+                // persists a plain int: an integral double (30.0) would otherwise be
+                // stored verbatim. Both readers coerce it, so this is only about not
+                // writing odd literals into the config file.
+                try { data.put(keys[i], v); } catch (Exception ignored) {}
+            } else {
+                bounds[i] = com.overdrive.app.config.UnifiedConfigManager
+                    .clampBsSpeedBound(stored.optInt(keys[i], 0));
+            }
+        }
+        // 0 disarms an end, so only a both-armed pair can be inverted.
+        if (bounds[0] > 0 && bounds[1] > 0 && bounds[0] > bounds[1]) {
+            return Messages.get("errors.bs_speed_order");
+        }
+        return null;
+    }
+
+    /**
+     * Validate and canonicalize RoadSense audio values before updateSection persists
+     * them. Package-visible for focused JVM tests of the unified-settings boundary.
+     */
+    static String validateRoadSenseAudioSettings(JSONObject data) throws Exception {
+        if (data == null) return null;
+        boolean hasVolume = data.has("warnAudioVolume");
+        boolean hasWriter = data.has("warnAudioVolumeWriter");
+        boolean hasSequence = data.has("warnAudioVolumeSequence");
+        if (!hasVolume) {
+            return (hasWriter || hasSequence)
+                    ? "RoadSense chime volume sequencing requires a volume"
+                    : null;
+        }
+        Integer volume = com.overdrive.app.roadsense.config.RoadSenseChimeLevels
+                .validatedMasterPercent(data.opt("warnAudioVolume"));
+        if (volume == null) {
+            return "RoadSense chime volume must be a whole number from 10 to 100";
+        }
+        // Store one canonical JSON type even when a client sent an integral double.
+        data.put("warnAudioVolume", volume);
+        if (hasWriter != hasSequence) {
+            return "RoadSense chime volume writer and sequence must be provided together";
+        }
+        if (hasWriter) {
+            if (data.length() != 3) {
+                return "Sequenced RoadSense chime volume updates cannot include other settings";
+            }
+            Object rawWriter = data.opt("warnAudioVolumeWriter");
+            if (!(rawWriter instanceof String)
+                    || !((String) rawWriter).matches("[0-9a-f]{32}")) {
+                return "RoadSense chime volume writer is invalid";
+            }
+            Object rawSequence = data.opt("warnAudioVolumeSequence");
+            if (!(rawSequence instanceof Number)) {
+                return "RoadSense chime volume sequence must be a positive integer";
+            }
+            Number number = (Number) rawSequence;
+            double value = number.doubleValue();
+            long integer = number.longValue();
+            if (!Double.isFinite(value)
+                    || value != (double) integer
+                    || integer < 1L
+                    || integer > 9_007_199_254_740_991L) {
+                return "RoadSense chime volume sequence must be a positive integer";
+            }
+            data.put("warnAudioVolumeSequence", integer);
+        }
+        return null;
+    }
+
+    private static void rememberRoadSenseVolumeSequence(String writer, long sequence) {
+        roadSenseVolumeSequences.remove(writer);
+        roadSenseVolumeSequences.put(writer, sequence);
+        while (roadSenseVolumeSequences.size() > MAX_ROAD_SENSE_VOLUME_WRITERS) {
+            String eldest = roadSenseVolumeSequences.keySet().iterator().next();
+            roadSenseVolumeSequences.remove(eldest);
         }
     }
 
@@ -1181,8 +1393,8 @@ public class QualitySettingsApiHandler {
                     // restart:true path (OemDashcamApiHandler.java around line 618-625).
                     com.overdrive.app.server.OemDashcamApiHandler.LIFECYCLE_EXEC.execute(() -> {
                         try {
-                            com.overdrive.app.server.OemDashcamApiHandler.applyLifecycle(false);
-                            com.overdrive.app.server.OemDashcamApiHandler.applyTriggerLifecycleFromUcm();
+                            com.overdrive.app.server.OemDashcamApiHandler
+                                .forceRestartPipelineFromCurrentIntent();
                         } catch (Exception e) {
                             // Best-effort — quality apply itself already succeeded; restart
                             // failure leaves the user with their old encoder settings until
@@ -1653,14 +1865,63 @@ public class QualitySettingsApiHandler {
     private static void sendTelemetryOverlaySettings(OutputStream out) throws Exception {
         boolean panoEffective = com.overdrive.app.config.UnifiedConfigManager
             .isTelemetryOverlayEnabledFor("pano");
+        boolean survEffective = com.overdrive.app.config.UnifiedConfigManager
+            .isTelemetryOverlayEnabledFor("surveillance");
         boolean oemEffective = com.overdrive.app.config.UnifiedConfigManager
             .isTelemetryOverlayEnabledFor("oemDashcam");
         JSONObject response = new JSONObject();
         response.put("success", true);
         response.put("enabled", panoEffective);              // legacy alias = pano
         response.put("panoEnabled", panoEffective);
+        response.put("surveillanceEnabled", survEffective);
         response.put("oemDashcamEnabled", oemEffective);
+        // Per-flow field selection. Absent list → the legacy eight-field
+        // default (resolved here so the web always gets a concrete array and
+        // renders the checklist consistently regardless of persistence state).
+        response.put("fields", buildFieldsResponse());
+        // Catalogue of every selectable field (key + which are legacy-default),
+        // so the UI can render the checklist without hard-coding the list.
+        response.put("fieldCatalog", buildFieldCatalog());
         HttpResponse.sendJson(out, response.toString());
+    }
+
+    /** Resolved per-flow field arrays: {@code {accOn:[...],surveillance:[...],oemDashcam:[...]}}. */
+    private static JSONObject buildFieldsResponse() throws Exception {
+        JSONObject fields = new JSONObject();
+        for (String flow : new String[]{"accOn", "surveillance", "oemDashcam"}) {
+            org.json.JSONArray arr = com.overdrive.app.config.UnifiedConfigManager
+                .getTelemetryOverlayFields(flow);
+            // fromJsonArray applies the legacy default on null, then re-serialize
+            // so the response is always an explicit, canonical-order array.
+            fields.put(flow, com.overdrive.app.telemetry.TelemetryFields
+                .fromJsonArray(arr).toJsonArray());
+        }
+        return fields;
+    }
+
+    /**
+     * Normalize an incoming field-key array: drop unknown keys, dedupe, and put
+     * into canonical order by round-tripping through TelemetryFields. An empty
+     * result is preserved as an explicit empty array (user deselected all) —
+     * distinct from a missing list (legacy default). NOTE: an all-unknown-keys
+     * input also collapses to empty here; the web UI only ever sends known keys.
+     */
+    private static org.json.JSONArray canonicalizeFields(org.json.JSONArray in) {
+        return com.overdrive.app.telemetry.TelemetryFields
+            .fromJsonArrayStrict(in).toJsonArray();
+    }
+
+    /** All selectable fields as {@code [{key,legacyDefault}]} in canonical order. */
+    private static org.json.JSONArray buildFieldCatalog() throws Exception {
+        org.json.JSONArray cat = new org.json.JSONArray();
+        for (com.overdrive.app.telemetry.TelemetryFields.Field f
+                : com.overdrive.app.telemetry.TelemetryFields.Field.values()) {
+            JSONObject o = new JSONObject();
+            o.put("key", f.getKey());
+            o.put("legacyDefault", f.isLegacyDefault());
+            cat.put(o);
+        }
+        return cat;
     }
 
     /**
@@ -1967,6 +2228,9 @@ public class QualitySettingsApiHandler {
             if (settings.has("panoEnabled")) {
                 delta.put("panoEnabled", settings.optBoolean("panoEnabled", false));
             }
+            if (settings.has("surveillanceEnabled")) {
+                delta.put("surveillanceEnabled", settings.optBoolean("surveillanceEnabled", false));
+            }
             if (settings.has("oemDashcamEnabled")) {
                 delta.put("oemDashcamEnabled", settings.optBoolean("oemDashcamEnabled", false));
             }
@@ -1974,12 +2238,42 @@ public class QualitySettingsApiHandler {
                 com.overdrive.app.config.UnifiedConfigManager.setTelemetryOverlay(delta);
             }
 
-            // Notify pano pipeline of the resolved pano state.
+            // Per-flow field selection. Body key "fields" is an object keyed by
+            // flow ("accOn"/"surveillance"/"oemDashcam"), each an array of field
+            // keys. Persisted independently (setTelemetryOverlayFields merges into
+            // the nested `fields` object so the other flows are preserved).
+            JSONObject fieldsIn = settings.optJSONObject("fields");
+            boolean accOnFieldsChanged = false, survFieldsChanged = false, oemFieldsChanged = false;
+            if (fieldsIn != null) {
+                if (fieldsIn.has("accOn")) {
+                    org.json.JSONArray a = fieldsIn.optJSONArray("accOn");
+                    if (a != null) { com.overdrive.app.config.UnifiedConfigManager
+                        .setTelemetryOverlayFields("accOn", canonicalizeFields(a)); accOnFieldsChanged = true; }
+                }
+                if (fieldsIn.has("surveillance")) {
+                    org.json.JSONArray a = fieldsIn.optJSONArray("surveillance");
+                    if (a != null) { com.overdrive.app.config.UnifiedConfigManager
+                        .setTelemetryOverlayFields("surveillance", canonicalizeFields(a)); survFieldsChanged = true; }
+                }
+                if (fieldsIn.has("oemDashcam")) {
+                    org.json.JSONArray a = fieldsIn.optJSONArray("oemDashcam");
+                    if (a != null) { com.overdrive.app.config.UnifiedConfigManager
+                        .setTelemetryOverlayFields("oemDashcam", canonicalizeFields(a)); oemFieldsChanged = true; }
+                }
+            }
+
+            // Notify pano pipeline of the resolved pano state + surveillance master.
             boolean panoEffective = com.overdrive.app.config.UnifiedConfigManager
                 .isTelemetryOverlayEnabledFor("pano");
+            boolean survEffective = com.overdrive.app.config.UnifiedConfigManager
+                .isTelemetryOverlayEnabledFor("surveillance");
             com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
             if (pipeline != null) {
                 pipeline.setOverlayEnabled(panoEffective);
+                pipeline.setSurveillanceOverlayEnabled(survEffective);
+                // Push live field edits to whichever flow is currently recording.
+                if (accOnFieldsChanged) pipeline.refreshOverlayFields("pano");
+                if (survFieldsChanged) pipeline.refreshOverlayFields("surveillance");
             }
 
             // Notify OEM Dashcam pipeline of its resolved state. The pipeline
@@ -1993,13 +2287,20 @@ public class QualitySettingsApiHandler {
             com.overdrive.app.camera.OemDashcamPipeline oem = CameraDaemon.getOemDashcamPipeline();
             if (oem != null) {
                 oem.setOverlayEnabled(oemEffective);
+                if (oemFieldsChanged) {
+                    oem.setOverlayFields(com.overdrive.app.telemetry.TelemetryFields.fromJsonArray(
+                        com.overdrive.app.config.UnifiedConfigManager
+                            .getTelemetryOverlayFields("oemDashcam")));
+                }
             }
 
             JSONObject response = new JSONObject();
             response.put("success", true);
             response.put("enabled", panoEffective);              // legacy alias
             response.put("panoEnabled", panoEffective);
+            response.put("surveillanceEnabled", survEffective);
             response.put("oemDashcamEnabled", oemEffective);
+            response.put("fields", buildFieldsResponse());
             HttpResponse.sendJson(out, response.toString());
         } catch (Exception e) {
             CameraDaemon.log("Error setting telemetry overlay: " + e.getMessage());

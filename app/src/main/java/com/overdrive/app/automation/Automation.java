@@ -15,6 +15,13 @@ import java.util.Map;
 import java.util.Objects;
 
 public class Automation {
+    // Runtime execution modes. "manual" is intentionally serialized with
+    // disabled=true as well, so an older build that does not understand
+    // manualOnly treats the automation as safely disabled instead of arming it.
+    public static final String MODE_AUTOMATIC = "automatic";
+    public static final String MODE_MANUAL = "manual";
+    public static final String MODE_DISABLED = "disabled";
+
     // Condition-combining logic. "AND" (default) = every condition must match;
     // "OR" = any one condition matching is enough. Stored as a String so the JSON
     // schema stays open and an unknown/absent value degrades safely to AND — which
@@ -44,10 +51,12 @@ public class Automation {
     // branch behaves exactly as before. Never null.
     private final List<AutomationAction> elseActions;
 
-    // volatile: written from HTTP request threads (setDisabled) and read from the telemetry thread
-    // (stateChanged) and the queue worker thread (triggerActions) with no shared lock, so a plain field
-    // could let those threads observe a stale enabled/disabled state and fire a just-disabled automation.
-    private volatile boolean disabled;
+    // volatile: written from HTTP request threads (setMode/setDisabled) and read from the
+    // telemetry thread (stateChanged), explicit-run thread, and queue worker with no shared
+    // lock. A plain field could let those threads observe a stale mode and fire after a change.
+    private volatile String mode;
+    /** Changes on every runtime mode mutation, including a disable-enable cycle. */
+    private volatile long enabledStateRevision;
 
     // Optional user-given name (a label shown in the list + the automation-control
     // target picker). Empty for automations created before this feature — the UI then
@@ -123,7 +132,7 @@ public class Automation {
         this.delay = Objects.requireNonNullElse(delay, 0);
         this.actions = actions;
         this.elseActions = elseActions != null ? elseActions : new ArrayList<>();
-        this.disabled = disabled;
+        this.mode = disabled ? MODE_DISABLED : MODE_AUTOMATIC;
     }
 
     /**
@@ -191,12 +200,41 @@ public class Automation {
     }
 
     /**
-     * Whether this automation is currently disabled
-     *
-     * @return Whether this automation is currently disabled
+     * Whether this automation is excluded from autonomous event processing.
+     * Both manual-only and fully disabled modes return true.
      */
     public boolean isDisabled() {
-        return disabled;
+        return !MODE_AUTOMATIC.equals(mode);
+    }
+
+    /**
+     * Whether this automation is armed only for an explicit user invocation.
+     * Manual-only automations are deliberately considered disabled by
+     * {@link #isDisabled()} so they contribute no event polling or queue worker.
+     */
+    public boolean isManualOnly() {
+        return MODE_MANUAL.equals(mode);
+    }
+
+    /** Whether neither automatic nor explicit execution is allowed. */
+    public boolean isFullyDisabled() {
+        return MODE_DISABLED.equals(mode);
+    }
+
+    /** Whether Run now / key mapping may explicitly execute this automation. */
+    public boolean allowsExplicitRun() {
+        return !isFullyDisabled();
+    }
+
+    /** Normalized execution mode: automatic, manual, or disabled. */
+    public String getMode() {
+        return mode;
+    }
+
+    public static boolean isValidMode(String value) {
+        return MODE_AUTOMATIC.equals(value)
+                || MODE_MANUAL.equals(value)
+                || MODE_DISABLED.equals(value);
     }
 
     /**
@@ -297,7 +335,21 @@ public class Automation {
      * @param disabled Whether this should be disabled
      */
     public void setDisabled(boolean disabled) {
-        this.disabled = disabled;
+        setMode(disabled ? MODE_DISABLED : MODE_AUTOMATIC);
+    }
+
+    /**
+     * Change the runtime execution mode. Callers validate the input before mutation;
+     * an invalid value is ignored in the safe direction.
+     */
+    public void setMode(String mode) {
+        if (!isValidMode(mode)) return;
+        enabledStateRevision++;
+        this.mode = mode;
+    }
+
+    long enabledStateRevision() {
+        return enabledStateRevision;
     }
 
     /**
@@ -368,7 +420,10 @@ public class Automation {
                 elseActionsJson.put(action.toJson());
             }
             json.put("elseActions", elseActionsJson);
+            // Compatibility contract: old builds know only `disabled`. Manual-only
+            // must look disabled to them or a downgrade could arm the rule.
             json.put("disabled", isDisabled());
+            if (isManualOnly()) json.put("manualOnly", true);
             // Optional name + run stats — emitted only when set, so an automation
             // created before this feature serializes with no new keys (byte-identical).
             if (!getName().isEmpty()) json.put("name", getName());
@@ -390,29 +445,117 @@ public class Automation {
      * @param input The JSON for this automation
      * @return An automation instance if the JSON is valid, null otherwise
      */
+    /**
+     * Rewrite stored option values that a later build renamed or withdrew, so an automation the
+     * user created against an older option set still loads.
+     *
+     * <p>Without this, an unknown option makes {@code EventCondition.eventData} return null and
+     * {@link #fromJson} drop the WHOLE automation — losing its name, conditions and actions, and
+     * (once any later save rewrites the file) erasing it from disk. Migrating is strictly better
+     * than dropping whenever the old value has a faithful successor.
+     *
+     * <p><b>RETIRED: occupant / seat=driver → passenger.</b> This rule rewrote a stored
+     * driver-occupancy rule to the passenger seat, because the driver option had been withdrawn
+     * (no {@code getPassengerStatus} area exists for that seat) and the old driver event was in
+     * fact fed from area 1 = the FRONT PASSENGER, so "passenger" was the behaviour the user had
+     * actually been observing.
+     *
+     * <p>The driver seat is now a supported option again, inferred from the seatbelt-reminder
+     * mask + the driver belt ({@code BydDataCollector.readDriverOccupancyNow}), so
+     * {@code seat=driver} is a VALID option and must NOT be rewritten — rewriting it would send
+     * a freshly-authored driver rule to the wrong seat. The rule is therefore removed rather
+     * than kept.
+     *
+     * <p><b>One-way loss, accepted and unavoidable:</b> a driver rule that was already rewritten
+     * by a build carrying this migration was persisted as {@code seat=passenger} on the next
+     * save, so its original intent is gone from disk and cannot be recovered here — a stored
+     * "passenger" entry is now indistinguishable from one the user authored deliberately.
+     * Guessing which ones to convert back would silently re-point working passenger rules at the
+     * driver seat, which is worse. Affected users re-pick the driver seat once; noted in the
+     * release notes.
+     *
+     * <p>Kept as an identity hook (rather than deleted) so the call sites in {@link #fromJson}
+     * and {@code ConditionGroup.fromJson} stay in place for the next option withdrawal, and so
+     * the collision-dropping wrapper below keeps its single documented seam.
+     *
+     * @return the entry unchanged; no option currently needs migrating
+     */
+    static JSONObject migrateStaleOptions(JSONObject entry) {
+        return entry;
+    }
+
+    /**
+     * Array-aware form of {@link #migrateStaleOptions}: migrates each entry, preserving order.
+     *
+     * <p>The collision-dropping this wrapper used to do existed only for the retired
+     * driver→passenger rewrite: rewriting BOTH halves of a "driving alone" rule
+     * ({@code driver==occupied AND passenger==empty}) collapsed them onto one seat, producing
+     * {@code passenger==occupied AND passenger==empty} — never satisfiable, so the automation
+     * loaded, looked healthy and silently never fired. With that rewrite gone no entry changes
+     * seat, so no migration can manufacture a duplicate, and dropping entries here would now
+     * DELETE a legitimate driver term. Kept as the single seam a future withdrawal would
+     * re-use; reinstate the drop logic together with any rule that rewrites a variable.
+     *
+     * @param arr the stored triggers or conditions array; may be null
+     * @return the entries to parse, in order
+     */
+    static List<JSONObject> migrateStaleOptions(JSONArray arr) throws org.json.JSONException {
+        List<JSONObject> out = new ArrayList<>();
+        if (arr == null) return out;
+        for (int i = 0; i < arr.length(); i++) {
+            out.add(migrateStaleOptions(arr.getJSONObject(i)));
+        }
+        return out;
+    }
+
     public static Automation fromJson(JSONObject input) {
         try {
             List<EventData> triggers = new ArrayList<>();
             JSONArray triggersJson = input.getJSONArray("triggers");
             if (triggersJson.length() == 0) return null;
-            for (int i = 0; i < triggersJson.length(); i++) {
-                JSONObject triggerJson = triggersJson.getJSONObject(i);
+            for (JSONObject triggerJson : migrateStaleOptions(triggersJson)) {
                 String key = triggerJson.getString("type");
                 EventCondition condition = Automations.getCondition(key);
                 if (condition == null) return null;
-                triggers.add(condition.eventData(triggerJson));
+                // eventData() returns null when a stored variable value is no longer a valid
+                // option (EventCondition.eventData → EnumType.isValid), e.g. an option that a
+                // later build removed. That null MUST NOT be added: it survives into the trigger
+                // set, and toJson() then NPEs on trigger.toJson() BEFORE json.put("triggers"),
+                // where the catch swallows it and returns an empty {} — which the next
+                // saveToFile() persists, silently destroying the whole automation (name,
+                // conditions, actions). Dropping just this automation keeps the damage contained
+                // and leaves the .bak recoverable, matching how an unknown type is handled above.
+                EventData triggerData = condition.eventData(triggerJson);
+                if (triggerData == null) return null;
+                triggers.add(triggerData);
             }
+            // Belt-and-braces: the migration can DROP a collided entry, so re-assert the
+            // non-empty invariant it was checked for above. It cannot currently empty the list
+            // (a driver entry is only dropped when a passenger entry it would duplicate is
+            // present, and that one is never dropped), but a future migration rule could, and a
+            // trigger-less automation would load and silently never fire.
+            if (triggers.isEmpty()) return null;
 
             List<AutomationCondition> conditions = new ArrayList<>();
             JSONArray conditionsJson = input.optJSONArray("conditions");
             if (conditionsJson != null) {
-                for (int i = 0; i < conditionsJson.length(); i++) {
-                    JSONObject conditionJson = conditionsJson.getJSONObject(i);
+                for (JSONObject conditionJson : migrateStaleOptions(conditionsJson)) {
                     String key = conditionJson.getString("type");
                     EventCondition condition = Automations.getCondition(key);
                     if (condition == null) return null;
-                    conditions.add(condition.automationCondition(conditionJson));
+                    // Same null contract as the triggers above (automationCondition() returns
+                    // null on a stale option / comparator / value). A null here propagates to
+                    // toJson()'s condition loop and to Automations.isEventReferenced, which
+                    // dereferences each condition's event data — so drop the automation instead.
+                    AutomationCondition parsed = condition.automationCondition(conditionJson);
+                    if (parsed == null) return null;
+                    conditions.add(parsed);
                 }
+                // Same rule as ConditionGroup.fromJson: if the migration emptied a NON-empty
+                // stored condition list, reject. conditionsMet treats an empty list as "always
+                // met", so keeping it would turn the automation's gate into no gate and let it
+                // fire unconditionally — worse than not firing, since actions actuate the car.
+                if (conditionsJson.length() > 0 && conditions.isEmpty()) return null;
             }
 
             // Optional; absent/unknown → AND, which is the pre-existing behaviour, so
@@ -430,6 +573,14 @@ public class Automation {
                 for (int i = 0; i < groupsJson.length(); i++) {
                     ConditionGroup g = ConditionGroup.fromJson(groupsJson.getJSONObject(i), MAX_GROUP_DEPTH);
                     if (g == null) return null;
+                    // DROP a term-less group instead of keeping it. evaluate() returns true for a
+                    // group with no leaves and no children, so under conditionLogic "OR" it makes
+                    // the whole condition set vacuously true — the automation then fires on every
+                    // trigger with its real conditions bypassed, actuating the vehicle. The editor
+                    // produces exactly this when a user adds a group and deletes its only row.
+                    // Dropping (not rejecting) keeps the user's other conditions, which is the
+                    // safe direction: a preserved gate beats a lost automation.
+                    if (g.getConditions().isEmpty() && g.getGroups().isEmpty()) continue;
                     conditionGroups.add(g);
                 }
             }
@@ -453,9 +604,13 @@ public class Automation {
             }
 
             boolean disabled = input.optBoolean("disabled", false);
+            // manualOnly wins over a conflicting disabled=false in a hand-edited file.
+            // The safe interpretation is never to arm an explicitly manual rule.
+            boolean manualOnly = input.optBoolean("manualOnly", false);
 
             Automation a = new Automation(triggers, conditions, conditionLogic, conditionGroups,
                     delay, actions, elseActions, disabled);
+            if (manualOnly) a.setMode(MODE_MANUAL);
             // Optional name + run stats (absent on pre-feature automations → defaults).
             a.setName(input.optString("name", ""));
             a.setStats(input.optLong("lastTriggered", 0L), input.optLong("triggerCount", 0L));

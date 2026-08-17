@@ -319,6 +319,20 @@ public class OemDashcamPipeline {
     // recording-only behaviour).
     private volatile EGLCore parentEglCore;
 
+    // TRUE only when this pipeline's GL context was actually created in pano's
+    // EGL SHARE GROUP (EGLCore.createShared succeeded). Recording never needs
+    // this — OEM blits its own texture inside its own context, so an independent
+    // context records perfectly. But VIEW-6 STREAMING does: pano's stream scaler
+    // binds our cameraTextureId on PANO's GL thread, and a texture name from an
+    // unshared context does not exist there — it samples as undefined/black while
+    // every gate (isRunning / texture id != 0 / matrix published) still reports
+    // ready. That silent mismatch is why view 6 showed the AVM mosaic or black
+    // while views 1-4 (which use pano's own texture) were correct, and why the
+    // manual OEM off/on workaround "fixed" it (the restart won the pano race).
+    // isRouteReady() now gates on this so the route is refused (and a restart
+    // scheduled) instead of falsely succeeding. Set inside start()'s EGL block.
+    private volatile boolean eglSharedWithPano = false;
+
     // Pano stream scaler this pipeline publishes its tex matrix into when
     // view-6 streaming is active. Set/cleared by GpuSurveillancePipeline
     // around bindOemSource/unbindOemSource. Per-frame the render loop
@@ -343,6 +357,11 @@ public class OemDashcamPipeline {
     // setOverlayRecordingActive on the recorder side.
     private volatile TelemetryDataCollector telemetryCollector;
     private volatile boolean overlayEnabled = false;
+    // Which telemetry fields the OEM dashcam overlay draws (its OWN independent
+    // selection — never shared with pano/surveillance). Defaults to the legacy
+    // eight-field set so behavior is unchanged until the user edits it.
+    private volatile com.overdrive.app.telemetry.TelemetryFields overlayFields =
+        com.overdrive.app.telemetry.TelemetryFields.legacyDefault();
 
     public OemDashcamPipeline(String outputDir) {
         this.outputDir = outputDir;
@@ -468,9 +487,25 @@ public class OemDashcamPipeline {
      *  arriving in that ~50–500ms window passes {@code isRunning} but
      *  finds a zero texture id. Use this method anywhere a consumer needs
      *  to know "the camera + EGL handles are actually plumbed" rather
-     *  than "start() is mid-flight". */
+     *  than "start() is mid-flight".
+     *
+     *  <p>ALSO requires {@link #isEglSharedWithPano()}: view-6 routing makes PANO's
+     *  GL thread bind OUR {@code cameraTextureId}, which only names a real texture
+     *  when both contexts are in one share group. Without this clause the route
+     *  "succeeded" against an unshared texture and the viewer got the AVM mosaic /
+     *  black while every other gate reported healthy. Recording is unaffected by
+     *  this gate (it never crosses contexts) — see {@link #isRecording}. */
     public boolean isRouteReady() {
-        return running.get() && cameraTextureId != 0 && cameraSurfaceTexture != null;
+        return running.get() && cameraTextureId != 0 && cameraSurfaceTexture != null
+            && eglSharedWithPano;
+    }
+
+    /** True iff this pipeline's GL context shares pano's EGL group, i.e. pano may
+     *  sample our camera texture (the view-6 streaming requirement). False when OEM
+     *  came up before pano and got an independent context — recording still works,
+     *  but the pipeline must be restarted for view-6 streaming to render. */
+    public boolean isEglSharedWithPano() {
+        return eglSharedWithPano;
     }
 
     /** True iff a dvr_*.mp4 segment is currently being written. Independent
@@ -847,8 +882,14 @@ public class OemDashcamPipeline {
         // nothing to read) — do this BEFORE the early return so a cleared
         // collector reliably tears the worker down.
         OverlayBitmapRenderer r = overlayRenderer;
+        // Keep the renderer's field selection current whenever it exists.
+        if (r != null) r.setActiveFields(overlayFields);
         if (telemetryCollector == null) {
             if (r != null) r.stopWorker();
+            // Drop any beam demand this flow published — the overlay can't draw
+            // without a collector, and a stale entry would keep the light poll
+            // alive for a flow that has stopped.
+            com.overdrive.app.byd.BydDataCollector.setOverlayBeamDemand("oem", false);
             return;
         }
         // Hold polling only when overlay is enabled AND we're actively
@@ -856,11 +897,36 @@ public class OemDashcamPipeline {
         // in — the overlay only paints into clips that are actually being
         // written to disk).
         boolean shouldHold = overlayEnabled && running.get() && recording.get();
+        // Report which overlay-only signals this flow draws so the collector can
+        // skip the reflective turn-signal / seatbelt reads when unused. Issued on
+        // EVERY reconcile while holding (not just the start edge) so a LIVE field
+        // change mid-recording — setOverlayFields() -> reconcileTelemetryHold()
+        // with shouldHold already true — re-reports demand. Without this, newly
+        // enabling turn/seatbelt mid-clip would draw a field whose HAL read is
+        // still skipped (stale/dead). setOverlayFieldDemand is idempotent.
+        if (shouldHold) {
+            telemetryCollector.setOverlayFieldDemand(
+                "oem",
+                overlayFields.has(com.overdrive.app.telemetry.TelemetryFields.Field.TURN_SIGNALS),
+                overlayFields.hasAny(
+                    com.overdrive.app.telemetry.TelemetryFields.Field.SEATBELT_DRIVER,
+                    com.overdrive.app.telemetry.TelemetryFields.Field.SEATBELT_PASSENGER));
+        }
+        // Beams live on BydDataCollector's 5 s poll (not the telemetry collector)
+        // and that poll is otherwise automation-gated, so declare demand here or
+        // the beam glyphs stay frozen at their boot state. Outside the shouldHold
+        // branch so the demand is also CLEARED when this flow stops drawing.
+        com.overdrive.app.byd.BydDataCollector.setOverlayBeamDemand(
+            "oem",
+            shouldHold && overlayFields.hasAny(
+                com.overdrive.app.telemetry.TelemetryFields.Field.LOW_BEAM,
+                com.overdrive.app.telemetry.TelemetryFields.Field.HIGH_BEAM));
         if (shouldHold && !overlayPollingHeld) {
             telemetryCollector.setOverlayRecordingActive(true);
             telemetryCollector.startPolling();
             overlayPollingHeld = true;
         } else if (!shouldHold && overlayPollingHeld) {
+            telemetryCollector.clearOverlayFieldDemand("oem");
             telemetryCollector.setOverlayRecordingActive(false);
             telemetryCollector.stopPolling();
             overlayPollingHeld = false;
@@ -874,6 +940,18 @@ public class OemDashcamPipeline {
             if (shouldHold) r.startWorker(telemetryCollector);
             else r.stopWorker();
         }
+    }
+
+    /**
+     * Set the OEM dashcam overlay's field selection (its own independent list).
+     * {@code null} resets to the legacy default. Applied to the renderer + re-
+     * reported as demand on the next reconcile.
+     */
+    public void setOverlayFields(com.overdrive.app.telemetry.TelemetryFields fields) {
+        this.overlayFields = (fields != null)
+            ? fields
+            : com.overdrive.app.telemetry.TelemetryFields.legacyDefault();
+        reconcileTelemetryHold();
     }
 
     public boolean isOverlayEnabled() {
@@ -1181,7 +1259,12 @@ public class OemDashcamPipeline {
     }
 
     private void startThreads() {
-        glThread = new HandlerThread("OemDvr-GL", Process.THREAD_PRIORITY_FOREGROUND);
+        // Default priority (was FOREGROUND): this is a compute-bound GL render
+        // loop and, like the pano GL-RenderLoop, should not preempt the native
+        // head-unit UI on the shared SDM665. The wait-bound encoder drainer /
+        // disk writer keep FOREGROUND (they burn no CPU; priority only trims
+        // their wakeup latency).
+        glThread = new HandlerThread("OemDvr-GL", Process.THREAD_PRIORITY_DEFAULT);
         glThread.start();
         glHandler = new Handler(glThread.getLooper());
         // Dedicated thread for SurfaceTexture frame-available callbacks.
@@ -1274,14 +1357,22 @@ public class OemDashcamPipeline {
                         // fails on Adreno with EGL_BAD_MATCH on encoder
                         // input surfaces.
                         eglCore = EGLCore.createShared(parent, true);
+                        // Only NOW is cross-context sampling (view-6 streaming) valid.
+                        eglSharedWithPano = true;
                         logger.info("OEM EGL context created in shared group with pano (recordable)");
                     } catch (Throwable t) {
                         logger.warn("EGLCore.createShared failed (" + t.getMessage()
-                            + "); falling back to independent context");
+                            + "); falling back to independent context — RECORDING is fine, "
+                            + "but view-6 streaming needs a restart once pano is up");
                         eglCore = new EGLCore();
+                        eglSharedWithPano = false;
                     }
                 } else {
+                    // No parent (pano wasn't up yet, or recording-only bring-up):
+                    // independent context. Recording works; view-6 streaming does not
+                    // until this pipeline is restarted with pano's context as parent.
                     eglCore = new EGLCore();
+                    eglSharedWithPano = false;
                 }
                 encoderEglSurface = eglCore.createWindowSurface(encoderSurface);
                 dummySurface = eglCore.createPbufferSurface(1, 1);
@@ -1420,7 +1511,7 @@ public class OemDashcamPipeline {
 
         // Attach surface. We try the legacy addPreviewSurface(Surface, mode)
         // first because OEM dashcam ids on Seal/Han respond to mode=0
-        // (single-channel passthrough). DiLink 4 (USE_ESCO_SURFACE_TEXTURE_PATH)
+        // (single-channel passthrough). DiLink 4 (USE_OEM_SURFACE_TEXTURE_PATH)
         // pano uses addTexture(SurfaceTexture, idx) with idx=0 mosaic; for OEM
         // dashcam idx=0 is also "the only channel", so the same call works.
         boolean attached = false;
@@ -1883,14 +1974,14 @@ public class OemDashcamPipeline {
         // R8-A #1: detachFromPano runs OUTSIDE lifecycleLock to avoid a
         // potential deadlock cycle (OEM-lifecycleLock ↔ pano-streamLifecycleLock
         // ↔ pano-GL-handler-barrier). It only reads pano state and posts
-        // a no-op Runnable; nothing in it mutates OEM-instance state, so
-        // it doesn't need the OEM lock. By moving it out of the locked
-        // region we sidestep any future lock-ordering bug.
-        detachFromPano();
+        // a GL fence; nothing in it mutates OEM-instance state, so it
+        // doesn't need the OEM lock. By moving it out of the locked region
+        // we sidestep any future lock-ordering bug.
+        boolean panoGpuQuiesced = detachFromPano();
 
         lifecycleLock.lock();
         try {
-            stopInternalLocked(fromStartFailure);
+            stopInternalLocked(fromStartFailure, panoGpuQuiesced);
         } finally {
             lifecycleLock.unlock();
         }
@@ -1903,46 +1994,70 @@ public class OemDashcamPipeline {
      * in-flight pano drawFrame. Lock-free; called from stopInternal
      * before lifecycleLock acquisition (R8-A #1).
      */
-    private void detachFromPano() {
+    private boolean detachFromPano() {
         try {
             com.overdrive.app.surveillance.GpuSurveillancePipeline pano =
                 com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
-            if (pano == null) return;
-            boolean wasSampling = false;
-            try {
-                wasSampling = pano.isStreamingEnabled()
-                    && pano.getStreamViewMode() == 6;
-            } catch (Throwable ignored) {}
+            if (pano == null) return true;
             pano.reattachOwnStreamCallback();
-            if (wasSampling) {
-                com.overdrive.app.camera.PanoramicCameraGpu panoCam = pano.getCamera();
-                android.os.Handler glH = panoCam != null ? panoCam.getGlHandler() : null;
-                if (glH != null) {
-                    final java.util.concurrent.CountDownLatch barrier =
-                        new java.util.concurrent.CountDownLatch(1);
-                    if (glH.post(barrier::countDown)) {
-                        try { barrier.await(500, java.util.concurrent.TimeUnit.MILLISECONDS); }
-                        catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                        }
-                    }
-                }
+            final long fenceGeneration = pano.getPendingOemSourceFenceGeneration();
+            if (fenceGeneration == 0L) return true;
+            com.overdrive.app.camera.PanoramicCameraGpu panoCam = pano.getCamera();
+            android.os.Handler glH = panoCam != null ? panoCam.getGlHandler() : null;
+            if (glH == null) {
+                // No pano GL thread exists, so no pano draw can still sample
+                // this source. Mark the generation complete and release OEM.
+                pano.completeOemSourceFence(fenceGeneration);
+                return true;
             }
+            final java.util.concurrent.CountDownLatch barrier =
+                new java.util.concurrent.CountDownLatch(1);
+            final java.util.concurrent.atomic.AtomicBoolean glFinished =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+            if (!glH.post(() -> {
+                try {
+                    // Handler ordering alone proves only CPU ordering. Finish
+                    // all preceding pano draws before OEM can delete the
+                    // shared EXTERNAL_OES texture from its context.
+                    GLES20.glFinish();
+                    glFinished.set(true);
+                } finally {
+                    barrier.countDown();
+                }
+            })) {
+                logger.warn("stop: pano GL fence post rejected; preserving shared texture");
+                return false;
+            }
+            try {
+                if (!barrier.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    logger.warn("stop: pano GL fence timed out; preserving shared texture");
+                    return false;
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            if (glFinished.get()) {
+                pano.completeOemSourceFence(fenceGeneration);
+                return true;
+            }
+            return false;
         } catch (Throwable t) {
             logger.warn("stop: pano reattach failed: " + t.getMessage());
+            return false;
         }
     }
 
-    private void stopInternalLocked(boolean fromStartFailure) {
+    private void stopInternalLocked(boolean fromStartFailure, boolean panoGpuQuiesced) {
         // Best-effort tear-down. Errors during stop are logged and swallowed
         // so we never block a daemon shutdown.
         //
         // detachFromPano() ran in stopInternal BEFORE we acquired
         // lifecycleLock — it's lock-free and just reattaches pano's
-        // stream sink + waits one frame on pano's GL handler. By the
-        // time we reach this method, pano is no longer sampling our
-        // EXTERNAL_OES texture, so the glDeleteTextures inside the GL
-        // Runnable below is safe.
+        // stream sink + finishes its preceding pano GL work. By the time we
+        // reach this method, pano is no longer sampling our EXTERNAL_OES
+        // texture. If that fence timed out, preserve the OEM GL objects
+        // rather than deleting a texture that may still be in use.
         try {
             if (recording.getAndSet(false) && encoder != null) {
                 encoder.stopEventRecording(true, 0);
@@ -2001,7 +2116,7 @@ public class OemDashcamPipeline {
         // unsafely so the surfaces / texture release with the process at
         // worst on next start (or full daemon kill, if ever).
         boolean glReleased = false;
-        if (glHandler != null) {
+        if (panoGpuQuiesced && glHandler != null) {
             try {
                 runOnGlThreadAndWait(() -> {
                     // Release SurfaceTexture + Surface FIRST on the GL
@@ -2099,7 +2214,7 @@ public class OemDashcamPipeline {
                     if (cameraSurfaceLocal != null) cameraSurfaceLocal.release();
                 } catch (Throwable wedgeIgnoredB) {}
             }
-        } else {
+        } else if (panoGpuQuiesced) {
             // No GL handler at all (init aborted before glThread came up).
             // Release the ST/Surface here directly — no GL thread to race.
             try {
@@ -2111,10 +2226,16 @@ public class OemDashcamPipeline {
             try {
                 if (cameraSurfaceLocal != null) cameraSurfaceLocal.release();
             } catch (Throwable noGlIgnoredB) {}
+        } else {
+            logger.warn("stop: preserving OEM GL resources after an unconfirmed pano fence");
         }
         encoderEglSurface = null;
         dummySurface = null;
         cameraTextureId = 0;
+        // The share-group property belongs to the context we just destroyed. Clear it
+        // so a restarted pipeline can't inherit a stale "shared" claim and let
+        // isRouteReady() green-light a cross-context bind against a dead texture.
+        eglSharedWithPano = false;
         passthroughProgram = 0;
         overlayTextureId = 0;
         overlayProgramId = 0;

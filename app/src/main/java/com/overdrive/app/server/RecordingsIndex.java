@@ -16,9 +16,12 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -87,8 +90,11 @@ public final class RecordingsIndex {
     // FILE_LOCK=SOCKET: process-level lock via a localhost socket, NOT
     // suitable for cross-UID coordination. App UID never opens this DB
     // directly; it reads via /api/recordings.
+    // AUTO_COMPACT_FILL_RATE=50: idle-CPU tuning shared by all seven H2 stores
+    // (see SocHistoryDatabase.JDBC_URL for the full rationale).
     private static final String JDBC_URL = "jdbc:h2:file:" + DB_PATH +
-            ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE";
+            ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE" +
+            ";AUTO_COMPACT_FILL_RATE=50";
 
     // Filename patterns mirror RecordingsApiHandler exactly. Kept in sync
     // there too because the parser is the single point of truth — any
@@ -134,6 +140,144 @@ public final class RecordingsIndex {
     private Connection connection;
     private volatile boolean initialized = false;
 
+    // Set by close() so a concurrent ensureOpen() on an HTTP worker can't
+    // resurrect the DB during daemon teardown and orphan the lock file.
+    private volatile boolean shuttingDown = false;
+
+    // How many times H2 closed the store under us and ensureOpen() re-opened
+    // it. Surfaced on /api/recordings/stats for field diagnosis — a nonzero
+    // value means something is interrupting the DB write threads.
+    private int reconnectCount = 0;
+
+    // All asynchronous repair sources converge here. A burst before execution
+    // becomes one pass; requests arriving during that pass become one follow-up.
+    private final java.util.concurrent.ConcurrentLinkedQueue<String> reconcileReasons =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final CoalescingTaskRunner reconcileRequests;
+    // Synchronous warmup reconciliation and asynchronous repair must not walk
+    // the same FUSE roots concurrently.
+    private final Object reconcileExecutionLock = new Object();
+
+    // ---------------- queryStats() memo ----------------
+    //
+    // WHY: queryStats() is a full-table `GROUP BY type` with SUM(size_bytes).
+    // No index covers the SUM (idx_rec_type_ts is (type, ts_ms DESC)), so H2
+    // reads the base row of EVERY recording per call — O(N) in library size.
+    // Three clients poll it concurrently (recording.js + surveillance.js at
+    // 10s, events.js/RecordingsFragment warming poll at 2-10s), so a large
+    // library pays several full scans every 10s forever while a page is open.
+    //
+    // The memo is exact rather than time-based-stale: it is invalidated by
+    // every mutation path (upsertRow / remove / reconcile's bulk delete), so a
+    // hit can only be served when nothing has changed the table since the
+    // scan. That keeps the "a just-finalized clip shows up on the very next
+    // poll" property the storage card depends on, and it means we do NOT need
+    // to reason about a TTL vs poll-cadence interaction (the mistake that
+    // makes StorageManager's 5s CATEGORY_STAT_CACHE_MS miss on every 10s poll).
+    //
+    // Guarded by the singleton monitor — every reader/writer below is already
+    // synchronized, so no extra lock is needed and none is held across I/O.
+    private Stats cachedStats = null;
+    private long cachedStatsTodayStart = 0L;
+
+    /** Drop the {@link #queryStats()} memo. Call from every path that changes
+     *  the recordings table. Cheap — one field write. */
+    private void invalidateStatsCache() {
+        cachedStats = null;
+    }
+
+    // ---------------- removal tombstones ----------------
+    //
+    // WHY: upsert(File) parses OUTSIDE the monitor (see its javadoc), so the
+    // check-then-write is no longer atomic against a concurrent remove(). Every
+    // delete path deletes the FILE FIRST and calls remove() second
+    // (StorageManager's reaper, RecordingsApiHandler.deleteRecording), so a
+    // parse parked ~30ms on a FUSE sidecar read can wake up AFTER the delete and
+    // MERGE the row back in — a ghost row for a file that no longer exists.
+    // That resurrects exactly the failure remove()'s own comment warns about:
+    // playback 404s, and queryStats() counts the dead clip's bytes (inflating
+    // the storage card) until the next reconcile, up to an HOUR later.
+    //
+    // Fix: remove() records the filename against a monotonically increasing
+    // sequence. upsert() samples the sequence BEFORE parsing; upsertRow() then
+    // refuses the MERGE if that filename was removed after the sample. Costs one
+    // map lookup under the monitor — no extra stat()/FUSE I/O, which is the
+    // whole point of not re-checking File.isFile() here.
+    //
+    // Recorded UNCONDITIONALLY, even when the DELETE affected 0 rows: the
+    // dangerous interleaving is precisely the one where the in-flight upsert
+    // hasn't MERGEd yet, so there is no row to delete at that moment.
+    //
+    // A tombstone is NOT a permanent block on the filename. The gate is a
+    // strict `removedAt > seqSampled`, so it only rejects parses that STARTED
+    // BEFORE the removal. A genuine later re-add of the same name (manual replay
+    // re-record, a restored file, reconcile finding it back on disk) samples a
+    // sequence at or after the tombstone and proceeds normally. That is why this
+    // is a sequence comparison and not a "was it ever deleted" set.
+    //
+    // All four fields/methods here are touched only under the singleton monitor
+    // (remove(), upsertRow(), currentRemovalSeq() are all synchronized), so the
+    // plain long and HashMap need no extra synchronization.
+    private long removalSeq = 0L;
+    private final java.util.Map<String, Long> removalTombstones = new java.util.HashMap<>();
+    /** Sentinel for callers with no parse window to protect (warmup, which
+     *  produces Rows on its parser pool and keeps its pre-existing semantics). */
+    private static final long NO_REMOVAL_GATE = -1L;
+    // Keep the map bounded. Parse windows are milliseconds; entries this far
+    // back cannot have an in-flight parse still referencing them.
+    private static final int TOMBSTONE_SOFT_CAP = 2048;
+    private static final int TOMBSTONE_KEEP = 1024;
+
+    /** Sample the removal sequence. Taken before an unsynchronized parse. */
+    private synchronized long currentRemovalSeq() {
+        return removalSeq;
+    }
+
+    /** Record that {@code filename} was removed, and prune old entries. */
+    private void noteRemoval(String filename) {
+        removalTombstones.put(filename, ++removalSeq);
+        if (removalTombstones.size() > TOMBSTONE_SOFT_CAP) {
+            long cutoff = removalSeq - TOMBSTONE_KEEP;
+            removalTombstones.entrySet().removeIf(e -> e.getValue() <= cutoff);
+        }
+    }
+
+    /** True when {@code filename} was removed after {@code seqSampled}, i.e. a
+     *  delete landed while the caller was parsing and its Row is now stale. */
+    private boolean removedSince(String filename, long seqSampled) {
+        if (seqSampled == NO_REMOVAL_GATE) return false;
+        Long removedAt = removalTombstones.get(filename);
+        return removedAt != null && removedAt > seqSampled;
+    }
+
+    // Timestamp of the last reopen ATTEMPT (successful or not); throttles
+    // retries so a sick store can't trigger a fresh getConnection() +
+    // createSchema() on every polled HTTP request. 0 = never attempted.
+    private long lastReopenAttemptAtMs = 0L;
+    private static final long REOPEN_COOLDOWN_MS = 10_000L;
+
+    // Latched true the first time init() opens the DB successfully. This is
+    // what licenses ensureOpen() to heal a dead connection: it distinguishes
+    // "this index was never initialized, don't touch the file" from "the
+    // index worked before and H2 closed it under us, so re-open it". Without
+    // it, a failed reopen (which clears `initialized`) would permanently
+    // disable self-healing.
+    private volatile boolean everInitialized = false;
+
+    // Latched when a statement failed with a store-level error AND the
+    // subsequent reopen+retry also failed. Cleared by the next statement that
+    // completes. This is what keeps the honesty invariant when the store is
+    // broken in a way Connection.isClosed() cannot see (corrupt page / IO
+    // error / MVStore panic): without it the connection still looks open, so
+    // the API would serve the empty failureValue as an authoritative 200.
+    private volatile boolean storeUnhealthy = false;
+
+    // Latched when init() exhausted its retries. Distinguishes "never tried
+    // yet" (cold boot — answer normally, the client retry converges) from
+    // "tried and permanently failed" (must be reported as unavailable, not as
+    // an empty library).
+    private volatile boolean initFailedPermanently = false;
+
     // Warmup state — single source of truth for whether the API should
     // return {warming: true} on /api/recordings until the first scan
     // completes. Volatile reads are fine; only one writer (the warmup
@@ -143,7 +287,13 @@ public final class RecordingsIndex {
     private final AtomicInteger warmupTotal = new AtomicInteger(0);
     private final AtomicInteger warmupDone = new AtomicInteger(0);
 
-    private RecordingsIndex() {}
+    private RecordingsIndex() {
+        reconcileRequests = new CoalescingTaskRunner(command -> {
+            Thread thread = new Thread(command, "RecordingsIndexReconcile");
+            thread.setDaemon(true);
+            thread.start();
+        }, this::runRequestedReconcile);
+    }
 
     // =================================================================
     // Lifecycle
@@ -156,6 +306,14 @@ public final class RecordingsIndex {
      */
     public synchronized boolean init() {
         if (initialized) return true;
+        // A fresh init() is an explicit "come back up", so clear the shutdown
+        // latch — but only on the path that actually opens the DB, and only
+        // after the already-initialized short-circuit above. Clearing it
+        // unconditionally would let any init() caller re-arm self-healing
+        // during teardown (close() runs at CameraDaemon:2100 while the HTTP
+        // server is still accepting requests), re-acquiring the lock file and
+        // orphaning a .lock.db that blocks the next daemon boot.
+        shuttingDown = false;
         logger.info("Initializing RecordingsIndex at " + DB_PATH);
 
         try {
@@ -182,6 +340,7 @@ public final class RecordingsIndex {
                 }
                 createSchema();
                 initialized = true;
+                everInitialized = true;
                 logger.info("RecordingsIndex initialized (schema v" + SCHEMA_VERSION + ")");
                 return true;
             } catch (Exception e) {
@@ -227,20 +386,311 @@ public final class RecordingsIndex {
                     // No sleep needed — this isn't a transient contention error.
                 } else {
                     logger.error("Failed to init RecordingsIndex: " + msg, e);
+                    // Permanent: the API must report the index as unavailable
+                    // rather than serving an empty list as authoritative.
+                    // There is no direct-FS listing fallback in the handler
+                    // anymore, so a silent empty response here would look
+                    // exactly like "you have no recordings".
+                    initFailedPermanently = true;
                     return false;
                 }
             }
         }
+        // Retries exhausted without success — same reasoning as above.
+        initFailedPermanently = true;
         return false;
     }
 
     public synchronized void close() {
+        // Mark the shutdown intent BEFORE dropping the connection so a
+        // concurrent ensureOpen() on an HTTP worker can't race in and
+        // re-open the DB while we're tearing down — that would re-acquire
+        // the lock file just before JVM exit and orphan a .lock.db that
+        // blocks the next daemon boot. Same defense as
+        // SocHistoryDatabase.reconnect()'s !isRunning guard.
+        shuttingDown = true;
         if (connection != null) {
             try { connection.close(); }
             catch (Exception e) { logger.warn("Index close failed: " + e.getMessage()); }
             connection = null;
         }
         initialized = false;
+    }
+
+    /**
+     * Ensure the shared JDBC connection is alive, re-opening it if H2 has
+     * closed it underneath us. Returns true when the DB is usable.
+     *
+     * <p><b>Why this exists:</b> {@code initialized} only tracks whether
+     * {@link #init()} succeeded — it is NOT a liveness signal. H2 can close
+     * the store while the daemon keeps running: any thread interrupt during
+     * an MVStore write surfaces as {@code ClosedByInterruptException} on the
+     * backing {@link java.nio.channels.FileChannel}, and H2 responds by
+     * closing the whole database. The flag stays true, so every subsequent
+     * query sailed past the {@code if (!initialized)} guards straight into
+     * "The database has been closed [90098-224]".
+     *
+     * <p>Observed in the field (log_4BWJLHG3, 2026-07-25): the connection
+     * died at 19:50:53 and every recordings query failed for the following
+     * two hours of daemon uptime — 550 errors across queryRecordings /
+     * queryCount / queryStats / upsertRow / remove / reconcile. Because the
+     * query methods swallow the failure and return an empty list, the API
+     * answered HTTP 200 {@code {success:true, recordings:[], totalCount:0}}
+     * and events.html rendered "no recordings" while the clips sat on disk.
+     * 13 clips (3 of them sentry events) were saved but never indexed.
+     *
+     * <p>Reconnecting is safe and cheap: the H2 file is the same, the store
+     * re-opens with the existing rows, and this is the only opener of that
+     * DB inside the daemon. On a wiped/corrupt store {@link #init()}'s
+     * recovery path still applies on the next daemon boot.
+     *
+     * <p>Callers must hold this object's monitor (every public entry point
+     * is {@code synchronized}); the monitor serializes the connection swap
+     * against in-flight PreparedStatements, matching
+     * {@link com.overdrive.app.trips.TripDatabase#ensureConnection()}.
+     */
+    private synchronized boolean ensureOpen() {
+        if (shuttingDown) return false;
+        // Never opened at all (init() not run yet, or it failed outright):
+        // do NOT create the DB here. Opening it from an arbitrary HTTP worker
+        // would race the daemon's own init()/warmup sequencing.
+        if (!everInitialized) return false;
+        // A latched store-level failure means the connection is open but the
+        // store behind it is broken. Try a reopen (throttled) rather than
+        // trusting isClosed(), which cannot see this class of failure.
+        if (storeUnhealthy) return reopen("unhealthy store");
+        try {
+            if (connection != null && !connection.isClosed()) return true;
+        } catch (Exception e) {
+            // isClosed() itself failed — treat as dead and re-open below.
+            logger.debug("ensureOpen: isClosed() probe failed: " + e.getMessage());
+        }
+        return reopen("connection closed");
+    }
+
+    /**
+     * Unconditionally drop and re-open the connection. Used both by
+     * {@link #ensureOpen()} and — critically — by the closed-store retry
+     * path, because H2 does NOT reliably report a dead store through
+     * {@link Connection#isClosed()}: when the MVStore panics, the JDBC
+     * session can still consider itself open while every statement throws
+     * 90098. An {@code isClosed()}-only check would therefore never heal the
+     * exact failure this class hit in the field, so the recovery trigger is
+     * the error from the statement, not the connection's self-report.
+     *
+     * <p>Throttled by {@link #REOPEN_COOLDOWN_MS}: if the store is genuinely
+     * unopenable (file deleted, disk full) we must not attempt a fresh
+     * {@code getConnection()} on every HTTP request — the web UI polls every
+     * ~1.5 s during a failure and each failed open does real file I/O.
+     * Between attempts callers fail fast and the API reports
+     * {@code indexUnavailable}.
+     *
+     * @return true when the connection is usable afterwards.
+     */
+    private synchronized boolean reopen(String reason) {
+        if (shuttingDown) return false;
+        long now = System.currentTimeMillis();
+        // Cooldown applies to ANY recent reopen attempt, successful or not.
+        // Gating on failures alone was useless against the very failure mode
+        // this class hit: a store that re-opens fine but then fails every
+        // statement would do one full close+open+createSchema PER statement,
+        // unbounded. One attempt per cooldown window bounds that to a trickle
+        // while still healing a genuinely transient close within seconds.
+        if (lastReopenAttemptAtMs > 0 && (now - lastReopenAttemptAtMs) < REOPEN_COOLDOWN_MS) {
+            return false;
+        }
+        lastReopenAttemptAtMs = now;
+        try {
+            if (connection != null) {
+                try { connection.close(); } catch (Exception ignored) { /* already dead */ }
+                connection = null;
+            }
+            connection = DriverManager.getConnection(JDBC_URL, "sa", "");
+            try (Statement stmt = connection.createStatement()) {
+                stmt.execute("SET CACHE_SIZE 8192");
+            }
+            // Re-assert the schema: if the store was wiped (corrupt-recovery
+            // on a previous open, or an external delete of the .mv.db) the
+            // reopened DB is empty and every statement would fail on a
+            // missing table. createSchema() is idempotent — it is already run
+            // on every normal open.
+            createSchema();
+            initialized = true;
+            // Fresh connection + asserted schema: clear the unhealthy latch so
+            // the next statement is trusted again. If the store is still
+            // broken, withRetry re-latches it on the next failure.
+            storeUnhealthy = false;
+            reconnectCount++;
+            logger.warn("Recordings index re-opened after " + reason
+                    + " (reconnect #" + reconnectCount + "). Kicking a reconcile to"
+                    + " re-index anything missed while it was down.");
+            // The dead window silently dropped upserts/removes, so the index
+            // now drifts from disk. Heal it in the background.
+            requestReconcile("store-reconnect");
+            return true;
+        } catch (Exception e) {
+            // CRITICAL: drop the half-open connection. getConnection() may
+            // have succeeded and createSchema() then failed (e.g. a wiped
+            // store, or the store dying again mid-DDL). Leaving that live
+            // handle in the field would make ensureOpen() see a non-null,
+            // non-closed connection and report the index HEALTHY forever,
+            // while every statement failed with "Table RECORDINGS not found"
+            // — which is NOT a closed-store error, so withRetry would return
+            // empty results and /api/recordings would go back to answering
+            // 200 {recordings:[]}. That is exactly the bug being fixed, so
+            // the invariant is: a failed reopen leaves connection == null.
+            if (connection != null) {
+                try { connection.close(); } catch (Exception ignored) { /* best-effort */ }
+                connection = null;
+            }
+            initialized = false;
+            logger.error("Failed to re-open recordings index (" + reason + "): "
+                    + e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * Run one SQL body against the index, healing a closed store once.
+     *
+     * <p>Every read/write path funnels through here so the recovery
+     * behaviour is identical everywhere: fail fast when the index is
+     * unavailable, and when a statement dies specifically because H2 closed
+     * the database, re-open and run the body exactly once more.
+     *
+     * <p>Bodies must be self-contained (build and return their own result
+     * rather than mutating a captured collection) so the retry cannot
+     * double-append into a partially-filled result.
+     */
+    private synchronized <T> T withRetry(String op, T failureValue, SqlBody<T> body) {
+        if (!ensureOpen()) return failureValue;
+        try {
+            T result = body.run();
+            storeUnhealthy = false;   // a statement completed — store is alive
+            return result;
+        } catch (Exception e) {
+            if (isClosedStoreError(e)) {
+                logger.warn(op + ": store was closed mid-statement — reconnecting");
+                if (reopen("closed store during " + op)) {
+                    try {
+                        T result = body.run();
+                        storeUnhealthy = false;
+                        return result;
+                    } catch (Exception e2) {
+                        // Reconnected and STILL failing: the store is broken
+                        // in a way a reopen can't fix. Latch it so
+                        // isAvailable() reports the index down instead of
+                        // letting the caller's empty failureValue be served as
+                        // an authoritative 200.
+                        storeUnhealthy = true;
+                        logger.error(op + " failed after reconnect: " + e2.getMessage(), e2);
+                        return failureValue;
+                    }
+                }
+                storeUnhealthy = true;
+                return failureValue;
+            }
+            // Log the throwable, not just getMessage(): the stack trace is
+            // what identifies WHY H2 closed the store (e.g. a thread
+            // interrupt surfacing as ClosedByInterruptException under the
+            // MVStore write). The message-only logging in the original code
+            // made the field failure undiagnosable.
+            logger.error(op + " failed: " + e.getMessage(), e);
+            return failureValue;
+        }
+    }
+
+    /** SQL body for {@link #withRetry}. */
+    private interface SqlBody<T> {
+        T run() throws Exception;
+    }
+
+    /**
+     * Truncate to at most {@code max} chars so a value can never exceed its
+     * VARCHAR column width. An over-long value fails the whole MERGE with
+     * VALUE_TOO_LONG, which would drop the clip from the index entirely — a
+     * truncated place label is strictly better than an invisible recording.
+     */
+    private static String clamp(String s, int max) {
+        if (s == null) return null;
+        return s.length() <= max ? s : s.substring(0, max);
+    }
+
+    /**
+     * Queue a background reconcile without stacking FUSE walks.
+     *
+     * @return true when the request was queued or merged into a running worker;
+     *         false during shutdown or when the worker could not be started.
+     */
+    public boolean requestReconcile(String reason) {
+        if (shuttingDown) return false;
+        if (reason != null && !reason.isEmpty()) reconcileReasons.offer(reason);
+        try {
+            reconcileRequests.request();
+            return true;
+        } catch (Throwable failure) {
+            logger.warn("Could not schedule recordings reconcile (" + reason + "): "
+                    + failure.getMessage());
+            // The runner keeps its pending bit and the reason remains queued.
+            // A later request retries scheduling without losing diagnostics.
+            return false;
+        }
+    }
+
+    private void runRequestedReconcile() {
+        StringBuilder reasons = new StringBuilder();
+        String reason;
+        while ((reason = reconcileReasons.poll()) != null) {
+            if (reasons.length() > 0) reasons.append(',');
+            reasons.append(reason);
+        }
+        if (reasons.length() > 0) {
+            logger.debug("Running requested reconcile: " + reasons);
+        }
+        try {
+            reconcile();
+        } catch (Throwable failure) {
+            logger.warn("Requested reconcile failed: " + failure.getMessage());
+        }
+    }
+
+    /**
+     * True when the index is currently usable for queries. Distinct from
+     * {@link #warmupState()}: warmup means "populating, ask again soon",
+     * whereas this returning false means "the DB is down, the empty result
+     * you are about to get is NOT authoritative." The API surfaces it as
+     * {@code indexUnavailable} so clients can show an error instead of a
+     * plausible-looking empty library.
+     */
+    public synchronized boolean isAvailable() {
+        return ensureOpen();
+    }
+
+    /**
+     * True when the index should be reported to clients as unavailable, i.e.
+     * an empty result from it would be a lie.
+     *
+     * <p>Tri-state, so a cold boot isn't mistaken for a failure:
+     * <ul>
+     *   <li>opened before but not usable now → unavailable (H2 closed or broke
+     *       the store under us).
+     *   <li>{@link #init()} tried and permanently failed → unavailable. There
+     *       is no direct-FS listing fallback in the API anymore, so answering
+     *       "empty" here would read as "you have no recordings" forever.
+     *   <li>never tried yet (daemon still starting — the HTTP server accepts
+     *       requests before the index init thread runs) → NOT unavailable;
+     *       answer normally so the existing warming / repair-on-read retry
+     *       path converges without a manual reload.
+     * </ul>
+     */
+    public synchronized boolean isUnavailableForClients() {
+        if (isAvailable()) return false;
+        return everInitialized || initFailedPermanently;
+    }
+
+    /** Number of times H2 closed the store and we re-opened it. Diagnostics. */
+    public synchronized int reconnectCount() {
+        return reconnectCount;
     }
 
     /**
@@ -369,6 +819,10 @@ public final class RecordingsIndex {
             stmt.execute("UPDATE recordings SET type = 'replay'"
                     + " WHERE type <> 'replay'"
                     + " AND filename LIKE 'replay\\_%' ESCAPE '\\'");
+            // Rows moved between type buckets — drop any queryStats() memo
+            // carried across a reopen (this runs on every open, including the
+            // mid-session reconnect path).
+            invalidateStatsCache();
 
             // Indexes — covering most common access patterns.
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_rec_ts ON recordings(ts_ms DESC)");
@@ -414,16 +868,42 @@ public final class RecordingsIndex {
      *   <li>The API handler's repair-on-read path.
      * </ul>
      *
-     * @return true if the row was inserted/updated, false on parse failure.
+     * <p>NOT {@code synchronized}: {@link #parse} costs ~30ms/file (sidecar
+     * JSON read + metadata parse on a FUSE mount) and MUST run outside the
+     * singleton monitor. Holding it across the parse is what made
+     * /api/recordings/stats slow on large libraries — reconcile() calls this
+     * per unindexed file, so a K-file drift chopped the monitor into K windows
+     * of ~30ms and every concurrent queryStats/queryRecordings/queryDates
+     * request queued behind them. That defeated the explicit intent documented
+    * in reconcile(): filesystem fingerprinting stays outside the monitor so
+    * FUSE metadata stalls cannot serialize every query behind a parse.
+     *
+     * <p>Only the short MERGE ({@link #upsertRow}) is synchronized — the same
+     * split the warmup pipeline already uses (4 unsynchronized parser threads
+     * feeding one writer that calls upsertRow). ensureOpen() is left to
+     * upsertRow's own withRetry: probing liveness here would take and release
+     * the monitor for no benefit, since the connection can close between that
+     * probe and the MERGE anyway.
+     *
+     * <p>Dropping {@code synchronized} also dropped the ATOMICITY of
+     * check-then-write against a concurrent {@link #remove}, which would let a
+     * parse that started before a delete resurrect the row afterwards. The
+     * removal-sequence sample below restores it without adding any I/O under the
+     * monitor — see the tombstone block near the top of this class.
+     *
+     * @return true if the row was inserted/updated, false on parse failure or
+     *         when the file was removed while we were parsing.
      */
-    public synchronized boolean upsert(File mp4) {
-        if (!initialized) return false;
+    public boolean upsert(File mp4) {
         if (mp4 == null || !mp4.isFile() || !mp4.canRead()) return false;
         if (!mp4.getName().endsWith(".mp4")) return false;
 
-        Row row = parse(mp4);
+        // Sample BEFORE parsing so any remove() landing during the parse is
+        // detected by upsertRow and the stale MERGE is refused.
+        long seq = currentRemovalSeq();
+        Row row = parse(mp4);   // OUTSIDE the monitor — see above.
         if (row == null) return false;
-        return upsertRow(row);
+        return upsertRow(row, seq);
     }
 
     /**
@@ -431,45 +911,138 @@ public final class RecordingsIndex {
      * pipeline (parser pool produces Rows, single writer drains them) so
      * the parse cost runs concurrently while writes stay serialised on
      * one JDBC connection.
+     *
+     * <p>Warmup keeps the ungated behaviour it always had: it runs before the
+     * index is serving and its Rows aren't racing user-driven deletes.
      */
     synchronized boolean upsertRow(Row row) {
-        if (!initialized || row == null) return false;
-        String sql =
-            "MERGE INTO recordings KEY(filename) VALUES (" +
-            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setString(1, row.filename);
-            ps.setString(2, row.absPath);
-            ps.setString(3, row.type);
-            ps.setInt(4, row.cameraId);
-            ps.setLong(5, row.tsMs);
-            ps.setLong(6, row.sizeBytes);
-            ps.setLong(7, row.mp4Mtime);
-            ps.setLong(8, row.sidecarMtime);
-            ps.setInt(9, row.schemaVersion);
-            setNullableString(ps, 10, row.peakSeverity);
-            setNullableString(ps, 11, row.peakProximity);
-            ps.setInt(12, row.personCount);
-            ps.setInt(13, row.vehicleCount);
-            ps.setInt(14, row.bikeCount);
-            ps.setInt(15, row.animalCount);
-            setNullableString(ps, 16, row.heroThumb);
-            setNullableString(ps, 17, row.actorClasses);
-            setNullableString(ps, 18, row.placeShort);
-            setNullableString(ps, 19, row.placeMedium);
-            setNullableString(ps, 20, row.placeDisplay);
-            setNullableString(ps, 21, row.placeCountry);
-            setNullableString(ps, 22, row.placeSource);
-            setNullableDouble(ps, 23, row.startLat);
-            setNullableDouble(ps, 24, row.startLng);
-            ps.setString(25, row.ymd);
-            setNullableString(ps, 26, row.storage);
-            ps.executeUpdate();
-            return true;
-        } catch (Exception e) {
-            logger.warn("upsertRow failed for " + row.filename + ": " + e.getMessage());
+        return upsertRow(row, NO_REMOVAL_GATE);
+    }
+
+    /**
+     * @param seqSampled removal sequence sampled before the caller's parse, or
+     *                   {@link #NO_REMOVAL_GATE} to skip the staleness check.
+     */
+    synchronized boolean upsertRow(Row row, long seqSampled) {
+        if (row == null) return false;
+        // A delete landed while the caller was parsing: the file is already gone
+        // from disk, so MERGEing this Row would create a ghost row that 404s on
+        // playback and inflates the storage card until the next reconcile.
+        if (removedSince(row.filename, seqSampled)) {
+            logger.debug("upsertRow: dropping stale row for removed " + row.filename);
             return false;
         }
+        // Writes are the path where a silent failure is permanent: a dropped
+        // upsert means the clip exists on disk but never appears in
+        // events.html until some later reconcile happens to catch it. So a
+        // closed store here is reconnected and the MERGE retried once.
+        final Row r = row;
+        return withRetry("upsertRow(" + row.filename + ")", Boolean.FALSE, () -> {
+            String sql =
+                "MERGE INTO recordings KEY(filename) VALUES (" +
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setString(1, r.filename);
+                ps.setString(2, r.absPath);
+                ps.setString(3, r.type);
+                ps.setInt(4, r.cameraId);
+                ps.setLong(5, r.tsMs);
+                ps.setLong(6, r.sizeBytes);
+                ps.setLong(7, r.mp4Mtime);
+                ps.setLong(8, r.sidecarMtime);
+                ps.setInt(9, r.schemaVersion);
+                setNullableString(ps, 10, r.peakSeverity);
+                setNullableString(ps, 11, r.peakProximity);
+                ps.setInt(12, r.personCount);
+                ps.setInt(13, r.vehicleCount);
+                ps.setInt(14, r.bikeCount);
+                ps.setInt(15, r.animalCount);
+                setNullableString(ps, 16, r.heroThumb);
+                setNullableString(ps, 17, r.actorClasses);
+                setNullableString(ps, 18, r.placeShort);
+                setNullableString(ps, 19, r.placeMedium);
+                setNullableString(ps, 20, r.placeDisplay);
+                setNullableString(ps, 21, r.placeCountry);
+                setNullableString(ps, 22, r.placeSource);
+                setNullableDouble(ps, 23, r.startLat);
+                setNullableDouble(ps, 24, r.startLng);
+                ps.setString(25, r.ymd);
+                setNullableString(ps, 26, r.storage);
+                ps.executeUpdate();
+                invalidateStatsCache();   // row counts/bytes changed
+                return Boolean.TRUE;
+            }
+        });
+    }
+
+    /**
+     * True when the exception means the store itself is unusable and the right
+     * response is "drop this connection and re-open", rather than a normal SQL
+     * error (constraint violation, syntax, bad value) that a reconnect cannot
+     * help.
+     *
+     * <p>The code set matters and must NOT be narrowed to 90098 alone. H2
+     * 2.2.224's {@code Store.convertMVStoreException} maps MVStore failures
+     * onto several distinct SQL codes — only {@code ERROR_CLOSED} becomes
+     * 90098 (DATABASE_IS_CLOSED); a corrupt page becomes 90030
+     * (FILE_CORRUPTED), an IO failure becomes 90028 (IO_EXCEPTION), and
+     * anything unclassified becomes 50000 (GENERAL_ERROR). Those other codes
+     * leave {@code Connection.isClosed()} returning false (it is a pure
+     * session-state field check, not a store probe), so without matching them
+     * here {@code ensureOpen()} would keep reporting the index healthy while
+     * every statement failed — the original silent-empty-library bug wearing a
+     * different error code.
+     *
+     * <p>90007 (OBJECT_CLOSED) is included for a statement/result closed under
+     * us, and "Table ... not found" (42S02/42102) because a wiped store
+     * re-opens as an empty DB whose missing tables are fixed by the
+     * {@code createSchema()} inside {@link #reopen}.
+     */
+    private static boolean isClosedStoreError(Exception e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            // Prefer the numeric error code. Substring-matching the message is
+            // NOT safe here: H2 echoes both the offending bound value and the
+            // full SQL text into the message, so a clause like "50000" also
+            // matches a VALUE_TOO_LONG (22001) raised by a legitimate place
+            // name such as "50000 Kuala Lumpur, Jalan …" overflowing
+            // place_display VARCHAR(256). That would tear down a perfectly
+            // healthy connection and spawn a reconcile once per cooldown
+            // window, forever, over one long string.
+            if (t instanceof java.sql.SQLException) {
+                switch (((java.sql.SQLException) t).getErrorCode()) {
+                    case 90098:   // DATABASE_IS_CLOSED — the field failure
+                    case 90007:   // OBJECT_CLOSED
+                    case 90030:   // FILE_CORRUPTED (MVStore corrupt page)
+                    case 90028:   // IO_EXCEPTION (MVStore read/write failed)
+                    case 50000:   // GENERAL_ERROR — MVStore panic lands here
+                    case 90097:   // DATABASE_IS_READ_ONLY — writes silently fail
+                    // Store was wiped/recreated and re-opened empty: the tables
+                    // are gone. 42102/42103/42104 are the TABLE/VIEW-not-found
+                    // family; an emptied .mv.db reports 42104 specifically, so
+                    // matching only 42102 would leave that case unhealed and
+                    // reproduce the original permanent-empty-library bug.
+                    case 42102:
+                    case 42103:
+                    case 42104:
+                        return true;
+                    default:
+                        break;    // fall through to the textual checks below
+                }
+            }
+            // Textual fallbacks for non-SQLException wrappers (e.g. a raw
+            // MVStoreException escaping outside the JDBC translation layer).
+            // Kept deliberately specific — no bare numeric substrings, which
+            // can collide with user data echoed into the message.
+            String m = t.getMessage();
+            if (m != null && (m.contains("database has been closed")
+                    || m.contains("Database is already closed")
+                    || m.contains("object is already closed")
+                    || m.contains("MVStoreException"))) {
+                return true;
+            }
+            if (t.getCause() == t) break;
+        }
+        return false;
     }
 
     /**
@@ -477,15 +1050,66 @@ public final class RecordingsIndex {
      * No-op when the filename isn't present.
      */
     public synchronized boolean remove(String filename) {
-        if (!initialized || filename == null || filename.isEmpty()) return false;
-        try (PreparedStatement ps = connection.prepareStatement(
-                "DELETE FROM recordings WHERE filename = ?")) {
-            ps.setString(1, filename);
-            return ps.executeUpdate() > 0;
-        } catch (Exception e) {
-            logger.warn("remove failed for " + filename + ": " + e.getMessage());
-            return false;
+        if (filename == null || filename.isEmpty()) return false;
+        // Tombstone FIRST, and unconditionally — before the DELETE and
+        // regardless of how many rows it affects. An upsert() that is mid-parse
+        // for this file hasn't MERGEd yet, so the DELETE below will report 0
+        // rows; recording the removal is what stops that in-flight upsert from
+        // resurrecting the row once it wakes. See the tombstone block above.
+        noteRemoval(filename);
+        // Same reconnect+retry rationale as upsertRow: a dropped DELETE
+        // leaves a ghost row pointing at a file the cleaner already removed,
+        // and playback then 404s.
+        final String name = filename;
+        return withRetry("remove(" + filename + ")", Boolean.FALSE, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "DELETE FROM recordings WHERE filename = ?")) {
+                ps.setString(1, name);
+                boolean deleted = ps.executeUpdate() > 0;
+                if (deleted) invalidateStatsCache();
+                return deleted;
+            }
+        });
+    }
+
+    /**
+     * Count index rows whose {@code abs_path} sits under one of the given
+     * directory roots. Used by the API handler's read-drift check: comparing
+     * the on-disk file count against THIS count — restricted to the roots
+     * whose listings were authoritative this pass — is what makes the
+     * comparison safe with offline-volume rows retained in the index (an
+     * unplugged SD card's rows are not under any scannable root, so they
+     * don't perpetually skew the comparison; see the reconcile Phase 2
+     * retention rationale).
+     *
+     * <p>Rows with NULL/empty abs_path are not counted; if their file is on
+     * disk the first mismatch-triggered reconcile repairs abs_path via
+     * upsert, so the comparison converges instead of re-firing forever.
+     *
+     * @return the count, or -1 when the index is unavailable / query failed
+     *         (callers must skip the comparison, not treat it as 0).
+     */
+    public synchronized int countRowsUnderRoots(List<String> roots) {
+        if (roots == null || roots.isEmpty()) return -1;
+        if (!isAvailable()) return -1;
+        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM recordings WHERE ");
+        for (int i = 0; i < roots.size(); i++) {
+            if (i > 0) sql.append(" OR ");
+            sql.append("abs_path LIKE ?");
         }
+        final String query = sql.toString();
+        final List<String> params = roots;
+        Integer count = withRetry("countRowsUnderRoots", null, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(query)) {
+                for (int i = 0; i < params.size(); i++) {
+                    ps.setString(i + 1, params.get(i) + "/%");
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getInt(1) : 0;
+                }
+            }
+        });
+        return count != null ? count : -1;
     }
 
     /**
@@ -494,16 +1118,17 @@ public final class RecordingsIndex {
      * that are already known.
      */
     public synchronized boolean contains(String filename) {
-        if (!initialized || filename == null) return false;
-        try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT 1 FROM recordings WHERE filename = ? LIMIT 1")) {
-            ps.setString(1, filename);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
+        if (filename == null) return false;
+        final String name = filename;
+        return withRetry("contains(" + filename + ")", Boolean.FALSE, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT 1 FROM recordings WHERE filename = ? LIMIT 1")) {
+                ps.setString(1, name);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next();
+                }
             }
-        } catch (Exception e) {
-            return false;
-        }
+        });
     }
 
     // =================================================================
@@ -576,7 +1201,7 @@ public final class RecordingsIndex {
      * the full walk so we don't gloss over a real mismatch.
      */
     private boolean canFastPathWarmup() {
-        if (!initialized) return false;
+        if (!isAvailable()) return false;
         String state = readMeta("warmup_state");
         if (!"complete".equals(state)) return false;
         int indexedCount = countIndexedRows();
@@ -592,15 +1217,14 @@ public final class RecordingsIndex {
         return true;
     }
 
-    private int countIndexedRows() {
-        try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT COUNT(*) FROM recordings");
-             ResultSet rs = ps.executeQuery()) {
-            return rs.next() ? rs.getInt(1) : 0;
-        } catch (Exception e) {
-            logger.warn("countIndexedRows failed: " + e.getMessage());
-            return -1;
-        }
+    private synchronized int countIndexedRows() {
+        return withRetry("countIndexedRows", -1, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT COUNT(*) FROM recordings");
+                 ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        });
     }
 
     /**
@@ -624,28 +1248,30 @@ public final class RecordingsIndex {
     }
 
     private synchronized String readMeta(String key) {
-        if (!initialized) return null;
-        try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT meta_value FROM recordings_meta WHERE meta_key = ?")) {
-            ps.setString(1, key);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString(1) : null;
+        final String k = key;
+        return withRetry("readMeta(" + key + ")", null, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT meta_value FROM recordings_meta WHERE meta_key = ?")) {
+                ps.setString(1, k);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getString(1) : null;
+                }
             }
-        } catch (Exception e) {
-            return null;
-        }
+        });
     }
 
     private synchronized void writeMeta(String key, String value) {
-        if (!initialized) return;
-        try (PreparedStatement ps = connection.prepareStatement(
-                "MERGE INTO recordings_meta KEY(meta_key) VALUES (?, ?)")) {
-            ps.setString(1, key);
-            ps.setString(2, value);
-            ps.executeUpdate();
-        } catch (Exception e) {
-            logger.warn("writeMeta(" + key + ") failed: " + e.getMessage());
-        }
+        final String k = key;
+        final String v = value;
+        withRetry("writeMeta(" + key + ")", Boolean.FALSE, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "MERGE INTO recordings_meta KEY(meta_key) VALUES (?, ?)")) {
+                ps.setString(1, k);
+                ps.setString(2, v);
+                ps.executeUpdate();
+            }
+            return Boolean.TRUE;
+        });
     }
 
     private void runWarmup() {
@@ -664,19 +1290,6 @@ public final class RecordingsIndex {
         addDirFiles(entries, sm.getAllRecordingsDirs(), null);
         addDirFiles(entries, sm.getAllSurveillanceDirs(), null);
         addDirFiles(entries, sm.getAllProximityDirs(), null);
-        // Legacy paths — keep mirrored with RecordingsApiHandler.
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files")),
-                null);
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files/recordings")),
-                null);
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files/sentry_events")),
-                null);
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files/proximity_events")),
-                null);
 
         // Dedup by filename (mirror dirs hold the same .mp4).
         Set<String> seen = new HashSet<>(entries.size() * 2);
@@ -845,83 +1458,221 @@ public final class RecordingsIndex {
     }
 
     /**
-     * Reconcile the index against the filesystem. Walks every dir,
-     * upserts unknown files, removes index rows whose mp4 is gone.
+      * Reconcile the index against the filesystem. Walks every dir,
+      * upserts new or changed files, removes index rows whose mp4 is gone.
      * Backstop for FileObserver event drops on FUSE-mounted SD cards.
-     * Cheap when the index is in sync — every existing row is one
-     * stat() call.
+      * Cheap when the index is in sync — existing rows compare filesystem
+      * fingerprints without parsing sidecar JSON.
      */
     public void reconcile() {
-        if (!initialized) return;
+        synchronized (reconcileExecutionLock) {
+            reconcileInternal();
+        }
+    }
+
+    private void reconcileInternal() {
+        if (!isAvailable()) return;
         long t0 = System.currentTimeMillis();
         StorageManager sm = StorageManager.getInstance();
 
-        Set<String> diskNames = new HashSet<>();
-        scanDirNames(diskNames, sm.getAllRecordingsDirs());
-        scanDirNames(diskNames, sm.getAllSurveillanceDirs());
-        scanDirNames(diskNames, sm.getAllProximityDirs());
-
-        // Three-phase walk: index enumerate → drop missing → upsert new.
+          // Three-phase walk: index snapshot → drop missing → upsert new/changed.
         // The SELECT enumerate is synchronized so the snapshot is
         // consistent. The per-row remove()/upsert() calls re-acquire the
-        // monitor themselves; we deliberately do NOT hold the lock across
-        // the locateFile() stat() calls because on FUSE-mounted SD cards
-        // they can each block 100-500ms, serializing every concurrent
+          // monitor themselves; filesystem fingerprinting stays outside that
+          // monitor because FUSE metadata calls can block, serializing every concurrent
         // queryRecordings/queryCount/queryStats request behind reconcile.
         // Accept temporary inconsistency — a file deleted between the
         // collect and verify phases will be cleaned up on the next
         // periodic reconcile (the operation is idempotent).
         int removed = 0;
         int added = 0;
-        // Files seen by scanDirNames() (exists, readable, size>0) but not
-        // findable by locateFile() — usually means a mount path drift or a
-        // symlinked dir that scanDirNames() followed but locateFile()'s
-        // canonical dir list does not. Surfaced in the summary so operators
-        // can spot data-loss-shaped gaps instead of silent skips.
-        int unlocatable = 0;
+        int refreshed = 0;
+        int failed = 0;
 
-        // Phase 1: snapshot the index under the monitor.
-        Set<String> indexNames = new HashSet<>();
+        // Phase 1: snapshot the index under the monitor — BEFORE the disk
+        // scan. Ordering matters (audit finding: reconcile deletion race):
+        // with scan-first, a file finalized + indexed AFTER its directory was
+        // scanned but BEFORE the snapshot appears in indexFiles, is absent
+        // from diskFiles, and Phase 2 removes its brand-new row. Snapshot-
+        // first inverts every race outcome to a safe one: a file indexed
+        // after the snapshot but found by the scan takes the idempotent
+        // ADD/upsert path; a file deleted after the snapshot makes remove() a
+        // no-op on the next pass.
+        Map<String, IndexedFileState> indexFiles;
         synchronized (this) {
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "SELECT filename FROM recordings");
-                 ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) indexNames.add(rs.getString(1));
-            } catch (Exception e) {
-                logger.warn("reconcile: index enumerate failed: " + e.getMessage());
-                return;
-            }
+            // Built inside the body so a reconnect-retry re-enumerates into a
+            // fresh map rather than merging two partial snapshots.
+            indexFiles = withRetry("reconcile: index enumerate", null, () -> {
+                Map<String, IndexedFileState> rows = new HashMap<>();
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "SELECT filename, abs_path, size_bytes, mp4_mtime, sidecar_mtime"
+                                + " FROM recordings");
+                     ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        rows.put(rs.getString(1), new IndexedFileState(
+                                rs.getString(2), rs.getLong(3), rs.getLong(4), rs.getLong(5)));
+                    }
+                }
+                return rows;
+            });
         }
+        // null (not empty) distinguishes "enumerate failed" from "index is
+        // legitimately empty". Bailing on failure is important: an empty
+        // snapshot would make Phase 2 believe every indexed row is missing.
+        if (indexFiles == null) {
+            logger.warn("reconcile: index enumerate unavailable — skipping this pass");
+            return;
+        }
+
+        // Disk scan. authoritativeRoots collects the directories whose
+        // enumeration provably completed (Java listFiles() non-null, or shell
+        // ls drained fully with exit 0) — only THOSE directories' contents are
+        // ground truth for Phase 2's removals. A dir that is missing (volume
+        // unmounted), listed partially (shell timeout), or failed to list
+        // never lands in the set, so its rows are retained. This is both the
+        // partial-listing safety fix and the offline-volume model: an
+        // unmounted SD/USB volume's dirs drop out of getAll*Dirs() (or fail
+        // exists()), its rows survive reconcile, and they rejoin the live set
+        // when the volume remounts — instead of being mass-pruned on the
+        // first reconcile that runs while the card is offline.
+        Map<String, RecordingFileFingerprint> diskFiles = new LinkedHashMap<>();
+        Set<String> authoritativeRoots = new HashSet<>();
+        Set<String> observedNames = new HashSet<>();
+        scanDirFiles(diskFiles, sm.getAllRecordingsDirs(), authoritativeRoots, observedNames);
+        scanDirFiles(diskFiles, sm.getAllSurveillanceDirs(), authoritativeRoots, observedNames);
+        scanDirFiles(diskFiles, sm.getAllProximityDirs(), authoritativeRoots, observedNames);
 
         // Phase 2: drop rows whose file is gone. remove() takes the
         // monitor per call; that's fine — we want short critical sections
         // here so query threads can interleave.
-        for (String name : indexNames) {
-            if (!diskNames.contains(name)) {
-                if (remove(name)) removed++;
+        //
+        // A row is prunable ONLY when its absence is PROVEN: its abs_path
+        // places it under a directory whose listing this pass was
+        // authoritative, AND no complete listing anywhere observed its
+        // filename (observedNames is raw listing output — see scanDirFiles
+        // for why pruning must not depend on the post-listing isFile()/size
+        // syscalls that feed diskFiles). Rows with a missing/empty abs_path
+        // can't be attributed to any scanned directory, so they are never
+        // pruned here (a later upsert repairs abs_path when the file is seen
+        // again).
+        int retainedUnverifiable = 0;
+        for (Map.Entry<String, IndexedFileState> e : indexFiles.entrySet()) {
+            if (diskFiles.containsKey(e.getKey())) continue;
+            if (observedNames.contains(e.getKey())) continue;  // listing saw it — not prunable
+            if (!isUnderAuthoritativeRoot(e.getValue().absolutePath, authoritativeRoots)) {
+                retainedUnverifiable++;
+                continue;
             }
+            if (remove(e.getKey())) removed++;
+        }
+        if (retainedUnverifiable > 0) {
+            logger.info("Reconcile: retained " + retainedUnverifiable
+                    + " row(s) not covered by an authoritative directory listing"
+                    + " (offline volume, partial/failed listing, or missing abs_path)"
+                    + " — not pruning");
         }
 
-        // Phase 3: upsert anything not already known. locateFile() is
-        // intentionally OUTSIDE any synchronized block — its stat() calls
-        // can stall on FUSE mounts and would otherwise serialize queries.
-        for (String name : diskNames) {
-            if (!indexNames.contains(name)) {
-                File f = locateFile(name, sm);
-                if (f != null) {
-                    if (upsert(f)) added++;
-                } else {
-                    unlocatable++;
-                    logger.warn("reconcile: file seen on disk but not locatable: " + name);
-                }
+        // Phase 3: parse only new or fingerprint-changed files. Active-first
+        // map insertion also repairs abs_path when the same filename moved
+        // between roots or volumes.
+        for (Map.Entry<String, RecordingFileFingerprint> entry : diskFiles.entrySet()) {
+            RecordingFileFingerprint fingerprint = entry.getValue();
+            IndexedFileState indexed = indexFiles.get(entry.getKey());
+            RecordingFileFingerprint.Decision decision = fingerprint.decisionAgainst(
+                    indexed != null ? indexed.absolutePath : null,
+                    indexed != null ? indexed.sizeBytes : 0L,
+                    indexed != null ? indexed.mp4Mtime : 0L,
+                    indexed != null ? indexed.sidecarMtime : 0L);
+            switch (decision) {
+                case ADD:
+                    if (upsert(fingerprint.file)) added++; else failed++;
+                    break;
+                case REFRESH:
+                    if (upsert(fingerprint.file)) refreshed++; else failed++;
+                    break;
+                case UNCHANGED:
+                    break;
             }
         }
         long ms = System.currentTimeMillis() - t0;
-        if (added > 0 || removed > 0 || unlocatable > 0) {
-            logger.info("Reconcile: +" + added + " / -" + removed
-                    + (unlocatable > 0 ? " / unlocatable=" + unlocatable : "")
-                    + " in " + ms + "ms");
+        if (added > 0 || refreshed > 0 || removed > 0 || failed > 0) {
+            // `failed` replaces the old `unlocatable` counter: an upsert that keeps
+            // refusing (unreadable mp4, unparseable name, tombstoned) is retried every
+            // pass, so a silent zero here hid a permanently-stuck row.
+            logger.info("Reconcile: +" + added + " / ~" + refreshed + " / -" + removed
+                    + (failed > 0 ? " / !" + failed : "") + " in " + ms + "ms");
         }
+    }
+
+    private static final class IndexedFileState {
+        final String absolutePath;
+        final long sizeBytes;
+        final long mp4Mtime;
+        final long sidecarMtime;
+
+        IndexedFileState(String absolutePath, long sizeBytes,
+                         long mp4Mtime, long sidecarMtime) {
+            this.absolutePath = absolutePath;
+            this.sizeBytes = sizeBytes;
+            this.mp4Mtime = mp4Mtime;
+            this.sidecarMtime = sidecarMtime;
+        }
+    }
+
+    /**
+     * Scan {@code dirs} into {@code out}, recording in
+     * {@code authoritativeRoots} the absolute path of every directory whose
+     * enumeration was COMPLETE (see {@link StorageManager.DirListing}), and
+     * in {@code observedNames} every filename such a complete listing
+     * CONTAINED — recorded straight off the listing, BEFORE the per-file
+     * isFile()/size filters below.
+     *
+     * <p>That ordering is the point (audit finding: destructive mid-scan
+     * pruning): the per-file checks are separate syscalls made AFTER the
+     * listing. If the volume drops between the two, every isFile() fails and
+     * {@code out} ends up empty while the root is already marked
+     * authoritative — and Phase 2 would prune every row under it. Pruning
+     * therefore keys off {@code observedNames} (pure listing output, no
+     * post-listing syscalls): a file the listing SAW is never prunable this
+     * pass, however its follow-up stat calls fared. The fingerprints in
+     * {@code out} are used only for the additive upsert path, where acting
+     * on a filtered/partial view merely under-adds and self-corrects.
+     *
+     * <p>The files of an incomplete listing are still collected into
+     * {@code out} for the same additive reason — but the directory is not
+     * authoritative, so Phase 2 will not prune its rows.
+     */
+    private void scanDirFiles(Map<String, RecordingFileFingerprint> out, List<File> dirs,
+                              Set<String> authoritativeRoots, Set<String> observedNames) {
+        StorageManager sm = StorageManager.getInstance();
+        for (File dir : dirs) {
+            if (dir == null) continue;
+            StorageManager.DirListing listing = sm.listMp4FilesChecked(dir);
+            if (listing.complete) {
+                authoritativeRoots.add(dir.getAbsolutePath());
+                for (File file : listing.files) {
+                    observedNames.add(file.getName());
+                }
+            }
+            for (File file : listing.files) {
+                if (!file.isFile() || out.containsKey(file.getName())) continue;
+                RecordingFileFingerprint fingerprint = RecordingFileFingerprint.from(file);
+                if (fingerprint.sizeBytes > 0) out.put(file.getName(), fingerprint);
+            }
+        }
+    }
+
+    /**
+     * True when {@code absPath} sits directly under one of the directories
+     * whose listing this reconcile pass was authoritative. Null/empty
+     * abs_path is never covered (non-prunable by construction).
+     */
+    private static boolean isUnderAuthoritativeRoot(String absPath, Set<String> roots) {
+        if (absPath == null || absPath.isEmpty()) return false;
+        for (String root : roots) {
+            if (absPath.startsWith(root + "/")) return true;
+        }
+        return false;
     }
 
     private void scanDirNames(Set<String> out, List<File> dirs) {
@@ -935,22 +1686,6 @@ public final class RecordingsIndex {
                 if (f.isFile() && f.length() > 0) out.add(f.getName());
             }
         }
-    }
-
-    private File locateFile(String name, StorageManager sm) {
-        for (File dir : sm.getAllRecordingsDirs()) {
-            File f = new File(dir, name);
-            if (f.exists() && f.canRead() && f.length() > 0) return f;
-        }
-        for (File dir : sm.getAllSurveillanceDirs()) {
-            File f = new File(dir, name);
-            if (f.exists() && f.canRead() && f.length() > 0) return f;
-        }
-        for (File dir : sm.getAllProximityDirs()) {
-            File f = new File(dir, name);
-            if (f.exists() && f.canRead() && f.length() > 0) return f;
-        }
-        return null;
     }
 
     // =================================================================
@@ -1025,7 +1760,6 @@ public final class RecordingsIndex {
      * clients don't break.
      */
     public synchronized List<JSONObject> queryRecordings(Filter f, int limit, int offset) {
-        if (!initialized) return new ArrayList<>();
         StringBuilder where = new StringBuilder();
         List<Object> args = new ArrayList<>();
         buildWhere(f, where, args);
@@ -1035,38 +1769,40 @@ public final class RecordingsIndex {
                 + " ORDER BY ts_ms DESC"
                 + " LIMIT ? OFFSET ?";
 
-        List<JSONObject> out = new ArrayList<>();
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            int p = 1;
-            for (Object a : args) bind(ps, p++, a);
-            ps.setInt(p++, Math.max(1, limit));
-            ps.setInt(p, Math.max(0, offset));
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) out.add(rowToJson(rs));
+        // The result list is built INSIDE the body so a reconnect-retry
+        // starts from an empty list instead of appending to a partially
+        // filled one.
+        return withRetry("queryRecordings", new ArrayList<JSONObject>(), () -> {
+            List<JSONObject> out = new ArrayList<>();
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                int p = 1;
+                for (Object a : args) bind(ps, p++, a);
+                ps.setInt(p++, Math.max(1, limit));
+                ps.setInt(p, Math.max(0, offset));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) out.add(rowToJson(rs));
+                }
             }
-        } catch (Exception e) {
-            logger.warn("queryRecordings failed: " + e.getMessage());
-        }
-        return out;
+            return out;
+        });
     }
 
     public synchronized int queryCount(Filter f) {
-        if (!initialized) return 0;
         StringBuilder where = new StringBuilder();
         List<Object> args = new ArrayList<>();
         buildWhere(f, where, args);
         String sql = "SELECT COUNT(*) FROM recordings"
                 + (where.length() > 0 ? " WHERE " + where : "");
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            int p = 1;
-            for (Object a : args) bind(ps, p++, a);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getInt(1);
+        return withRetry("queryCount", 0, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                int p = 1;
+                for (Object a : args) bind(ps, p++, a);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) return rs.getInt(1);
+                }
             }
-        } catch (Exception e) {
-            logger.warn("queryCount failed: " + e.getMessage());
-        }
-        return 0;
+            return 0;
+        });
     }
 
     /**
@@ -1077,7 +1813,6 @@ public final class RecordingsIndex {
      * the row would always show only the active chip).
      */
     public synchronized List<PlaceBucket> queryPlaces(Filter f, int limit) {
-        if (!initialized) return new ArrayList<>();
         Filter copy = copyFilter(f);
         copy.place = null;
         StringBuilder where = new StringBuilder();
@@ -1092,24 +1827,24 @@ public final class RecordingsIndex {
                 + " ORDER BY c DESC, place_short ASC"
                 + " LIMIT ?";
 
-        List<PlaceBucket> out = new ArrayList<>();
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            int p = 1;
-            for (Object a : args) bind(ps, p++, a);
-            ps.setInt(p, Math.max(1, limit));
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    PlaceBucket b = new PlaceBucket();
-                    b.label = rs.getString(1);
-                    b.count = rs.getInt(2);
-                    b.newestTs = rs.getLong(3);
-                    out.add(b);
+        return withRetry("queryPlaces", new ArrayList<PlaceBucket>(), () -> {
+            List<PlaceBucket> out = new ArrayList<>();
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                int p = 1;
+                for (Object a : args) bind(ps, p++, a);
+                ps.setInt(p, Math.max(1, limit));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        PlaceBucket b = new PlaceBucket();
+                        b.label = rs.getString(1);
+                        b.count = rs.getInt(2);
+                        b.newestTs = rs.getLong(3);
+                        out.add(b);
+                    }
                 }
             }
-        } catch (Exception e) {
-            logger.warn("queryPlaces failed: " + e.getMessage());
-        }
-        return out;
+            return out;
+        });
     }
 
     /**
@@ -1117,25 +1852,24 @@ public final class RecordingsIndex {
      * flag for the calendar dot decoration.
      */
     public synchronized List<DateBucket> queryDates() {
-        if (!initialized) return new ArrayList<>();
         String sql =
             "SELECT ymd, COUNT(*) AS c, "
             + " MAX(CASE WHEN type = 'sentry' THEN 1 ELSE 0 END) AS hasSentry"
             + " FROM recordings WHERE ymd IS NOT NULL GROUP BY ymd";
-        List<DateBucket> out = new ArrayList<>();
-        try (PreparedStatement ps = connection.prepareStatement(sql);
-             ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) {
-                DateBucket b = new DateBucket();
-                b.date = rs.getString(1);
-                b.count = rs.getInt(2);
-                b.hasSentry = rs.getInt(3) > 0;
-                out.add(b);
+        return withRetry("queryDates", new ArrayList<DateBucket>(), () -> {
+            List<DateBucket> out = new ArrayList<>();
+            try (PreparedStatement ps = connection.prepareStatement(sql);
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    DateBucket b = new DateBucket();
+                    b.date = rs.getString(1);
+                    b.count = rs.getInt(2);
+                    b.hasSentry = rs.getInt(3) > 0;
+                    out.add(b);
+                }
             }
-        } catch (Exception e) {
-            logger.warn("queryDates failed: " + e.getMessage());
-        }
-        return out;
+            return out;
+        });
     }
 
     /**
@@ -1143,38 +1877,60 @@ public final class RecordingsIndex {
      * Used by /api/recordings/stats and the native fragment header.
      */
     public synchronized Stats queryStats() {
-        Stats s = new Stats();
-        if (!initialized) return s;
         long todayStart = startOfTodayMillis();
+        // Memo hit only when the table is unchanged AND we're still in the same
+        // local day — the todayC bucket is relative to midnight, so a day
+        // rollover (or a TZ/DST shift) must re-run even with no writes.
+        if (cachedStats != null && cachedStatsTodayStart == todayStart) {
+            return cachedStats.copy();
+        }
         String sql =
             "SELECT type,"
             + "  COUNT(*) AS c,"
             + "  COALESCE(SUM(size_bytes), 0) AS bytes,"
             + "  SUM(CASE WHEN ts_ms >= ? THEN 1 ELSE 0 END) AS todayC"
             + " FROM recordings GROUP BY type";
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setLong(1, todayStart);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    String t = rs.getString(1);
-                    long c = rs.getLong(2);
-                    long b = rs.getLong(3);
-                    long tc = rs.getLong(4);
-                    if ("normal".equals(t) || "oemDashcam".equals(t)) {
-                        s.normalCount += c; s.normalBytes += b; s.normalToday += tc;
-                    } else if ("sentry".equals(t)) {
-                        s.sentryCount = c; s.sentryBytes = b; s.sentryToday = tc;
-                    } else if ("proximity".equals(t)) {
-                        s.proximityCount = c; s.proximityBytes = b; s.proximityToday = tc;
-                    } else if ("replay".equals(t)) {
-                        s.replayCount = c; s.replayBytes = b; s.replayToday = tc;
+        // Stats is accumulated with += for the normal/oemDashcam fold, so a
+        // fresh instance MUST be allocated inside the body — reusing one
+        // across a reconnect-retry would double-count the dashcam bucket.
+        //
+        // NOTE the null sentinel: withRetry returns this failureValue when the
+        // store is down, and an all-zero Stats must NEVER be memoized — that
+        // would latch "0 clips / 0 B" until the next write, which is exactly
+        // the false-empty the caller's sendIndexUnavailable() guard exists to
+        // prevent. Returning null here lets us distinguish failure from a
+        // legitimately empty table, and we publish the memo only on success.
+        Stats fresh = withRetry("queryStats", null, () -> {
+            Stats s = new Stats();
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setLong(1, todayStart);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String t = rs.getString(1);
+                        long c = rs.getLong(2);
+                        long b = rs.getLong(3);
+                        long tc = rs.getLong(4);
+                        if ("normal".equals(t) || "oemDashcam".equals(t)) {
+                            s.normalCount += c; s.normalBytes += b; s.normalToday += tc;
+                        } else if ("sentry".equals(t)) {
+                            s.sentryCount = c; s.sentryBytes = b; s.sentryToday = tc;
+                        } else if ("proximity".equals(t)) {
+                            s.proximityCount = c; s.proximityBytes = b; s.proximityToday = tc;
+                        } else if ("replay".equals(t)) {
+                            s.replayCount = c; s.replayBytes = b; s.replayToday = tc;
+                        }
                     }
                 }
             }
-        } catch (Exception e) {
-            logger.warn("queryStats failed: " + e.getMessage());
-        }
-        return s;
+            return s;
+        });
+        // Store down → hand back a zeroed Stats exactly as before (callers
+        // gate on isUnavailableForClients(), not on this value), but leave the
+        // memo empty so the next poll retries the scan.
+        if (fresh == null) return new Stats();
+        cachedStats = fresh;
+        cachedStatsTodayStart = todayStart;
+        return fresh.copy();
     }
 
     // =================================================================
@@ -1414,7 +2170,7 @@ public final class RecordingsIndex {
         // Sidecar enrichment — same logic as
         // RecordingsApiHandler.parseRecordingUncached, kept close to
         // identical so existing callers don't notice the swap.
-        File sidecar = new File(mp4.getParentFile(), name.replace(".mp4", ".json"));
+        File sidecar = RecordingFileFingerprint.sidecarFor(mp4);
         if (sidecar.exists() && sidecar.canRead()) {
             r.sidecarMtime = sidecar.lastModified();
             try {
@@ -1514,16 +2270,27 @@ public final class RecordingsIndex {
                                 : (!dn.isEmpty() ? dn : null);
                         String mediumLabel = (!dist.isEmpty() && !city.isEmpty() && !dist.equals(city))
                                 ? (dist + ", " + city) : shortLabel;
-                        if (shortLabel != null) r.placeShort = shortLabel;
-                        if (mediumLabel != null) r.placeMedium = mediumLabel;
-                        if (!dn.isEmpty()) r.placeDisplay = dn;
-                        if (!cc.isEmpty()) r.placeCountry = cc.toLowerCase(Locale.US);
-                        if (!src.isEmpty()) r.placeSource = src;
+                        // Clamp to the column widths declared in
+                        // createSchema(). Reverse-geocoders (Nominatim) return
+                        // display_name strings well over 256 chars, which H2
+                        // rejects with VALUE_TOO_LONG (22001) — and because
+                        // that aborts the whole MERGE, the clip would silently
+                        // never be indexed and never appear in events.html.
+                        if (shortLabel != null) r.placeShort = clamp(shortLabel, 128);
+                        if (mediumLabel != null) r.placeMedium = clamp(mediumLabel, 192);
+                        if (!dn.isEmpty()) r.placeDisplay = clamp(dn, 256);
+                        if (!cc.isEmpty()) r.placeCountry = clamp(cc.toLowerCase(Locale.US), 8);
+                        if (!src.isEmpty()) r.placeSource = clamp(src, 32);
                     }
                 }
             } catch (Exception se) {
-                // Sidecar parse failure is non-fatal; row still indexed
-                // with bare mp4 metadata.
+                // Sidecar parse failure is non-fatal; row still indexed with bare
+                // mp4 metadata. Reset the fingerprint so reconcile keeps seeing this
+                // row as REFRESH-eligible: persisting a mtime that MATCHES disk
+                // alongside NULL enrichment would latch UNCHANGED and strip the
+                // place chip / hero thumb permanently (a truncated-mid-rewrite
+                // sidecar is exactly the transient case that must self-heal).
+                r.sidecarMtime = 0L;
             }
         }
 
@@ -1574,8 +2341,9 @@ public final class RecordingsIndex {
         rec.put("dateFormatted", FMT_DATE_DISPLAY.get().format(d));
         rec.put("timeFormatted", FMT_TIME_DISPLAY.get().format(d));
 
-        rec.put("videoUrl", "/video/" + name);
-        rec.put("thumbnailUrl", "/thumb/" + name);
+        String mediaQuery = mediaPathQuery(absPath);
+        rec.put("videoUrl", "/video/" + name + mediaQuery);
+        rec.put("thumbnailUrl", "/thumb/" + name + mediaQuery);
 
         int sv = rs.getInt("schema_version");
         if (sv > 0) rec.put("schemaVersion", sv);
@@ -1595,7 +2363,11 @@ public final class RecordingsIndex {
         if (animal > 0) rec.put("animalCount", animal);
 
         String hero = rs.getString("hero_thumb");
-        if (hero != null) rec.put("heroThumbnailUrl", "/thumb/" + hero);
+        if (hero != null) {
+            File parent = new File(absPath).getParentFile();
+            String heroPath = parent == null ? hero : new File(parent, hero).getAbsolutePath();
+            rec.put("heroThumbnailUrl", "/thumb/" + hero + mediaPathQuery(heroPath));
+        }
 
         String classes = rs.getString("actor_classes");
         if (classes != null && !classes.isEmpty()) {
@@ -1636,6 +2408,11 @@ public final class RecordingsIndex {
         rec.put("ymd", rs.getString("ymd"));
 
         return rec;
+    }
+
+    private static String mediaPathQuery(String absolutePath) throws Exception {
+        return "?path=" + java.net.URLEncoder.encode(absolutePath, "UTF-8")
+                .replace("+", "%20");
     }
 
     private static String bucketLabelFor(long ts) {
@@ -1756,5 +2533,21 @@ public final class RecordingsIndex {
         public long totalCount() { return normalCount + sentryCount + proximityCount + replayCount; }
         public long totalBytes() { return normalBytes + sentryBytes + proximityBytes + replayBytes; }
         public long totalToday() { return normalToday + sentryToday + proximityToday + replayToday; }
+
+        /** Field-wise copy. The fields are public and mutable, so
+         *  {@link RecordingsIndex#queryStats()} hands every caller its own copy
+         *  rather than the memoized instance — otherwise a caller that adjusted
+         *  a bucket (the existing handler folds oemDashcam into normal, so this
+         *  is a plausible future edit) would silently corrupt the cached value
+         *  for every subsequent reader. */
+        Stats copy() {
+            Stats c = new Stats();
+            c.normalCount = normalCount; c.normalBytes = normalBytes; c.normalToday = normalToday;
+            c.sentryCount = sentryCount; c.sentryBytes = sentryBytes; c.sentryToday = sentryToday;
+            c.proximityCount = proximityCount; c.proximityBytes = proximityBytes;
+            c.proximityToday = proximityToday;
+            c.replayCount = replayCount; c.replayBytes = replayBytes; c.replayToday = replayToday;
+            return c;
+        }
     }
 }

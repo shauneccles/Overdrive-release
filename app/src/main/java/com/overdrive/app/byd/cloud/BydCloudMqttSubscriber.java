@@ -35,6 +35,12 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
 
     private static final int BACKOFF_BASE_SECONDS = 5;
     private static final int BACKOFF_CAP_SECONDS = 300;
+    // Base for the "broker resolved but connect failed" (downstream/transient)
+    // ramp. Starts at the original fast 15s retry for a transient blip, then
+    // doubles toward BACKOFF_CAP_SECONDS so a persistently unreachable :8883
+    // backs off instead of spinning a broker-lookup + fresh TLS handshake every
+    // 15s forever (the parked-night data leak).
+    private static final int PROGRESS_BACKOFF_BASE_SECONDS = 15;
     private static final long SESSION_REFRESH_MS = 25 * 60 * 1000; // 25 min (before 30 min expiry)
     private static final long REAUTH_COOLDOWN_MS = 60 * 1000; // matches pyBYD _MQTT_REAUTH_COOLDOWN_S
 
@@ -58,6 +64,9 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
     private volatile long firstDecryptFailureAtMs = 0;
 
     private final AtomicBoolean connecting = new AtomicBoolean(false);
+    private final Object messageDispatchLock = new Object();
+    /** Guarded by {@link #messageDispatchLock}; prevents Paho callback fan-out from double ingesting. */
+    private MqttMessage lastDispatchedMessage;
     private ScheduledExecutorService scheduler;
 
     public BydCloudMqttSubscriber(BydCloudClient client) {
@@ -109,7 +118,10 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
     }
 
     public boolean isConnected() {
-        return mqttClient != null && mqttClient.isConnected();
+        // Single read of the volatile field — disconnectQuietly() nulls it on
+        // every reconnect attempt, so two reads could NPE between them.
+        MqttClient mc = mqttClient;
+        return mc != null && mc.isConnected();
     }
 
     // ── Connection ──────────────────────────────────────────────────────
@@ -150,10 +162,24 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
             return;
         }
 
+        // Close any client left over from a previous attempt BEFORE building a
+        // new one. The disconnected() callback deliberately does NOT close the
+        // client (Paho forbids disconnect()/close() from its own callback
+        // thread), so after a "Connection lost" the old MqttClient is still in
+        // the field when the reconnect fires. Without this, assigning the new
+        // client below orphaned the old one — its sockets were reclaimed only
+        // by GC, producing the CloseGuard "close not called" warnings. No-op
+        // when the field is already null (first connect, refreshSession path).
+        disconnectQuietly();
+
         // Tracks how far we got so we can reset the backoff counter on
         // partial progress (e.g. broker resolved but TLS handshake failed —
         // those are transient and shouldn't escalate to 300s reconnect).
         boolean brokerResolved = false;
+        // Declared outside the try so the catch can close a client whose
+        // connect()/subscribe() failed — it is only assigned to the mqttClient
+        // field on full success, so disconnectQuietly() can't reach it.
+        MqttClient mc = null;
 
         try {
             lastConnectAttemptMs = System.currentTimeMillis();
@@ -185,7 +211,7 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
                     + " proxy=" + ProxyHelper.isProxyAvailable());
 
             // Create Paho v5 client
-            MqttClient mc = new MqttClient(brokerUri, clientId, new MemoryPersistence());
+            mc = new MqttClient(brokerUri, clientId, new MemoryPersistence());
             mc.setCallback(this);
 
             MqttConnectionOptions opts = new MqttConnectionOptions();
@@ -202,23 +228,32 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
             // SSL with proxy support — same pattern as MqttPublisherService.
             boolean proxyActive = ProxyHelper.isProxyAvailable();
             if (proxyActive) {
+                // Explicitly factory-proxied — immune to the global SOCKS props, so no
+                // props lock needed; connect concurrently with anything.
                 opts.setSocketFactory(ProxyHelper.getProxiedSslSocketFactory(false));
+                mc.connect(opts);
             } else {
-                // Clear any leftover system SOCKS properties
-                System.clearProperty("socksProxyHost");
-                System.clearProperty("socksProxyPort");
+                // DIRECT connect on the default SSL factory, which DOES honor the
+                // process-global socksProxy* properties: leftover props from a sibling
+                // WS+proxy publisher would misroute this socket through the proxy.
+                // Clear + connect under the shared props lock so (a) our clear can't
+                // strip the props out from under a publisher's mid-flight WS connect,
+                // and (b) a publisher can't re-assert them mid-flight into ours.
+                // See ProxyHelper.SOCKS_PROPS_LOCK.
                 opts.setSocketFactory(javax.net.ssl.SSLSocketFactory.getDefault());
+                synchronized (ProxyHelper.SOCKS_PROPS_LOCK) {
+                    System.clearProperty("socksProxyHost");
+                    System.clearProperty("socksProxyPort");
+                    mc.connect(opts);
+                }
             }
-
-            mc.connect(opts);
-            // v5 subscribe API — IMqttMessageListener takes (topic, msg).
-            mc.subscribe(topic, 1, (t, msg) -> {
-                logger.info("EMQ raw message: topic=" + t
-                        + " bytes=" + (msg.getPayload() != null ? msg.getPayload().length : 0)
-                        + " qos=" + msg.getQos() + " retained=" + msg.isRetained());
-            });
+            // A topic listener supersedes the global callback for matching messages in Paho v5.
+            // Route both callback surfaces through one ingestion function; its identity guard also
+            // protects against versions that fan the same MqttMessage out to both callbacks.
+            mc.subscribe(topic, 1, this::dispatchIncomingMessage);
 
             mqttClient = mc;
+            mc = null; // ownership transferred to the field — don't close in a later failure path
             consecutiveFailures = 0;
             dataProvider.setMqttConnected(true);
             logger.info("Connected and subscribed to BYD EMQ topic=" + topic);
@@ -254,18 +289,34 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
                 }
             }
 
-            disconnectQuietly();
+            // Close the client from THIS failed attempt. It was never assigned
+            // to the mqttClient field (that only happens on full success), so
+            // the old disconnectQuietly() call here closed nothing — the failed
+            // client's sockets leaked to GC (CloseGuard "close not called").
+            // The field itself was already cleaned at the top of this method.
+            closeClientQuietly(mc);
+            mc = null;
 
             // Backoff strategy: if we made any forward progress (broker
             // resolved) the failure is downstream — TLS race, broker hiccup —
-            // and we should retry quickly instead of ramping into a 5-minute
-            // window. If we never resolved the broker, escalate normally.
-            // Transient service errors (1005/1008/1009) get a fixed short
-            // delay because they're an upstream BYD condition that's unlikely
-            // to clear faster on exponential ramp.
+            // and we should retry quickly at first instead of ramping straight
+            // into a 5-minute window. But it must NOT retry at a fixed 15s
+            // FOREVER: a persistently unreachable :8883 (metered/restrictive
+            // network, or BYD broker trouble) then re-does a broker-lookup HTTPS
+            // POST + a fresh TLS handshake every 15s, 24/7 while parked —
+            // ~40-70 MB/day of pure reconnect churn (each attempt builds a new
+            // MqttClient, so no TLS session reuse). Instead: count the failures
+            // and grow the delay from ~15s toward the cap so a transient blip
+            // still clears fast (first retries ≈15s) while a stuck :8883 decays
+            // to the 5-minute ceiling. Transient service errors (1005/1008/1009)
+            // share this gentle ramp for the same reason.
             if (brokerResolved || isTransientService) {
-                consecutiveFailures = 1; // reset, but keep at first-attempt
-                scheduleReconnect(15);   // 15-second fixed retry
+                consecutiveFailures++;
+                // 15s, 30s, 60s, 120s, 240s, capped at BACKOFF_CAP_SECONDS.
+                long delay = Math.min(
+                        PROGRESS_BACKOFF_BASE_SECONDS * (1L << Math.min(consecutiveFailures - 1, 10)),
+                        BACKOFF_CAP_SECONDS);
+                scheduleReconnect(delay);
             } else {
                 consecutiveFailures++;
                 scheduleReconnect(0); // 0 = compute from consecutiveFailures
@@ -383,15 +434,30 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
         MqttClient mc = mqttClient;
         mqttClient = null;
         dataProvider.setMqttConnected(false);
-        if (mc != null) {
-            try {
-                if (mc.isConnected()) mc.disconnect(2000);
-            } catch (Exception ignored) {}
-            try { mc.close(); } catch (Exception ignored) {}
-        }
-        // Clean up JVM-level SOCKS proxy properties
-        System.clearProperty("socksProxyHost");
-        System.clearProperty("socksProxyPort");
+        closeClientQuietly(mc);
+        // Do NOT clear the JVM-level socksProxyHost/Port properties here. This
+        // subscriber never SETS them (it routes via explicit socket factories);
+        // they are process-global and owned by the v3 publisher path, which
+        // documents that a sibling WS+proxy connection may still rely on them
+        // (see MqttPublisherService.disconnect() / MqttConnectionManager.stopAll()).
+        // Clearing them on every subscriber disconnect — which now also runs at
+        // the top of every (re)connect attempt — would silently strip the proxy
+        // from a healthy publisher connection's sockets.
+    }
+
+    /**
+     * Best-effort disconnect + close of a Paho client. Safe on null, on a
+     * client whose connect() failed, and on a connected client (disconnect
+     * first — Paho's close() throws if still connected). Must NOT be called
+     * from a Paho callback thread (32107 deadlock guard); all call sites run
+     * on the subscriber's scheduler thread.
+     */
+    private static void closeClientQuietly(MqttClient mc) {
+        if (mc == null) return;
+        try {
+            if (mc.isConnected()) mc.disconnect(2000);
+        } catch (Exception ignored) {}
+        try { mc.close(); } catch (Exception ignored) {}
     }
 
     // ── MqttCallback (v5) ───────────────────────────────────────────────
@@ -426,6 +492,19 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
 
     @Override
     public void messageArrived(String topic, MqttMessage message) {
+        dispatchIncomingMessage(topic, message);
+    }
+
+    private void dispatchIncomingMessage(String topic, MqttMessage message) {
+        if (message == null) return;
+        synchronized (messageDispatchLock) {
+            if (message == lastDispatchedMessage) return;
+            lastDispatchedMessage = message;
+        }
+        if (!running) return;
+
+        // Allocate before decrypt/parse so reset() can fence a callback that was already in flight.
+        long updateSequence = dataProvider.beginVehicleInfoUpdate();
         byte[] payload = message.getPayload();
         // Always log arrival — this is the smoking gun for "are we even
         // getting messages from the broker?" investigations.
@@ -477,7 +556,7 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
         try {
             switch (event) {
                 case "vehicleInfo":
-                    dataProvider.updateFromVehicleInfo(respondData, null);
+                    dataProvider.updateFromVehicleInfo(respondData, null, updateSequence);
                     break;
                 // Other event types (smartCharge, energyConsumption,
                 // remoteControl) currently have no consumer — ignore quietly.

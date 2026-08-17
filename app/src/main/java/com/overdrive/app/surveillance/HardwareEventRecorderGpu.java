@@ -13,6 +13,7 @@ import com.overdrive.app.telegram.TelegramNotifier;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.util.Locale;
+import java.util.concurrent.CopyOnWriteArraySet;
 
 /**
  * HardwareEventRecorderGpu - MediaCodec encoder with Surface input for GPU pipeline.
@@ -1128,15 +1129,12 @@ public class HardwareEventRecorderGpu {
     private Runnable fileClosedCallback;
     
     // Streaming
-    // Volatile: setStreamCallback / clearStreamCallback run on the HTTP
-    // worker thread; the drainer thread reads `streamCallback != null &&
-    // streamHeadersSent` on every output buffer. Without volatile, a fresh
-    // callback set just after CSD publish can be invisible to the drainer
-    // (no SPS/PPS sent → late client gets a corrupt stream until the next
-    // IDR), and a `streamHeadersSent=false` reset can be missed (drainer
-    // keeps thinking headers were sent → never re-sends them).
-    private volatile StreamCallback streamCallback;
-    private volatile boolean streamHeadersSent = false;
+    // One encoder feeds the legacy port-8887 server and every /ws client.
+    // A single replaceable callback lets one reconnect erase another
+    // connection's sink, so subscribers are independently owned instead.
+    private final Object streamCallbackLock = new Object();
+    private final CopyOnWriteArraySet<StreamCallback> streamCallbacks =
+        new CopyOnWriteArraySet<>();
     
     // Recording state
     // volatile: read by isRecording() from RecordingModeManager,
@@ -1396,7 +1394,24 @@ public class HardwareEventRecorderGpu {
         
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
         format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);  // I-frame every 2 seconds
+        // I-frame cadence. Recording keeps its historical 2s. LIVE-VIEW STREAMING
+        // uses 1s, matching the OEM app (sl/g.java:238 sets "i-frame-interval" to 1
+        // for its AVM encoder).
+        //
+        // Why it matters here specifically: the byd_apa HAL emits at its own fixed
+        // low rate (~4.5 fps observed) and cannot be retimed — setCameraFps returns
+        // false for every value, and both the OEM app and other players discard that
+        // return. At 4.5 fps a 2-second interval is ~9 frames between keyframes, so
+        // a viewer that joins late, drops a packet, or sees a run of near-empty
+        // P-frames has no recovery point for two seconds and the picture appears
+        // stuck. A 1-second cadence bounds that. Cost is a modest bitrate increase
+        // on a 2 Mbps stream — cheap next to an unusable preview.
+        //
+        // Scoped to stream-only encoders (usePreRecordBuffer == false, set before
+        // init() by GpuSurveillancePipeline:4037 and OemDashcamPipeline), so
+        // recordings on EVERY vehicle — dilink4 or legacy — keep byte-identical
+        // encoder settings.
+        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, usePreRecordBuffer ? 2 : 1);
 
         // Bitrate mode left to encoder default (typically VBR). CBR was tried
         // but caused recordings to freeze 5-6s in on the BYD DiLink 5.0 H.265
@@ -1965,26 +1980,44 @@ public class HardwareEventRecorderGpu {
      * @param callback Callback to receive H.264 packets
      */
     public void setStreamCallback(StreamCallback callback) {
-        this.streamCallback = callback;
-        this.streamHeadersSent = false;
-        
-        // If format already available, send SPS/PPS immediately
-        // This handles late-joining clients after encoder has started
-        if (callback != null && savedFormat != null) {
-            try {
-                ByteBuffer sps = savedFormat.getByteBuffer("csd-0");
-                ByteBuffer pps = savedFormat.getByteBuffer("csd-1");
-                if (sps != null && pps != null) {
-                    callback.onSpsPps(sps.duplicate(), pps.duplicate());
-                    streamHeadersSent = true;
-                    logger.info("SPS/PPS sent immediately to new callback (late join)");
-                }
-            } catch (Exception e) {
-                logger.error("Failed to send SPS/PPS to new callback", e);
-            }
+        synchronized (streamCallbackLock) {
+            streamCallbacks.clear();
+            addStreamCallbackLocked(callback);
         }
-        
         logger.info("Stream callback registered");
+    }
+
+    /** Add one independently removable stream sink without replacing others. */
+    public void addStreamCallback(StreamCallback callback) {
+        synchronized (streamCallbackLock) {
+            addStreamCallbackLocked(callback);
+        }
+    }
+
+    private void addStreamCallbackLocked(StreamCallback callback) {
+        if (callback == null || !streamCallbacks.add(callback) || savedFormat == null) return;
+        sendSpsPps(callback, savedFormat);
+    }
+
+    /** Remove only this client's sink; other clients continue receiving frames. */
+    public void removeStreamCallback(StreamCallback callback) {
+        if (callback == null) return;
+        synchronized (streamCallbackLock) {
+            streamCallbacks.remove(callback);
+        }
+    }
+
+    private void sendSpsPps(StreamCallback callback, MediaFormat format) {
+        try {
+            ByteBuffer sps = format.getByteBuffer("csd-0");
+            ByteBuffer pps = format.getByteBuffer("csd-1");
+            if (sps != null && pps != null) {
+                callback.onSpsPps(sps.duplicate(), pps.duplicate());
+                logger.info("SPS/PPS sent to stream callback");
+            }
+        } catch (Exception e) {
+            logger.error("Failed to send SPS/PPS", e);
+        }
     }
     
     /**
@@ -2373,8 +2406,9 @@ public class HardwareEventRecorderGpu {
      * Removes the streaming callback.
      */
     public void clearStreamCallback() {
-        this.streamCallback = null;
-        this.streamHeadersSent = false;
+        synchronized (streamCallbackLock) {
+            streamCallbacks.clear();
+        }
         logger.info("Stream callback cleared");
     }
     
@@ -2945,13 +2979,14 @@ public class HardwareEventRecorderGpu {
         // the hardware encoder time to finish encoding in-flight frames.
         try {
             for (int drainPass = 0; drainPass < 5; drainPass++) {
-                int framesBefore = recordedFrames;
-                drainEncoderInternal();
-                int framesWritten = recordedFrames - framesBefore;
-                if (framesWritten == 0 && drainPass > 0) {
+                // Count what this pass DEQUEUED, not what reached disk: recordedFrames is advanced
+                // only by the disk-writer thread, which stopDrainerThread() above already stopped,
+                // so measuring it here made every pass read 0 and the loop broke at pass 1.
+                int drained = drainEncoderInternal();
+                if (drained == 0 && drainPass > 0) {
                     break;  // Encoder is empty
                 }
-                if (framesWritten > 0 && drainPass < 4) {
+                if (drained > 0 && drainPass < 4) {
                     // More frames were available — give encoder a moment to finish any in-flight
                     try { Thread.sleep(20); } catch (InterruptedException ignored) {}
                 }
@@ -3155,8 +3190,22 @@ public class HardwareEventRecorderGpu {
                         " (frames=" + recordedFrames + ", size=" + tempFile.length() + ")");
                 tempFile.delete();
             }
+
+            // Every FAILURE branch above unlinks (or renames to .broken) a
+            // *.mp4.tmp that StorageManager counts toward the category's reported
+            // size (partialExtensionsForCategory). Only the SUCCESS branch reaches
+            // onFileSaved, which is what normally invalidates the reporting cache —
+            // so without this an aborted segment's bytes (tens to hundreds of MB)
+            // stayed in the storage card's figure until some unrelated mutation.
+            // Cheap and idempotent, so it runs for the success path too.
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance()
+                        .invalidateCategorySizeCache(null);
+            } catch (Throwable ignored) {
+                // StorageManager may not be initialised in every process.
+            }
         }
-        
+
         // Reset state
         recordedFrames = 0;
         firstFramePtsUs = -1;
@@ -3632,6 +3681,16 @@ public class HardwareEventRecorderGpu {
         } finally {
             cursor.close();
             releaseManualClipReservation();
+            // The three abort paths above each unlink a size-counted
+            // <clip>.mp4.tmp; only the success path reaches onFileSaved (via
+            // ManualClipService). Invalidating in the finally covers every exit
+            // without duplicating the call at each return.
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance()
+                        .invalidateCategorySizeCache(null);
+            } catch (Throwable ignored) {
+                // StorageManager may not be initialised in every process.
+            }
         }
     }
 
@@ -4448,18 +4507,12 @@ public class HardwareEventRecorderGpu {
                     }
                 }
                 
-                // Send SPS/PPS to streaming callback
-                if (streamCallback != null && !streamHeadersSent) {
-                    try {
-                        ByteBuffer sps = format.getByteBuffer("csd-0");
-                        ByteBuffer pps = format.getByteBuffer("csd-1");
-                        if (sps != null && pps != null) {
-                            streamCallback.onSpsPps(sps.duplicate(), pps.duplicate());
-                            streamHeadersSent = true;
-                            logger.info("SPS/PPS sent to stream");
-                        }
-                    } catch (Exception e) {
-                        logger.error("Failed to send SPS/PPS", e);
+                // Every connected sink receives the format before the next
+                // packet. The lock also prevents a just-added client from
+                // racing a packet dispatch ahead of its SPS/PPS.
+                synchronized (streamCallbackLock) {
+                    for (StreamCallback callback : streamCallbacks) {
+                        sendSpsPps(callback, format);
                     }
                 }
                 
@@ -4558,15 +4611,23 @@ public class HardwareEventRecorderGpu {
                     // of this iteration, so outputBuffer's mutation here is
                     // confined to the current thread and bounded to the
                     // stream-callback duration.
-                    if (streamCallback != null && streamHeadersSent) {
+                    StreamCallback[] callbacks;
+                    synchronized (streamCallbackLock) {
+                        callbacks = streamCallbacks.toArray(new StreamCallback[0]);
+                    }
+                    if (callbacks.length > 0) {
                         int savedPos = outputBuffer.position();
                         int savedLim = outputBuffer.limit();
                         try {
                             outputBuffer.position(bufferInfo.offset);
                             outputBuffer.limit(bufferInfo.offset + bufferInfo.size);
-                            streamCallback.onH264Packet(outputBuffer, bufferInfo);
-                        } catch (Exception e) {
-                            logger.error("Stream callback error", e);
+                            for (StreamCallback callback : callbacks) {
+                                try {
+                                    callback.onH264Packet(outputBuffer, bufferInfo);
+                                } catch (Exception e) {
+                                    logger.error("Stream callback error", e);
+                                }
+                            }
                         } finally {
                             outputBuffer.limit(savedLim);
                             outputBuffer.position(savedPos);
@@ -4973,6 +5034,17 @@ public class HardwareEventRecorderGpu {
                     logger.warn("Deleting empty segment " + oldSegmentNumber + " tmp file");
                     oldTemp.delete();
                 }
+
+                // Same reason as closeEventRecording: the failure branches unlink a
+                // size-counted *.mp4.tmp for a COMPLETE rotated segment, and only
+                // the success branch reaches onFileSaved. Without this the reported
+                // size keeps counting a segment that is already gone.
+                try {
+                    com.overdrive.app.storage.StorageManager.getInstance()
+                            .invalidateCategorySizeCache(null);
+                } catch (Throwable ignored) {
+                    // StorageManager may not be initialised in every process.
+                }
             }
 
             // Notify the engine after the rename so consumers can read the
@@ -5145,6 +5217,7 @@ public class HardwareEventRecorderGpu {
         if (orphans == null || orphans.length == 0) return;
 
         long now = System.currentTimeMillis();
+        boolean anyDeleted = false;
         for (File f : orphans) {
             long age = now - f.lastModified();
             if (age > 5 * 60 * 1000) { // Older than 5 minutes
@@ -5157,9 +5230,25 @@ public class HardwareEventRecorderGpu {
                     ok = deleteViaShell(f);
                 }
                 if (ok) {
+                    anyDeleted = true;
                     logger.info("Cleaned orphan: " + f.getName() + " (" + (size / 1024)
                             + " KB, age=" + (age / 1000) + "s)");
                 }
+            }
+        }
+
+        // These .tmp/.broken partials ARE counted by StorageManager's reported size
+        // (partialExtensionsForCategory), and an aborted segment partial is a full
+        // clip — hundreds of MB. This sweep is separate from cleanupOldSegments and
+        // from StorageManager.sweepOrphanTempFiles, so nothing else invalidates the
+        // reporting cache for it; without this the storage card keeps counting bytes
+        // that are already freed.
+        if (anyDeleted) {
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance()
+                        .invalidateCategorySizeCache(null);
+            } catch (Throwable ignored) {
+                // StorageManager may not be initialised in every process.
             }
         }
     }
@@ -5232,6 +5321,7 @@ public class HardwareEventRecorderGpu {
         }
         
         // Delete oldest files if over limit
+        boolean anyDeleted = false;
         if (totalSize > maxSizeBytes) {
             // Sort by last modified (oldest first)
             java.util.Arrays.sort(files, (f1, f2) -> 
@@ -5266,6 +5356,7 @@ public class HardwareEventRecorderGpu {
                 long fileSize = file.length();
                 if (file.delete()) {
                     totalSize -= fileSize;
+                    anyDeleted = true;
                     long sidecarBytes = deleteSegmentSidecars(file);
                     logger.info("Deleted old segment: " + file.getName() +
                             " (" + (fileSize / 1024) + " KB"
@@ -5274,6 +5365,20 @@ public class HardwareEventRecorderGpu {
                 } else {
                     logger.warn("Failed to delete file: " + file.getName());
                 }
+            }
+        }
+
+        // This rotation frees size-counted .mp4s AND their .json/.jpg/thumb_
+        // sidecars, but it is the recorder's OWN loop-rotation — it does not go
+        // through StorageManager's reap, so nothing else invalidates the reporting
+        // size/count cache. Without this the storage card keeps reporting the
+        // rotated-away bytes until some other mutation happens to invalidate.
+        if (anyDeleted) {
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance()
+                        .invalidateCategorySizeCache(null);
+            } catch (Throwable ignored) {
+                // StorageManager may not be initialised in every process.
             }
         }
     }

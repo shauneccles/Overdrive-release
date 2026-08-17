@@ -57,7 +57,10 @@ BYD.recording = {
         // Dynamic per-volume ceilings; server pulls these from live StatFs.
         maxLimitMb: 100000,
         maxLimitMbSdCard: 100000,
-        maxLimitMbUsb: 100000
+        maxLimitMbUsb: 100000,
+        // Combined-limit advisory (one entry per targeted volume). See
+        // shared/storage-budget.js — rendered, never enforced.
+        storageBudget: []
     },
     cdrInfo: null,
     savedConfig: null,
@@ -92,17 +95,27 @@ BYD.recording = {
         
         // Reload config when page becomes visible (user switches back to tab)
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible' && !this.hasUnsavedChanges) {
+            // reloadConfig self-gates on hasUnsavedChanges (and falls back to the
+            // banner-only refresh when dirty), so no second gate here — returning to a
+            // dirty tab should still pick up a peer page's limit change.
+            if (document.visibilityState === 'visible') {
                 this.reloadConfig();
             }
         });
         
         // SOTA: More frequent config refresh (every 10s) to catch app UI changes quickly
         setInterval(() => {
-            if (!this.hasUnsavedChanges) {
-                this.reloadConfig();
+            // Unconditional: reloadConfig self-gates on hasUnsavedChanges and, when
+            // dirty, refreshes only the overcommit banner (which writes no control).
+            // Gating here as well would leave a dirty page's banner stale forever.
+            this.reloadConfig();
+            // Skip 2 of every 3 ticks while the recordings index is down
+            // (10s → 30s effective) so a permanently-down index doesn't get
+            // polled 6×/min for as long as the page stays open.
+            this._statsSkip = (this._statsSkip || 0) + 1;
+            if (!this._indexDown || this._statsSkip % 3 === 0) {
+                this.loadStorageStats();  // Always refresh storage stats
             }
-            this.loadStorageStats();  // Always refresh storage stats
 
             // Refresh CDR info if visible
             if (this.config.recordingsStorageType === 'SD_CARD') {
@@ -131,8 +144,16 @@ BYD.recording = {
     
     async reloadConfig() {
         // Only reload if no unsaved changes
-        if (this.hasUnsavedChanges) return;
-        
+        if (this.hasUnsavedChanges) {
+            // ...but the overcommit advisory still must track PEER pages: it's a
+            // function of the other categories' limits, so a dirty page would
+            // otherwise keep asserting an overcommit the user already fixed elsewhere
+            // (or stay silent about a new one) for as long as it stays dirty. Safe to
+            // run while dirty because it writes no control — only the banner.
+            this.refreshBudgetOnly();
+            return;
+        }
+
         try {
             const resp = await fetch('/api/settings/quality');
             const data = await resp.json();
@@ -302,6 +323,17 @@ BYD.recording = {
             }
         } catch (e) {}
 
+        // Kick the storage read NOW and join it at the end, so the expensive
+        // /api/settings/storage overlaps the two cheap reads below instead of
+        // running after them. It writes only recordingsLimitMb /
+        // recordingsStorageType / storageInfo.*, which nothing below touches.
+        //
+        // NOTE the mode reads below stay SERIAL with respect to each other on
+        // purpose: /api/recording/mode and /api/settings/unified both write
+        // config.recordingMode, and unified is meant to win. Parallelising that
+        // pair would make the winner depend on response order.
+        const storageSettingsPromise = this.loadStorageSettings();
+
         // Load recording mode
         try {
             const modeResp = await fetch('/api/recording/mode');
@@ -355,9 +387,10 @@ BYD.recording = {
         } catch (e) {
             console.warn('Failed to load unified config:', e);
         }
-        
-        // Load storage settings
-        await this.loadStorageSettings();
+
+        // Join the storage read kicked off above. loadStorageSettings() swallows
+        // its own errors, so this can't reject and reach callers.
+        await storageSettingsPromise;
     },
     
     async loadStorageSettings() {
@@ -404,6 +437,7 @@ BYD.recording = {
                 // fallback to internal; drives the honest banner copy below.
                 this.storageInfo.recordingsEffectiveLimitMb = data.recordingsEffectiveLimitMb || 0;
                 this.storageInfo.recordingsPath = data.recordingsPath || '';
+                this.storageInfo.storageBudget = data.storageBudget || [];
 
                 this.updateStorageLimitUI();
                 this.updateStorageTypeUI();
@@ -417,6 +451,28 @@ BYD.recording = {
         try {
             const resp = await fetch('/api/recordings/stats');
             const data = await resp.json();
+            // Recordings index is down — the zeroed counters in this payload
+            // are not authoritative, so show "--" rather than asserting the
+            // library is empty. Also mark the outage so the 10s poller backs
+            // off instead of hammering the daemon 6×/min for the page's whole
+            // lifetime (each 503 takes the index monitor server-side).
+            if (data.indexUnavailable) {
+                this._indexDown = true;
+                var rdIds = ['storageUsed', 'storageLimit'];
+                for (var ri = 0; ri < rdIds.length; ri++) {
+                    var rel = document.getElementById(rdIds[ri]);
+                    if (rel) rel.textContent = '--';
+                }
+                var rFill = document.getElementById('storageFill');
+                if (rFill) rFill.style.width = '0%';
+                // Today's clip count is written only in the success branch, so
+                // without this it keeps its hardcoded "0 →" default and asserts
+                // that nothing was recorded today.
+                var rToday = document.getElementById('recToday');
+                if (rToday) rToday.textContent = '--';
+                return;
+            }
+            this._indexDown = false;
             if (data.success) {
                 const usedEl = document.getElementById('storageUsed');
                 const limitEl = document.getElementById('storageLimit');
@@ -454,8 +510,11 @@ BYD.recording = {
                 };
 
                 // Used = everything the recordings quota actually holds
-                // (cam_* + replay_*), matching the server-side reaper.
-                const usedBytes = (counts.normal.bytes || 0) + (counts.replay.bytes || 0);
+                // (cam_*/dvr_* + replay_* + proximity_*), matching the server-side
+                // reaper. Proximity shares the recordings cap, so leaving it out made
+                // the bar read "in cap" while dashcam clips were being deleted.
+                const usedBytes = (counts.normal.bytes || 0) + (counts.replay.bytes || 0)
+                    + (counts.proximity.bytes || 0);
                 if (usedEl) usedEl.textContent = BYD.i18n.t('recording.storage_used', {size: this.formatSize(usedBytes)});
 
                 const limitMb = this.config.recordingsLimitMb || 500;
@@ -545,6 +604,37 @@ BYD.recording = {
         const maxLabel = document.getElementById('recLimitMax');
         if (minLabel) minLabel.textContent = BYD.i18n.t('recording.unit_mb', {n: 100});
         if (maxLabel) maxLabel.textContent = maxLimit >= 1000 ? BYD.i18n.t('recording.unit_gb', {n: (maxLimit / 1000)}) : BYD.i18n.t('recording.unit_mb', {n: maxLimit});
+
+        this.updateBudgetBanner();
+    },
+
+    /**
+     * Render the combined-limit advisory. Passes the CURRENT (possibly unsaved)
+     * slider value as pending so the warning appears while dragging, not only
+     * after Apply. Guarded on the shared module being present so a cached page
+     * without the new script tag doesn't throw.
+     */
+    updateBudgetBanner() {
+        if (!BYD.storageBudget) return;
+        BYD.storageBudget.render('recBudgetBanner', this.storageInfo.storageBudget,
+            'recordings', this.config.recordingsLimitMb, this.config.recordingsStorageType);
+    },
+
+    /**
+     * Re-read ONLY the storage budget and re-render the advisory — for the dirty-page
+     * case, where the full reloadConfig is (correctly) suppressed to protect unsaved
+     * edits. Writes no control, so it is safe with edits in flight; the pending slider
+     * value in this.config is what the banner renders against either way.
+     */
+    async refreshBudgetOnly() {
+        if (!BYD.storageBudget) return;
+        try {
+            const resp = await fetch('/api/settings/storage');
+            const data = await resp.json();
+            if (!data || !data.success || !data.storageBudget) return;
+            this.storageInfo.storageBudget = data.storageBudget;
+            this.updateBudgetBanner();
+        } catch (e) { /* advisory only — keep the last render */ }
     },
     
     updateStorageTypeUI() {
@@ -901,6 +991,9 @@ BYD.recording = {
         this.config.recordingsLimitMb = parseInt(value);
         const v = parseInt(value);
         document.getElementById('recLimitValue').textContent = v >= 1000 ? BYD.i18n.t('recording.unit_gb', {n: (v / 1000)}) : BYD.i18n.t('recording.unit_mb', {n: v});
+        // Live advisory while dragging — the point at which the user crosses the
+        // volume's capacity is exactly when they need to know.
+        this.updateBudgetBanner();
         this.markChanged();
     },
 
@@ -1481,6 +1574,15 @@ BYD.recording = {
 
     // ==================== Telemetry Overlay ====================
 
+    // Cached field catalog (list of selectable keys) + last-known fields per
+    // flow, so a checklist edit can POST the whole flow array back.
+    _telemetryCatalog: null,
+    _telemetryFields: { accOn: [], surveillance: [], oemDashcam: [] },
+    // Field edits auto-POST, so hasUnsavedChanges never trips and the 10s
+    // reloadConfig poller can re-render a grid between a click and its POST,
+    // visually reverting the checkbox. Skip re-rendering while one is in flight.
+    _telemetryFieldPostInFlight: 0,
+
     async loadTelemetryOverlay() {
         try {
             const resp = await fetch('/api/settings/telemetry-overlay');
@@ -1488,9 +1590,106 @@ BYD.recording = {
             if (data.success) {
                 const toggle = document.getElementById('telemetryOverlayEnabled');
                 if (toggle) toggle.checked = data.enabled || false;
+                this._telemetryCatalog = data.fieldCatalog || null;
+                if (data.fields) this._telemetryFields = data.fields;
+                // Render the ACC-on flow checklist and reflect enabled state.
+                this.renderTelemetryFields('accOn', 'telemetryFieldsAccOnGrid');
+                this.updateTelemetryFieldsVisibility('accOn', !!(toggle && toggle.checked));
+                // Re-render the OEM grid too: it shares this catalog and may have
+                // rendered empty if loadOemDashcam won the init race.
+                const oemCb = document.getElementById('oemTelemetryOverlay');
+                if (oemCb) {
+                    this.renderTelemetryFields('oemDashcam', 'telemetryFieldsOemDashcamGrid');
+                    this.updateTelemetryFieldsVisibility('oemDashcam', !!oemCb.checked);
+                }
             }
         } catch (e) {
             console.warn('Failed to load telemetry overlay state:', e);
+        }
+    },
+
+    // Human-readable label for a field key. Uses i18n when present, falls back
+    // to a built-in English map so the checklist is never blank.
+    telemetryFieldLabel(key) {
+        const fallback = {
+            speed: 'Speed', gear: 'Gear', accelPedal: 'Accelerator',
+            brakePedal: 'Brake', seatbeltDriver: 'Driver seatbelt',
+            seatbeltPassenger: 'Passenger seatbelt', turnSignals: 'Turn signals',
+            timestamp: 'Date & time', batteryPercent: 'Battery %',
+            voltage12v: '12V voltage', lowBeam: 'Low beam',
+            highBeam: 'High beam', location: 'GPS location',
+            vin: 'VIN'
+        };
+        const i18nKey = 'recording.telemetry_field_' + key;
+        const t = (BYD.i18n && BYD.i18n.t) ? BYD.i18n.t(i18nKey) : null;
+        return (t && t !== i18nKey) ? t : (fallback[key] || key);
+    },
+
+    // Build the chip grid for a flow from the cached catalog + selection.
+    // Reuses the .checkbox-item chip look (hidden input + .active state).
+    renderTelemetryFields(flow, gridId) {
+        const grid = document.getElementById(gridId);
+        if (!grid || !this._telemetryCatalog) return;
+        // Don't repaint over an edit whose POST hasn't landed yet.
+        if (this._telemetryFieldPostInFlight > 0) return;
+        const selected = new Set(this._telemetryFields[flow] || []);
+        grid.innerHTML = '';
+        this._telemetryCatalog.forEach(f => {
+            const id = 'telField_' + flow + '_' + f.key;
+            const label = document.createElement('label');
+            label.className = 'checkbox-item' + (selected.has(f.key) ? ' active' : '');
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.id = id;
+            cb.checked = selected.has(f.key);
+            cb.addEventListener('change', () => {
+                label.classList.toggle('active', cb.checked);
+                this.toggleTelemetryField(flow, f.key, cb.checked, gridId);
+            });
+            const span = document.createElement('span');
+            span.textContent = this.telemetryFieldLabel(f.key);
+            label.appendChild(cb);
+            label.appendChild(span);
+            grid.appendChild(label);
+        });
+    },
+
+    updateTelemetryFieldsVisibility(flow, visible) {
+        const wrap = document.getElementById('telemetryFields'
+            + flow.charAt(0).toUpperCase() + flow.slice(1));
+        if (wrap) wrap.style.display = visible ? '' : 'none';
+    },
+
+    // Collect the currently-checked keys for a flow from the DOM grid.
+    _collectFlowFields(flow, gridId) {
+        const grid = document.getElementById(gridId);
+        const keys = [];
+        if (grid) {
+            grid.querySelectorAll('input[type=checkbox]').forEach(cb => {
+                if (cb.checked) keys.push(cb.id.replace('telField_' + flow + '_', ''));
+            });
+        }
+        return keys;
+    },
+
+    async toggleTelemetryField(flow, key, checked, gridId) {
+        const keys = this._collectFlowFields(flow, gridId);
+        this._telemetryFields[flow] = keys;
+        const body = { fields: {} };
+        body.fields[flow] = keys;
+        this._telemetryFieldPostInFlight++;
+        try {
+            const resp = await fetch('/api/settings/telemetry-overlay', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            const data = await resp.json();
+            if (data.success && data.fields) this._telemetryFields = data.fields;
+        } catch (e) {
+            console.warn('Failed to update telemetry fields:', e);
+        } finally {
+            this._telemetryFieldPostInFlight--;
         }
     },
 
@@ -1507,6 +1706,7 @@ BYD.recording = {
             const data = await resp.json();
             if (data.success) {
                 toggle.checked = data.enabled;
+                this.updateTelemetryFieldsVisibility('accOn', !!data.enabled);
                 if (BYD.utils && BYD.utils.toast) {
                     BYD.utils.toast(data.enabled ? BYD.i18n.t('recording.telemetry_overlay_enabled') : BYD.i18n.t('recording.telemetry_overlay_disabled'), 'success');
                 }
@@ -1872,6 +2072,14 @@ BYD.recording = {
 
             const telCb = document.getElementById('oemTelemetryOverlay');
             if (telCb) telCb.checked = !!(tdata && tdata.oemDashcamEnabled);
+            // OEM field checklist mirrors the ACC-on one but its own flow.
+            // Seed the shared cache from this response: both loaders run in one
+            // Promise.all, so loadTelemetryOverlay may not have populated it yet
+            // and the grid would render empty with nothing to retry it.
+            if (tdata && tdata.fieldCatalog) this._telemetryCatalog = tdata.fieldCatalog;
+            if (tdata && tdata.fields) this._telemetryFields = tdata.fields;
+            this.renderTelemetryFields('oemDashcam', 'telemetryFieldsOemDashcamGrid');
+            this.updateTelemetryFieldsVisibility('oemDashcam', !!(telCb && telCb.checked));
 
             // Surface pipeline + recording state. Status badge + status row
             // both reflect the same source so the user sees one consistent
@@ -2106,6 +2314,8 @@ BYD.recording = {
                 if (BYD.utils && BYD.utils.toast) {
                     BYD.utils.toast(BYD.i18n.t('common.error'), 'error');
                 }
+            } else {
+                this.updateTelemetryFieldsVisibility('oemDashcam', enabled);
             }
         } catch (e) {
             cb.checked = !enabled;

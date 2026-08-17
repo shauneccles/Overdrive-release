@@ -31,8 +31,11 @@ public class TripDatabase {
     // (H2 throws JdbcSQLFeatureNotSupportedException at init). Single-
     // process architecture: only CameraDaemon writes, TripApiHandler reads
     // from the same JVM. FILE_LOCK=SOCKET handles cross-process safety.
+    // AUTO_COMPACT_FILL_RATE=50: idle-CPU tuning shared by all seven H2 stores
+    // (see SocHistoryDatabase.JDBC_URL for the full rationale).
     private static final String JDBC_URL = "jdbc:h2:file:" + DB_PATH +
-            ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE";
+            ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE" +
+            ";AUTO_COMPACT_FILL_RATE=50";
 
     // volatile: reassigned by reconnect() (now synchronized); the fence gives a
     // happens-before edge so any reader sees the freshly-swapped connection.
@@ -99,7 +102,14 @@ public class TripDatabase {
         }
     }
 
-    public void close() {
+    // synchronized: this NULLS the shared `connection` field, exactly like
+    // reconnect() reassigns it — so it must take the same monitor every CRUD
+    // method and ensureConnection() hold. Without it, a worker that just passed
+    // ensureConnection()==true could NPE on connection.prepareStatement, have its
+    // catch call reconnect(), and RE-OPEN the store with isInitialized=true after
+    // a deliberate close — leaving a half-dead state where writes are possible but
+    // no trip will ever start.
+    public synchronized void close() {
         if (connection != null) {
             try {
                 connection.close();
@@ -146,15 +156,60 @@ public class TripDatabase {
                 reconnect();
                 return connection != null && !connection.isClosed();
             }
-            return true;
+            // isClosed() is not enough. It reports only whether THIS Connection object was
+            // closed on our side; when H2 shuts the DATABASE down underneath us it keeps
+            // returning false while every statement throws 90098 "The database has been
+            // closed". Observed on a BYD Seal head unit on 2026-08-14: the store closed
+            // mid-session and stayed dead for hours until the daemon was restarted. The
+            // failure is near-silent, because every DAO logs its SQLException and returns an
+            // empty result — so GET /api/trips answered `success:true, trips:[]`, anything
+            // derived from trip history (recent consumption, range estimates) went null, and
+            // a real drive was recorded to the telemetry file only, to be rebuilt later by
+            // recoverTripsFromDisk. So probe the store instead of trusting the flag.
+            if (probe()) return true;
+            logger.warn("connection alive but database unusable — forcing a reopen");
+            forceReconnect();
+            return probe();
         } catch (Exception e) {
             logger.error("Connection check failed", e);
-            reconnect();
+            forceReconnect();
             try {
                 return connection != null && !connection.isClosed();
             } catch (Exception e2) {
                 return false;
             }
+        }
+    }
+
+    /**
+     * Cheapest round-trip that actually reaches the store. Embedded H2, so this is
+     * microseconds; the alternative is trusting a client-side flag that lies.
+     */
+    private boolean probe() {
+        Connection c = connection;
+        if (c == null) return false;
+        try (java.sql.Statement st = c.createStatement()) {
+            st.execute("SELECT 1");
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Reopen unconditionally. {@link #reconnect()} is a no-op when {@code isClosed()} returns
+     * false, which is exactly the case that needs reopening here, so the handle is dropped
+     * first.
+     */
+    private synchronized void forceReconnect() {
+        Connection old = connection;
+        connection = null;
+        if (old != null) {
+            try { old.close(); } catch (Exception ignored) { }
+        }
+        reconnect();
+        if (connection != null) {
+            logger.info("Trip database reopened after the store closed underneath us");
         }
     }
 
@@ -226,7 +281,13 @@ public class TripDatabase {
                 // is their delta; these are the readings shown on the trip UI.
                 // 0 = odometer was unavailable at that edge (recovered/legacy row).
                 "odometer_start_km REAL DEFAULT 0," +
-                "odometer_end_km REAL DEFAULT 0" +
+                "odometer_end_km REAL DEFAULT 0," +
+                // Cumulative HAL electricity-consumption counter (kWh) at trip
+                // start/end — the electric twin of fuel_con_*. Its delta is the
+                // metered kWh drawn, the only electric-energy source with enough
+                // resolution to measure a short trip. -1 = not captured.
+                "elec_con_start REAL DEFAULT -1," +
+                "elec_con_end REAL DEFAULT -1" +
                 ")"
             );
 
@@ -286,6 +347,29 @@ public class TripDatabase {
                 stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS odometer_end_km REAL DEFAULT 0");
             } catch (Exception e) {
                 logger.debug("trips odometer column migration: " + e.getMessage());
+            }
+
+            // Migration: cumulative HAL electricity-accumulator snapshots. Old
+            // rows read these as -1 (sentinel "no accumulator"), so the energy
+            // cascade falls back to the remaining-kWh delta exactly as before —
+            // no regression, and no stored energy figure is rewritten.
+            try {
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS elec_con_start REAL DEFAULT -1");
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS elec_con_end REAL DEFAULT -1");
+            } catch (Exception e) {
+                logger.debug("trips elec-accumulator column migration: " + e.getMessage());
+            }
+
+            // Migration: provenance of electricity_rate. A trip is now priced at
+            // the rate the LAST CHARGE was billed at (the energy it burned was
+            // bought then), so we record which source supplied the rate and the
+            // tariff label behind it. Old rows read '' — the UI treats that as
+            // "no provenance chip" and shows cost exactly as it did before.
+            try {
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS rate_source VARCHAR(16) DEFAULT ''");
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS rate_label VARCHAR(64) DEFAULT ''");
+            } catch (Exception e) {
+                logger.debug("trips rate-source column migration: " + e.getMessage());
             }
 
             // Routes table for O(1) similar-trip lookups
@@ -431,8 +515,9 @@ public class TripDatabase {
                 "efficiency_score, consistency_score, micro_moments_json, telemetry_file_path, route_id, " +
                 "is_phev, fuel_pct_start, fuel_pct_end, litres_used, fuel_price_per_l, fuel_cost, " +
                 "electric_cost, ice_seconds, fuel_con_start, fuel_con_end, size_bytes, sidecar_size_bytes, " +
-                "odometer_start_km, odometer_end_km) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "odometer_start_km, odometer_end_km, rate_source, rate_label, " +
+                "elec_con_start, elec_con_end) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         try (PreparedStatement pstmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
             setTripParams(pstmt, trip);
@@ -442,6 +527,10 @@ public class TripDatabase {
             pstmt.setLong(45, trip.sidecarSizeBytes);
             pstmt.setDouble(46, trip.odometerStartKm);
             pstmt.setDouble(47, trip.odometerEndKm);
+            pstmt.setString(48, trip.rateSource != null ? trip.rateSource : "");
+            pstmt.setString(49, trip.rateLabel != null ? trip.rateLabel : "");
+            pstmt.setDouble(50, trip.elecConStart);
+            pstmt.setDouble(51, trip.elecConEnd);
             pstmt.executeUpdate();
 
             try (ResultSet keys = pstmt.getGeneratedKeys()) {
@@ -476,7 +565,8 @@ public class TripDatabase {
                 "route_id=?, " +
                 "is_phev=?, fuel_pct_start=?, fuel_pct_end=?, litres_used=?, fuel_price_per_l=?, " +
                 "fuel_cost=?, electric_cost=?, ice_seconds=?, fuel_con_start=?, fuel_con_end=?, " +
-                "size_bytes=?, sidecar_size_bytes=?, odometer_start_km=?, odometer_end_km=? " +
+                "size_bytes=?, sidecar_size_bytes=?, odometer_start_km=?, odometer_end_km=?, " +
+                "rate_source=?, rate_label=?, elec_con_start=?, elec_con_end=? " +
                 "WHERE id=?";
 
         try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
@@ -487,7 +577,11 @@ public class TripDatabase {
             pstmt.setLong(45, trip.sidecarSizeBytes);
             pstmt.setDouble(46, trip.odometerStartKm);
             pstmt.setDouble(47, trip.odometerEndKm);
-            pstmt.setLong(48, trip.id);
+            pstmt.setString(48, trip.rateSource != null ? trip.rateSource : "");
+            pstmt.setString(49, trip.rateLabel != null ? trip.rateLabel : "");
+            pstmt.setDouble(50, trip.elecConStart);
+            pstmt.setDouble(51, trip.elecConEnd);
+            pstmt.setLong(52, trip.id);
             pstmt.executeUpdate();
             logger.debug("Updated trip id=" + trip.id);
         } catch (Exception e) {
@@ -1294,10 +1388,9 @@ public class TripDatabase {
     // phantom trip in history + rollups + routes.
     private static final long MIN_TRIP_DURATION_MS = 60_000L;
     private static final double MIN_TRIP_DISTANCE_KM = 0.2;
-    // GPS-altitude noise floor for elevation reconstruction, mirroring the live
-    // scoring path (TripScoreEngine.ALT_NOISE_THRESHOLD = 2.0 m). Sub-floor
-    // altitude wobble is ignored so recovered climb/descent isn't fabricated.
-    private static final double ALT_NOISE_THRESHOLD_M = 2.0;
+    // Elevation reconstruction uses the SAME ElevationEstimator as the live
+    // scoring path (TripScoreEngine) — one implementation, one set of noise/
+    // accuracy constants, instead of a hand-synced duplicate deadband here.
     // Max file-missing-while-volume-up rows the orphan reconcile will delete in
     // ONE pass. Genuine deletions are incremental (a handful per 30s tick); a
     // larger batch signals a transient FUSE stat storm (files exist() returns
@@ -1630,7 +1723,8 @@ public class TripDatabase {
         int maxSpeed = 0;
         long speedSum = 0; int speedCount = 0;
         double elevGain = 0, elevLoss = 0;
-        double prevLat = 0, prevLon = 0, prevAlt = Double.NaN;
+        ElevationEstimator elevation = new ElevationEstimator();
+        double prevLat = 0, prevLon = 0;
         long prevGpsTs = 0;
         boolean havePrevGps = false;
         double firstLat = 0, firstLon = 0, lastLat = 0, lastLon = 0;
@@ -1667,23 +1761,18 @@ public class TripDatabase {
                 }
                 prevLat = s.lat; prevLon = s.lon; prevGpsTs = s.timestampMs; havePrevGps = true;
             }
-            if (!Double.isNaN(s.altitude) && s.altitude != 0) {
-                if (Double.isNaN(prevAlt)) {
-                    prevAlt = s.altitude;
-                } else {
-                    double dAlt = s.altitude - prevAlt;
-                    // Deadband: GPS altitude jitters several metres even parked.
-                    // Only accumulate (and only advance the baseline) once the
-                    // change clears a noise floor, mirroring the live scoring
-                    // path (TripScoreEngine.ALT_NOISE_THRESHOLD = 2.0 m). Without
-                    // this, ~1Hz jitter integrates into fabricated climb totals.
-                    if (Math.abs(dAlt) >= ALT_NOISE_THRESHOLD_M) {
-                        if (dAlt > 0) elevGain += dAlt; else elevLoss += -dAlt;
-                        prevAlt = s.altitude;
-                    }
-                }
-            }
+            // Elevation: SAME pipeline as the live scoring path (movement gate,
+            // vertical-accuracy gate, 10s median smoothing, MSL-source-flip and
+            // long-gap resets, hysteresis banking). Works at this file's ~1Hz
+            // rate because the smoothing window is time-based. Old telemetry
+            // files lack the "va"/"am" keys — they decode as 0/false, meaning
+            // "no accuracy gate, no source flips" (graceful degradation).
+            elevation.addSample(s.timestampMs, s.altitude, s.verticalAccuracyM,
+                    s.altitudeIsMsl,
+                    ElevationEstimator.isElevationEligible(s.gearMode, s.speedKmh));
         }
+        elevGain = elevation.getGainM();
+        elevLoss = elevation.getLossM();
 
         t.distanceKm = distKm;
         t.maxSpeedKmh = maxSpeed;
@@ -1850,6 +1939,8 @@ public class TripDatabase {
             o.put("energyPerKm", t.energyPerKm);
             o.put("electricityRate", t.electricityRate);
             o.put("currency", t.currency != null ? t.currency : "");
+            o.put("rateSource", t.rateSource != null ? t.rateSource : "");
+            o.put("rateLabel", t.rateLabel != null ? t.rateLabel : "");
             o.put("tripCost", t.tripCost);
             o.put("kinematicState", t.kinematicState != null ? t.kinematicState : "");
             o.put("gradientProfile", t.gradientProfile != null ? t.gradientProfile : "");
@@ -1878,6 +1969,8 @@ public class TripDatabase {
             o.put("iceSeconds", t.iceSeconds());
             o.put("fuelConStart", t.fuelConStart);
             o.put("fuelConEnd", t.fuelConEnd);
+            o.put("elecConStart", t.elecConStart);
+            o.put("elecConEnd", t.elecConEnd);
             o.put("odometerStartKm", t.odometerStartKm);
             o.put("odometerEndKm", t.odometerEndKm);
         } catch (Exception e) {
@@ -1934,8 +2027,12 @@ public class TripDatabase {
         t.iceSecondsAtomic.set(o.optInt("iceSeconds", 0));
         t.fuelConStart = o.optDouble("fuelConStart", -1);
         t.fuelConEnd = o.optDouble("fuelConEnd", -1);
+        t.elecConStart = o.optDouble("elecConStart", -1);
+        t.elecConEnd = o.optDouble("elecConEnd", -1);
         t.odometerStartKm = o.optDouble("odometerStartKm", 0);
         t.odometerEndKm = o.optDouble("odometerEndKm", 0);
+        t.rateSource = o.optString("rateSource", "");
+        t.rateLabel = o.optString("rateLabel", "");
         return t;
     }
 
@@ -2147,6 +2244,11 @@ public class TripDatabase {
         // otherwise return 0.0, which falsely satisfies the >=0 metered guard.
         try { trip.fuelConStart = rs.getDouble("fuel_con_start"); if (rs.wasNull()) trip.fuelConStart = -1; } catch (Exception e) { trip.fuelConStart = -1; }
         try { trip.fuelConEnd   = rs.getDouble("fuel_con_end");   if (rs.wasNull()) trip.fuelConEnd   = -1; } catch (Exception e) { trip.fuelConEnd = -1; }
+        // Same wasNull re-mapping for the electricity accumulator: a NULL read as
+        // 0.0 would look like a valid "meter says zero kWh" pair and suppress the
+        // fallback tiers, zeroing energy on every legacy row.
+        try { trip.elecConStart = rs.getDouble("elec_con_start"); if (rs.wasNull()) trip.elecConStart = -1; } catch (Exception e) { trip.elecConStart = -1; }
+        try { trip.elecConEnd   = rs.getDouble("elec_con_end");   if (rs.wasNull()) trip.elecConEnd   = -1; } catch (Exception e) { trip.elecConEnd = -1; }
         // Storage accounting (added in size-backfill migration). 0 means
         // "not yet backfilled" — see runBackfillIfNeeded().
         try { trip.sizeBytes        = rs.getLong("size_bytes"); }         catch (Exception e) { trip.sizeBytes = 0; }
@@ -2154,6 +2256,10 @@ public class TripDatabase {
         // Absolute odometer snapshots (0 = unavailable at that edge → UI shows "--").
         try { trip.odometerStartKm = rs.getDouble("odometer_start_km"); } catch (Exception e) { trip.odometerStartKm = 0; }
         try { trip.odometerEndKm   = rs.getDouble("odometer_end_km"); }   catch (Exception e) { trip.odometerEndKm = 0; }
+        // Rate provenance ("charge"/"config" + tariff label). Empty on every trip
+        // recorded before this column existed → UI omits the chip.
+        try { String rs1 = rs.getString("rate_source"); trip.rateSource = rs1 != null ? rs1 : ""; } catch (Exception e) { trip.rateSource = ""; }
+        try { String rl = rs.getString("rate_label");  trip.rateLabel  = rl != null ? rl : ""; }   catch (Exception e) { trip.rateLabel = ""; }
         return trip;
     }
 

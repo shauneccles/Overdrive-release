@@ -1,17 +1,24 @@
 package com.overdrive.app.ui
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.view.animation.PathInterpolator
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.TooltipCompat
 import androidx.navigation.NavController
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.AppBarConfiguration
@@ -24,7 +31,11 @@ import com.overdrive.app.storage.StorageSetup
 import com.overdrive.app.ui.daemon.DaemonStartupManager
 import com.overdrive.app.ui.model.DaemonStatus
 import com.overdrive.app.ui.model.DaemonType
+import com.overdrive.app.ui.model.NavigationRailSwipePolicy
 import com.overdrive.app.ui.model.TunnelDisplayPolicy
+import com.overdrive.app.ui.navigation.NavigationRailCatalog
+import com.overdrive.app.ui.util.PreferencesManager
+import com.overdrive.app.ui.widget.SwipeExpandableRailScrollView
 import com.overdrive.app.ui.viewmodel.DaemonsViewModel
 import com.overdrive.app.ui.viewmodel.LogsViewModel
 import com.overdrive.app.ui.viewmodel.MainViewModel
@@ -60,6 +71,19 @@ class MainActivity : AppCompatActivity() {
     // Bounded poll while waiting for an onboarding navigation to commit (~2s total).
     private val NAV_POLL_INTERVAL_MS = 100L
     private val NAV_POLL_MAX_ATTEMPTS = 20
+    private val RAIL_COMPACT_WIDTH_DP = 80
+    private val RAIL_EXPANDED_WIDTH_DP = 216
+    private val RAIL_ANIMATION_MS = 350L
+    // Floor for a re-toggle that interrupts a slide part-way: the duration
+    // scales with the distance left, but never gets so short it reads as a snap.
+    private val RAIL_ANIMATION_MIN_MS = 140L
+    // Chevron's distance from the rail's trailing edge when expanded:
+    // 8dp margin + half of the 48dp button.
+    private val RAIL_CHEVRON_EDGE_INSET_DP = 32
+    private val KEY_RAIL_EXPANDED = "navigation_rail_expanded"
+    // M3 emphasized-decelerate — same curve ZoomableVideoView uses, so the rail
+    // shares the app's motion vocabulary instead of a stock Decelerate.
+    private val RAIL_EASING = PathInterpolator(0.05f, 0.7f, 0.1f, 1.0f)
 
     // Handler + runnable owned by the activity so they can be cancelled in
     // onDestroy() — prevents the periodic update check from leaking the
@@ -79,6 +103,16 @@ class MainActivity : AppCompatActivity() {
     // UI elements
     private lateinit var toolbar: MaterialToolbar
     private lateinit var navigationRail: LinearLayout
+    private lateinit var navigationRailScroll: SwipeExpandableRailScrollView
+    private var navigationRailExpanded = false
+    private var navigationRailAnimator: ValueAnimator? = null
+    // Which form the rows currently hold. Rows sit in expanded form for the
+    // whole slide and only return to compact once a collapse settles, so a
+    // starting slide can skip a redundant 17-row relayout on its first frame.
+    // Starts false to match item_rail_destination.xml's compact form.
+    private var navigationRailRowsExpandedForm = false
+    private var railItems: List<RailItem> = emptyList()
+    private var railActionItems: List<RailActionItem> = emptyList()
     private lateinit var tvCurrentUrl: TextView
     private lateinit var urlBar: View
     private lateinit var statusPill: View
@@ -178,6 +212,7 @@ class MainActivity : AppCompatActivity() {
 
         initViews()
         setupNavigation(savedInstanceState)
+        handleNavigateExtra(intent)
         setupCopyButton()
         setupLogListener()
         observeViewModels()
@@ -371,6 +406,7 @@ class MainActivity : AppCompatActivity() {
         maybeShowPinLock()
         intent?.let {
             handleLocationStartIntent(it)
+            handleNavigateExtra(it)
             // Critical: when MainActivity is already running and the install
             // script's `am start --ez post_update true` re-delivers the
             // intent (singleTop launchMode → onNewIntent, not onCreate), the
@@ -382,6 +418,33 @@ class MainActivity : AppCompatActivity() {
             // consumed, subsequent calls become no-ops).
             runDaemonStartup(it, fromOnCreate = false)
         }
+    }
+
+    /**
+     * Deep-link entry for external surfaces (the OverDrive launcher's glance
+     * widgets, notifications). A plain string extra keeps the contract stable
+     * across both APKs without sharing code: `--es navigate_to trips`.
+     * The extra is STRIPPED once consumed so an OS task-restore of the same
+     * intent record cannot replay the navigation over the user's later state.
+     * Unknown values are ignored (forward/backward compatible).
+     */
+    private fun handleNavigateExtra(intent: android.content.Intent) {
+        val target = intent.getStringExtra(EXTRA_NAVIGATE_TO) ?: return
+        intent.removeExtra(EXTRA_NAVIGATE_TO)
+        setIntent(intent)
+        val destinationId = when (target) {
+            "trips" -> R.id.tripsFragment
+            "charging" -> R.id.chargingFragment
+            "roadsense" -> R.id.roadSenseFragment
+            "recordings" -> R.id.recordingsFragment
+            "live" -> R.id.liveViewFragment
+            "vehicle" -> R.id.vehicleControlFragment
+            "dashboard" -> R.id.dashboardFragment
+            else -> return
+        }
+        // navigateToRailDestination self-defers via pendingRailDestination when
+        // FragmentManager state is saved, so this is safe from onCreate/onNewIntent.
+        navigateToRailDestination(destinationId)
     }
 
     /**
@@ -629,6 +692,14 @@ class MainActivity : AppCompatActivity() {
         // reconciles against the live config so it never clobbers a later Settings
         // change (see flushPendingOperatingMode).
         com.overdrive.app.onboarding.OnboardingHost.flushPendingOperatingMode(applicationContext)
+
+        // Re-drive a rail tap that was deferred because it raced Activity state saving. Now
+        // resumed, FragmentManager can commit. navigateToRailDestination re-checks isStateSaved
+        // and clears the pending value, so this can't loop or fire a stale destination.
+        pendingRailDestination?.let { dest ->
+            pendingRailDestination = null
+            navigateToRailDestination(dest)
+        }
     }
 
     /**
@@ -1294,6 +1365,7 @@ class MainActivity : AppCompatActivity() {
     private fun initViews() {
         toolbar = findViewById(R.id.toolbar)
         navigationRail = findViewById(R.id.navigationRail)
+        navigationRailScroll = findViewById(R.id.navigationRailScroll)
         tvCurrentUrl = findViewById(R.id.tvCurrentUrl)
         urlBar = findViewById(R.id.urlBar)
         statusPill = findViewById(R.id.statusPill)
@@ -1326,6 +1398,7 @@ class MainActivity : AppCompatActivity() {
                 R.id.keyMappingFragment,
                 R.id.integrationsFragment,
                 R.id.roadSenseFragment,
+                R.id.networkFragment,
                 R.id.diagnosticsFragment,
                 R.id.settingsFragment,
                 R.id.settingsAboutFragment
@@ -1334,7 +1407,7 @@ class MainActivity : AppCompatActivity() {
 
         toolbar.setupWithNavController(navController, appBarConfiguration)
 
-        setupCustomRail()
+        setupCustomRail(savedInstanceState)
     }
 
     /**
@@ -1346,50 +1419,103 @@ class MainActivity : AppCompatActivity() {
      * Selection sync is driven from the NavController so deep links and
      * code-driven nav also light up the right rail item.
      */
-    private fun setupCustomRail() {
+    private fun setupCustomRail(savedInstanceState: Bundle?) {
         // Order matches the previous rail_menu.xml so user's mental model
         // stays the same.
         val items = listOf(
-            RailItem(R.id.railDestDashboard, R.id.dashboardFragment,
+            RailItem("dashboard", R.id.railDestDashboard, R.id.dashboardFragment,
                 R.drawable.ic_dashboard, R.string.rail_dashboard),
-            RailItem(R.id.railDestLive, R.id.liveViewFragment,
+            RailItem(NavigationRailCatalog.LIVE, R.id.railDestLive, R.id.liveViewFragment,
                 R.drawable.ic_live, R.string.rail_live),
-            RailItem(R.id.railDestRecordings, R.id.recordingsFragment,
-                R.drawable.ic_recording, R.string.rail_recordings),
-            RailItem(R.id.railDestVehicle, R.id.vehicleControlFragment,
+            RailItem(NavigationRailCatalog.RECORDINGS, R.id.railDestRecordings,
+                R.id.recordingsFragment, R.drawable.ic_recording, R.string.rail_recordings,
+                ownedDestinationIds = setOf(
+                    R.id.videoPlayerFragment,
+                    R.id.surveillanceSettingsWebFragment,
+                    R.id.recordingSettingsWebFragment,
+                )),
+            RailItem(NavigationRailCatalog.VEHICLE, R.id.railDestVehicle,
+                R.id.vehicleControlFragment,
                 R.drawable.ic_vehicle_control, R.string.rail_vehicle),
-            RailItem(R.id.railDestProjection, R.id.projectionFragment,
+            RailItem(NavigationRailCatalog.PROJECTION, R.id.railDestProjection,
+                R.id.projectionFragment,
                 R.drawable.ic_projection, R.string.rail_projection),
-            RailItem(R.id.railDestTrips, R.id.tripsFragment,
+            RailItem(NavigationRailCatalog.TRIPS, R.id.railDestTrips, R.id.tripsFragment,
                 R.drawable.ic_trips, R.string.rail_trips),
-            RailItem(R.id.railDestCharging, R.id.chargingFragment,
+            RailItem(NavigationRailCatalog.CHARGING, R.id.railDestCharging,
+                R.id.chargingFragment,
                 R.drawable.ic_charging, R.string.rail_charging),
-            RailItem(R.id.railDestAutomations, R.id.automationsFragment,
+            RailItem(NavigationRailCatalog.AUTOMATIONS, R.id.railDestAutomations,
+                R.id.automationsFragment,
                 R.drawable.ic_automations, R.string.rail_automations),
-            RailItem(R.id.railDestKeyMapping, R.id.keyMappingFragment,
+            RailItem(NavigationRailCatalog.KEY_MAPPING, R.id.railDestKeyMapping,
+                R.id.keyMappingFragment,
                 R.drawable.ic_key_mapping, R.string.rail_key_mapping),
-            RailItem(R.id.railDestIntegrations, R.id.integrationsFragment,
-                R.drawable.ic_integrations, R.string.rail_integrations),
-            RailItem(R.id.railDestRoadSense, R.id.roadSenseFragment,
+            RailItem(NavigationRailCatalog.INTEGRATIONS, R.id.railDestIntegrations,
+                R.id.integrationsFragment, R.drawable.ic_integrations,
+                R.string.rail_integrations,
+                ownedDestinationIds = setOf(
+                    R.id.telegramSettingsFragment,
+                    R.id.abrpSettingsFragment,
+                    R.id.mqttFragment,
+                    R.id.bydCloudFragment,
+                )),
+            RailItem(NavigationRailCatalog.ROAD_SENSE, R.id.railDestRoadSense,
+                R.id.roadSenseFragment,
                 R.drawable.ic_roadsense, R.string.rail_roadsense),
             // Hazard Map is a standalone Activity, not a nav-graph fragment,
             // so it launches via startActivity (destinationId = 0).
-            RailItem(R.id.railDestMap, 0,
+            RailItem(NavigationRailCatalog.MAP, R.id.railDestMap, 0,
                 R.drawable.ic_roadsense_map, R.string.rail_hazard_map,
                 launchActivity = com.overdrive.app.navmap.RoadSenseMapActivity::class.java),
-            RailItem(R.id.railDestDiagnostics, R.id.diagnosticsFragment,
-                R.drawable.ic_diagnostics, R.string.rail_diagnostics),
-            RailItem(R.id.railDestSettings, R.id.settingsFragment,
-                R.drawable.ic_settings, R.string.rail_settings),
-            RailItem(R.id.railDestAbout, R.id.settingsAboutFragment,
+            RailItem(NavigationRailCatalog.NETWORK, R.id.railDestNetwork,
+                R.id.networkFragment,
+                R.drawable.ic_hotspot, R.string.rail_network),
+            RailItem(NavigationRailCatalog.DIAGNOSTICS, R.id.railDestDiagnostics,
+                R.id.diagnosticsFragment,
+                R.drawable.ic_diagnostics, R.string.rail_diagnostics,
+                ownedDestinationIds = setOf(R.id.adbConsoleFragment)),
+            RailItem("settings", R.id.railDestSettings, R.id.settingsFragment,
+                R.drawable.ic_settings, R.string.rail_settings,
+                ownedDestinationIds = setOf(
+                    R.id.daemonsFragment,
+                    R.id.settingsSecurityFragment,
+                )),
+            RailItem("about", R.id.railDestAbout, R.id.settingsAboutFragment,
                 R.drawable.ic_update, R.string.settings_section_about)
         )
+        railItems = items
+
+        val languageClick = View.OnClickListener {
+            com.overdrive.app.ui.dialog.LanguagePickerDialog.show(this) {
+                recreate()
+            }
+        }
+        val helpClick = View.OnClickListener { startOnboardingReplay() }
+        val actions = listOf(
+            RailActionItem(
+                R.id.railLanguageButton,
+                R.drawable.ic_language,
+                R.string.settings_language_label,
+                languageClick
+            ),
+            RailActionItem(
+                R.id.railHelpButton,
+                R.drawable.ic_help,
+                R.string.onboarding_help_cd,
+                helpClick
+            )
+        )
+        railActionItems = actions
 
         // Bind icon + label and click handler per row.
         items.forEach { item ->
             val row = navigationRail.findViewById<View>(item.rowId) ?: return@forEach
             row.findViewById<ImageView>(R.id.railItemIcon)?.setImageResource(item.iconRes)
             row.findViewById<TextView>(R.id.railItemLabel)?.setText(item.labelRes)
+            val label = getString(item.labelRes)
+            row.contentDescription = label
+            TooltipCompat.setTooltipText(row, label)
             row.setOnClickListener {
                 val activity = item.launchActivity
                 if (activity != null) {
@@ -1399,6 +1525,40 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        actions.forEach { item ->
+            val row = navigationRail.findViewById<View>(item.rowId) ?: return@forEach
+            row.findViewById<ImageView>(R.id.railItemIcon)?.setImageResource(item.iconRes)
+            row.findViewById<TextView>(R.id.railItemLabel)?.setText(item.labelRes)
+            val label = getString(item.labelRes)
+            row.contentDescription = label
+            TooltipCompat.setTooltipText(row, label)
+            row.setOnClickListener(item.onClick)
+        }
+
+        // Portrait keeps these actions in the toolbar. Landscape renders
+        // them as full rail rows after the destination list.
+        findViewById<View>(R.id.toolbarLanguageButton)?.setOnClickListener(languageClick)
+        findViewById<View>(R.id.toolbarHelpButton)?.setOnClickListener(helpClick)
+
+        val expandButton = navigationRail.findViewById<ImageButton>(R.id.railExpandButton)
+        expandButton?.setOnClickListener {
+            setNavigationRailExpanded(!navigationRailExpanded, animate = true)
+        }
+        navigationRailScroll.onRailSwipe = { action ->
+            when (action) {
+                NavigationRailSwipePolicy.Action.EXPAND ->
+                    setNavigationRailExpanded(true, animate = true)
+                NavigationRailSwipePolicy.Action.COLLAPSE ->
+                    setNavigationRailExpanded(false, animate = true)
+                NavigationRailSwipePolicy.Action.NONE -> Unit
+            }
+        }
+        setNavigationRailExpanded(
+            savedInstanceState?.getBoolean(KEY_RAIL_EXPANDED, false) == true,
+            animate = false
+        )
+        refreshNavigationRailVisibility()
 
         // Selection sync — light up the row whose destinationId matches
         // the current nav destination (or any of its ancestors).
@@ -1411,43 +1571,35 @@ class MainActivity : AppCompatActivity() {
         navController.addOnDestinationChangedListener { _, destination, _ ->
             var node: androidx.navigation.NavDestination? = destination
             while (node != null) {
-                val match = syncItems.firstOrNull { it.destinationId == node!!.id }
+                val nodeId = node.id
+                val match = syncItems.firstOrNull {
+                    it.destinationId == nodeId || nodeId in it.ownedDestinationIds
+                }
                 if (match != null) {
+                    applyNavigationRailVisibility(match.key)
                     syncItems.forEach { item ->
                         navigationRail.findViewById<View>(item.rowId)?.isSelected =
-                            (item.destinationId == match.destinationId)
+                            (item.key == match.key)
                     }
                     return@addOnDestinationChangedListener
                 }
                 node = node.parent
             }
-        }
-
-        // Language picker — moved to the toolbar end-cluster so it's
-        // reachable from the top-right at every screen size. Falls back
-        // to the legacy rail-header button if a downstream layout ever
-        // restores it; the dialog itself is the same.
-        val languageClick = View.OnClickListener {
-            com.overdrive.app.ui.dialog.LanguagePickerDialog.show(this) {
-                recreate()
+            syncItems.forEach { item ->
+                navigationRail.findViewById<View>(item.rowId)?.isSelected = false
             }
+            applyNavigationRailVisibility(activeKey = null)
         }
-        findViewById<View>(R.id.toolbarLanguageButton)?.setOnClickListener(languageClick)
-        navigationRail.findViewById<View>(R.id.railLanguageButton)?.setOnClickListener(languageClick)
 
-        // Onboarding replay "?" — opens the guide's chapter menu (parked-gated inside
-        // the host). Present in the portrait toolbar AND the landscape rail header; wire
-        // both null-safely since only one exists per orientation.
-        val helpClick = View.OnClickListener { startOnboardingReplay() }
-        findViewById<View>(R.id.toolbarHelpButton)?.setOnClickListener(helpClick)
-        navigationRail.findViewById<View>(R.id.railHelpButton)?.setOnClickListener(helpClick)
     }
 
     private data class RailItem(
+        val key: String,
         val rowId: Int,
         val destinationId: Int,
         val iconRes: Int,
         val labelRes: Int,
+        val ownedDestinationIds: Set<Int> = emptySet(),
         // When non-null, the row launches this Activity via startActivity()
         // instead of navigating to a nav-graph fragment. Such rows have no
         // NavController destination (destinationId == 0) and are skipped by
@@ -1456,12 +1608,304 @@ class MainActivity : AppCompatActivity() {
     )
 
     /**
+     * Re-applies persisted pin/unpin choices. A hidden destination opened by a
+     * deep link is shown temporarily while active so selection and navigation
+     * context remain visible without silently changing the user's preference.
+     */
+    fun refreshNavigationRailVisibility() {
+        if (!::navigationRail.isInitialized || !::navController.isInitialized) return
+        val destinationId = navController.currentDestination?.id
+        val activeKey = destinationId?.let { id ->
+            railItems.firstOrNull {
+                it.destinationId == id || id in it.ownedDestinationIds
+            }?.key
+        }
+        applyNavigationRailVisibility(activeKey)
+    }
+
+    private fun applyNavigationRailVisibility(activeKey: String?) {
+        val customizableKeys = NavigationRailCatalog.customizableKeys
+        val visibleKeys = PreferencesManager.getVisibleNavigationKeys(customizableKeys)
+        railItems.forEach { item ->
+            val fixed = item.key !in customizableKeys
+            val visible = fixed || item.key in visibleKeys || item.key == activeKey
+            navigationRail.findViewById<View>(item.rowId)?.visibility =
+                if (visible) View.VISIBLE else View.GONE
+        }
+    }
+
+    private data class RailActionItem(
+        val rowId: Int,
+        val iconRes: Int,
+        val labelRes: Int,
+        val onClick: View.OnClickListener
+    )
+
+    /**
+     * Compact is the default: icons keep their full 56dp touch targets while labels
+     * are removed from the narrow 80dp rail. A right swipe (or chevron button)
+     * expands to a comfortable horizontal icon+label layout; left reverses it.
+     *
+     * Rows are switched to their expanded (horizontal) form up-front and stay
+     * there for the whole slide. Both widths put the icon centre on the same
+     * 40dp line, so holding one form keeps the icons visually static instead of
+     * letting them drift to the centre of the widening rail and snap back at
+     * the end. Labels then only need to cross-fade.
+     */
+    private fun setNavigationRailExpanded(expanded: Boolean, animate: Boolean) {
+        val stateChanged = navigationRailExpanded != expanded
+        navigationRailExpanded = expanded
+        // Capture the in-flight width before cancelling so an interrupted slide
+        // resumes from where it is rather than jumping to a stale edge.
+        val startWidth = navigationRailScroll.width
+            .takeIf { it > 0 } ?: navigationRailScroll.layoutParams.width
+        // Clear the field BEFORE cancelling: cancel() delivers onAnimationEnd
+        // synchronously, and the identity check there is what stops the outgoing
+        // slide from settling rows to a state this call is about to replace.
+        val outgoing = navigationRailAnimator
+        navigationRailAnimator = null
+        outgoing?.cancel()
+
+        val targetWidth = dp(
+            if (expanded) RAIL_EXPANDED_WIDTH_DP else RAIL_COMPACT_WIDTH_DP
+        )
+        if (!animate || !stateChanged || !navigationRailScroll.isLaidOut) {
+            updateRailExpandButton(expanded, animate = false, durationMs = 0L)
+            navigationRailScroll.layoutParams =
+                navigationRailScroll.layoutParams.apply { width = targetWidth }
+            // force: this is the assert-the-truth path (first bind, rotation,
+            // density change), so it must re-apply even if the memo agrees —
+            // dp() padding is density-derived and can go stale.
+            applyRailItemLayout(expanded, force = true)
+            if (expanded) setRailLabelsVisible(true, durationMs = 0L)
+            return
+        }
+
+        // Interrupting a slide part-way shortens the remaining travel, so scale
+        // the duration to it — otherwise a re-toggle crawls the last few dp.
+        val travel = Math.abs(targetWidth - startWidth)
+        val fullTravel = dp(RAIL_EXPANDED_WIDTH_DP - RAIL_COMPACT_WIDTH_DP)
+        val slideMs = (
+            if (fullTravel > 0) RAIL_ANIMATION_MS * travel / fullTravel
+            else RAIL_ANIMATION_MS
+            ).coerceAtLeast(RAIL_ANIMATION_MIN_MS)
+
+        updateRailExpandButton(expanded, animate = true, durationMs = slideMs)
+        // Expanded row geometry for the entire slide — see the kdoc above.
+        applyRailItemLayout(true)
+        setRailLabelsVisible(expanded, durationMs = slideMs)
+
+        navigationRailAnimator = ValueAnimator.ofInt(startWidth, targetWidth).apply {
+            duration = slideMs
+            interpolator = RAIL_EASING
+            addUpdateListener { animator ->
+                navigationRailScroll.layoutParams =
+                    navigationRailScroll.layoutParams.apply {
+                        width = animator.animatedValue as Int
+                    }
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    // Identity separates "this slide finished" from "this slide
+                    // was cancelled by a re-toggle" — the caller clears the field
+                    // before cancelling, so a superseded slide bails here.
+                    if (navigationRailAnimator !== this@apply) return
+                    navigationRailAnimator = null
+                    // Expanding needs no settle: the rows already hold expanded
+                    // geometry, so a completed expand costs zero relayout.
+                    if (!expanded) applyRailItemLayout(false)
+                }
+            })
+            start()
+        }
+    }
+
+    /**
+     * Cross-fade the destination labels. Rows stay in their expanded form for
+     * the whole slide, so the labels are laid out either way — fading them
+     * beats flipping GONE/VISIBLE at the boundary, which is what made them pop.
+     * The collapse settle in [applyRailRowLayout] takes them back to GONE.
+     *
+     * A duration of 0 applies the end state immediately.
+     */
+    private fun setRailLabelsVisible(visible: Boolean, durationMs: Long) {
+        forEachRailRow { row, _ ->
+            val label = row.findViewById<TextView>(R.id.railItemLabel) ?: return@forEachRailRow
+            label.animate().cancel()
+            if (durationMs <= 0L) {
+                label.alpha = if (visible) 1f else 0f
+                label.visibility = View.VISIBLE
+                return@forEachRailRow
+            }
+            // Coming from GONE the alpha is whatever it was left at (the XML
+            // default is opaque), so seed it to 0 or the fade-in would be a pop.
+            // An interrupted slide is already VISIBLE mid-fade — resume from
+            // its current alpha instead.
+            if (visible && label.visibility != View.VISIBLE) label.alpha = 0f
+            label.visibility = View.VISIBLE
+            label.animate()
+                .alpha(if (visible) 1f else 0f)
+                // Fade in over the back half, once the rail has the room for
+                // text; fade out over the front half so it never squeezes into
+                // a narrowing rail.
+                .setStartDelay(if (visible) durationMs / 2 else 0L)
+                .setDuration(durationMs / 2)
+                .setInterpolator(RAIL_EASING)
+                .start()
+        }
+    }
+
+    /** Drops any queued label / chevron view animations. */
+    private fun cancelRailViewAnimations() {
+        forEachRailRow { row, _ ->
+            row.findViewById<TextView>(R.id.railItemLabel)?.animate()?.cancel()
+        }
+        navigationRail.findViewById<ImageButton>(R.id.railExpandButton)?.animate()?.cancel()
+    }
+
+    /** Walks every rail row — destinations then secondary actions. */
+    private inline fun forEachRailRow(action: (LinearLayout, Int) -> Unit) {
+        railItems.forEach { item ->
+            navigationRail.findViewById<LinearLayout>(item.rowId)?.let {
+                action(it, item.labelRes)
+            }
+        }
+        railActionItems.forEach { item ->
+            navigationRail.findViewById<LinearLayout>(item.rowId)?.let {
+                action(it, item.labelRes)
+            }
+        }
+    }
+
+    /**
+     * Switch every row between the compact (vertical) and expanded (horizontal)
+     * form. Each call relayouts ~17 rows, so it no-ops when the rows already
+     * hold the requested form — during a slide that keeps the work off the
+     * first and last frames, where a dropped frame is most visible.
+     *
+     * [force] skips the memo for paths that must assert absolute state: the
+     * initial bind, and rotation, where the inflated views are new (landscape
+     * even carries two extra rows) so the memo describes a dead hierarchy.
+     */
+    private fun applyRailItemLayout(expanded: Boolean, force: Boolean = false) {
+        if (!force && navigationRailRowsExpandedForm == expanded) return
+        navigationRailRowsExpandedForm = expanded
+        forEachRailRow { row, labelRes -> applyRailRowLayout(row, labelRes, expanded) }
+    }
+
+    private fun applyRailRowLayout(row: LinearLayout, labelRes: Int, expanded: Boolean) {
+        val label = row.findViewById<TextView>(R.id.railItemLabel) ?: return
+        val horizontalPadding = if (expanded) dp(12) else 0
+        val verticalPadding = dp(6)
+
+        row.orientation =
+            if (expanded) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        row.gravity =
+            if (expanded) Gravity.CENTER_VERTICAL else Gravity.CENTER
+        row.minimumHeight = dp(56)
+        row.setPadding(
+            horizontalPadding,
+            verticalPadding,
+            horizontalPadding,
+            verticalPadding
+        )
+
+        val labelParams = label.layoutParams as LinearLayout.LayoutParams
+        labelParams.width =
+            if (expanded) 0 else ViewGroup.LayoutParams.WRAP_CONTENT
+        labelParams.weight = if (expanded) 1f else 0f
+        labelParams.marginStart = if (expanded) dp(12) else 0
+        labelParams.topMargin = if (expanded) 0 else dp(4)
+        label.layoutParams = labelParams
+        label.gravity =
+            if (expanded) Gravity.START or Gravity.CENTER_VERTICAL
+            else Gravity.CENTER_HORIZONTAL
+        // Visibility is owned by setRailLabelsVisible during a slide; only the
+        // settled compact state drops the label out of layout entirely.
+        if (!expanded) {
+            label.animate().cancel()
+            label.alpha = 0f
+            label.visibility = View.GONE
+        }
+
+        // Tooltip only earns its place while the label is hidden. contentDescription
+        // is set once at bind time in setupCustomRail and never changes.
+        TooltipCompat.setTooltipText(row, if (expanded) null else getString(labelRes))
+    }
+
+    /**
+     * Chevron points right when collapsed, left when expanded. Rotating one
+     * drawable rather than swapping two keeps the affordance continuous with
+     * the slide instead of blinking to a different asset mid-motion.
+     */
+    private fun updateRailExpandButton(
+        expanded: Boolean,
+        animate: Boolean,
+        durationMs: Long
+    ) {
+        val button = navigationRail.findViewById<ImageButton>(R.id.railExpandButton)
+            ?: return
+        val descriptionRes = if (expanded) R.string.rail_collapse else R.string.rail_expand
+        val description = getString(descriptionRes)
+        button.contentDescription = description
+        TooltipCompat.setTooltipText(button, description)
+
+        button.animate().cancel()
+        // The vector auto-mirrors in RTL, so expansion alone controls rotation.
+        // Translation still mirrors because the rail grows from the other edge.
+        //
+        // Read the direction off the Configuration, not the View: this first runs
+        // from onCreate, and a View resolves its layoutDirection during layout —
+        // until then it reports LTR, which left the collapsed chevron pointing
+        // into the rail in RTL locales until the first toggle.
+        val rtl = resources.configuration.layoutDirection == View.LAYOUT_DIRECTION_RTL
+        val targetRotation = if (expanded) 180f else 0f
+        // Translate rather than re-gravity: the button is centred by the rail's
+        // own gravity, so a gravity flip would jump. Offset runs from where the
+        // expanded rail centres it (half of 216dp) out to the trailing inset.
+        val trailingOffset =
+            dp(RAIL_EXPANDED_WIDTH_DP / 2 - RAIL_CHEVRON_EDGE_INSET_DP).toFloat()
+        val targetTranslation = when {
+            !expanded -> 0f
+            rtl -> -trailingOffset
+            else -> trailingOffset
+        }
+        if (!animate) {
+            button.rotation = targetRotation
+            button.translationX = targetTranslation
+            return
+        }
+        button.animate()
+            .rotation(targetRotation)
+            .translationX(targetTranslation)
+            .setDuration(durationMs)
+            .setInterpolator(RAIL_EASING)
+            .start()
+    }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density + 0.5f).toInt()
+
+    /**
      * Navigate to a rail destination, popping any sub-pages so the tab
      * resets to its root. Uses M3 expressive fade-through (the incoming
      * destination scales up slightly while the outgoing fades) so the
      * switch reads as motion, not just a cross-fade.
      */
     private fun navigateToRailDestination(destinationId: Int) {
+        // Reselecting an already-visible top-level screen is a no-op. Besides avoiding a
+        // pointless transition, this prevents Surface-backed screens such as Projection from
+        // being torn down and recreated while a resize transaction is still settling.
+        if (navController.currentDestination?.id == destinationId) return
+        // A late click can race Activity state saving (for example while a configuration
+        // transition is settling). Navigation cannot commit after that point; FragmentManager
+        // would throw. Stash the target and re-drive it from onResume (once the Activity is
+        // resumed and state is no longer saved) so the user's tap isn't silently dropped.
+        if (supportFragmentManager.isStateSaved) {
+            pendingRailDestination = destinationId
+            return
+        }
+        pendingRailDestination = null
         val options = androidx.navigation.NavOptions.Builder()
             .setLaunchSingleTop(true)
             .setRestoreState(false)
@@ -1475,17 +1919,22 @@ class MainActivity : AppCompatActivity() {
             navController.navigate(destinationId, /* args = */ null, options)
         } catch (_: IllegalArgumentException) {
             // Destination not in graph — defensive only.
+        } catch (_: IllegalStateException) {
+            // FragmentManager state may have been saved between the guard and navigate().
+            pendingRailDestination = destinationId
         }
     }
     
     private fun setupCopyButton() {
-        btnCopyUrl.setOnClickListener {
-            val url = mainViewModel.currentUrl.value ?: return@setOnClickListener
+        val copyUrl = View.OnClickListener {
+            val url = mainViewModel.currentUrl.value ?: return@OnClickListener
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val clip = ClipData.newPlainText(getString(R.string.clip_label_url), url)
             clipboard.setPrimaryClip(clip)
             Toast.makeText(this, getString(R.string.toast_url_copied_short), Toast.LENGTH_SHORT).show()
         }
+        btnCopyUrl.setOnClickListener(copyUrl)
+        findViewById<View>(R.id.statusPill)?.setOnClickListener(copyUrl)
     }
     
     private fun setupLogListener() {
@@ -1566,6 +2015,10 @@ class MainActivity : AppCompatActivity() {
                 getString(R.string.dashboard_starting_tailscale)
             TunnelDisplayPolicy.Kind.WAITING_FOR_URL ->
                 getString(R.string.dashboard_waiting_url)
+            TunnelDisplayPolicy.Kind.STOPPING ->
+                getString(R.string.dashboard_tunnel_stopping)
+            TunnelDisplayPolicy.Kind.FAILED ->
+                getString(R.string.dashboard_tunnel_failed)
             TunnelDisplayPolicy.Kind.ONLINE -> display.url
             TunnelDisplayPolicy.Kind.HIDDEN -> getString(R.string.dashboard_no_tunnel)
         }
@@ -1574,7 +2027,9 @@ class MainActivity : AppCompatActivity() {
             TunnelDisplayPolicy.Kind.STARTING_ZROK,
             TunnelDisplayPolicy.Kind.STARTING_CLOUDFLARED,
             TunnelDisplayPolicy.Kind.STARTING_TAILSCALE,
-            TunnelDisplayPolicy.Kind.WAITING_FOR_URL -> R.drawable.status_dot_starting
+            TunnelDisplayPolicy.Kind.WAITING_FOR_URL,
+            TunnelDisplayPolicy.Kind.STOPPING -> R.drawable.status_dot_starting
+            TunnelDisplayPolicy.Kind.FAILED,
             TunnelDisplayPolicy.Kind.HIDDEN -> R.drawable.status_dot_offline
         }
         statusIndicator.setBackgroundResource(drawableRes)
@@ -1633,7 +2088,7 @@ class MainActivity : AppCompatActivity() {
         val manualCameraId: Int?,
         val isManualOverride: Boolean,
         // Persisted ingestion mode. "default" = legacy ImageReader + 4-strip
-        // → 2x2 rearrangement. "dilink4" = esco SurfaceTexture passthrough.
+        // → 2x2 rearrangement. "dilink4" = oem SurfaceTexture passthrough.
         // Absent in older config → "default".
         val cameraMode: String,
         // GL fragment-shader red-pixel suppression for the HAL "calibration
@@ -1854,6 +2309,26 @@ class MainActivity : AppCompatActivity() {
                 .let { if (it >= 0) it else 0 }
         }
 
+        // Per-role explainer: this one spinner mixes two role families —
+        // direct-camera roles (windshield / cabin: WHICH camera feeds a
+        // layout view) and the four pano slice roles (WHERE each direction
+        // lives inside the mosaic). The explainer keeps them distinct, and
+        // for windshield explicitly decouples it from the Forward-dashcam
+        // recorder ID picker. Null-safe: absent view = no behaviour change.
+        val roleExplainerView = dialogView.findViewById<TextView>(R.id.tvRoleExplainer)
+        fun updateRoleExplainer() {
+            val key = state.roles.getOrNull(currentRoleIndex)?.key ?: return
+            roleExplainerView?.setText(
+                when {
+                    key.equals("windshield", ignoreCase = true) ->
+                        R.string.camera_role_explainer_windshield
+                    key.equals("cabin", ignoreCase = true) ->
+                        R.string.camera_role_explainer_cabin
+                    else -> R.string.camera_role_explainer_slice
+                }
+            )
+        }
+
         fun updateCurrentMappingText() {
             val role = state.roles.getOrNull(currentRoleIndex)
             val mappedId = role?.let { state.currentMappings[it.key] }
@@ -1863,6 +2338,7 @@ class MainActivity : AppCompatActivity() {
             } else {
                 getString(R.string.camera_mapping_current_format, mappedLabel)
             }
+            updateRoleExplainer()
         }
 
         fun refreshPreview(scheduleNext: Boolean) {
@@ -2436,6 +2912,208 @@ class MainActivity : AppCompatActivity() {
             }.start()
         }
 
+        // ---- Camera pairing card (additive visual mirror) ----
+        // Reflects the two radio groups above into side-by-side role slots
+        // with one-shot snapshot thumbnails and a one-tap Swap. Every view
+        // is bound null-safely so the dialog degrades to the classic
+        // pickers if the card is absent. Swap introduces NO new write path:
+        // it re-checks the radio groups and drives the same Save buttons a
+        // manual tap (and CameraWizardCoach.coachSaveIds) already uses, so
+        // save semantics, failure handling, and restart behaviour are
+        // byte-identical to the shipping flow.
+        val pairPanoThumb = dialogView.findViewById<ImageView>(R.id.ivPairPanoThumb)
+        val pairDashcamThumb = dialogView.findViewById<ImageView>(R.id.ivPairDashcamThumb)
+        val pairPanoValue = dialogView.findViewById<TextView>(R.id.tvPairPanoValue)
+        val pairDashcamValue = dialogView.findViewById<TextView>(R.id.tvPairDashcamValue)
+        val swapButton = dialogView.findViewById<View>(R.id.btnSwapCameraIds)
+
+        // Slot 0 = pano, slot 1 = dashcam. Same manual-recycle discipline as
+        // the role-mapping preview above — ImageView won't recycle replaced
+        // bitmaps on its own.
+        val pairThumbBitmaps = arrayOfNulls<android.graphics.Bitmap>(2)
+        val pairThumbInFlight = booleanArrayOf(false, false)
+        val pairThumbShownId = intArrayOf(-1, -1)
+        // Bounded per-slot retry. Both slots fetch at dialog open and the
+        // daemon gates direct opens behind a single-flight cold start
+        // (503 Retry-After=2s) — the losing slot (typically the dashcam)
+        // would otherwise stay on the placeholder forever. Attempts reset
+        // whenever the slot's target camera id changes. Dedicated handler:
+        // the role-preview loop calls removeCallbacksAndMessages(null) on
+        // previewHandler, which would nuke our retries if shared.
+        val pairThumbAttempts = intArrayOf(0, 0)
+        val pairThumbTargetId = intArrayOf(-1, -1)
+        val pairRetryHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+        fun radioIdForManualCameraId(id: Int): Int = when (id) {
+            0 -> R.id.rbManualCamera0
+            1 -> R.id.rbManualCamera1
+            2 -> R.id.rbManualCamera2
+            3 -> R.id.rbManualCamera3
+            4 -> R.id.rbManualCamera4
+            5 -> R.id.rbManualCamera5
+            else -> R.id.rbManualCameraAuto
+        }
+
+        fun selectedPanoId(): Int = when (manualCameraGroup.checkedRadioButtonId) {
+            R.id.rbManualCamera0 -> 0
+            R.id.rbManualCamera1 -> 1
+            R.id.rbManualCamera2 -> 2
+            R.id.rbManualCamera3 -> 3
+            R.id.rbManualCamera4 -> 4
+            R.id.rbManualCamera5 -> 5
+            else -> -1
+        }
+
+        fun selectedOemId(): Int = when (oemDashcamGroup.checkedRadioButtonId) {
+            R.id.rbOemDashcam0 -> 0
+            R.id.rbOemDashcam1 -> 1
+            R.id.rbOemDashcam2 -> 2
+            R.id.rbOemDashcam3 -> 3
+            R.id.rbOemDashcam4 -> 4
+            R.id.rbOemDashcam5 -> 5
+            else -> -1
+        }
+
+        // Displayed id = the checked manual id, or what Auto resolves to.
+        // Auto-dashcam mirrors the daemon's pano XOR 1 inference so the
+        // card previews what a save would actually produce.
+        fun displayedPanoId(): Int {
+            val sel = selectedPanoId()
+            return if (sel >= 0) sel else state.panoCameraId
+        }
+
+        fun displayedDashcamId(): Int {
+            val sel = selectedOemId()
+            if (sel >= 0) return sel
+            val pano = displayedPanoId()
+            return if (pano in 0..1) pano xor 1 else -1
+        }
+
+        fun loadPairThumb(slot: Int, target: ImageView?, cameraId: Int) {
+            if (target == null || dialogClosed) return
+            if (cameraId < 0) return  // unresolvable — keep placeholder icon
+            if (pairThumbTargetId[slot] != cameraId) {
+                // New target for this slot — fresh retry budget.
+                pairThumbTargetId[slot] = cameraId
+                pairThumbAttempts[slot] = 0
+            }
+            if (pairThumbShownId[slot] == cameraId || pairThumbInFlight[slot]) return
+            if (pairThumbAttempts[slot] >= 3) return  // budget exhausted — placeholder stays
+            // Reuse the daemon-advertised direct candidate (and its preview
+            // dimensions) — same endpoint contract as the role-mapping
+            // preview. No candidate → placeholder stays; selection and Swap
+            // remain fully usable, preserving the wedged-pipeline rescue
+            // path the manual pickers were designed for.
+            val candidate = state.candidates.firstOrNull {
+                it.kind.equals("direct", ignoreCase = true) && it.cameraId == cameraId
+            } ?: return
+            val path = buildCameraPreviewPath(candidate) ?: return
+            pairThumbAttempts[slot]++
+            pairThumbInFlight[slot] = true
+            Thread {
+                var bitmap: android.graphics.Bitmap? = null
+                try {
+                    val conn = com.overdrive.app.util.DaemonHttpClient.open(
+                        path, "GET", 2500, 4000)
+                    val bytes = if (conn.responseCode == 200) {
+                        conn.inputStream.use { it.readBytes() }
+                    } else null
+                    conn.disconnect()
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        bitmap = android.graphics.BitmapFactory
+                            .decodeByteArray(bytes, 0, bytes.size)
+                    }
+                } catch (_: Exception) {
+                    bitmap = null
+                }
+                val finalBitmap = bitmap
+                runOnUiThread {
+                    pairThumbInFlight[slot] = false
+                    if (dialogClosed) {
+                        finalBitmap?.recycle()
+                        return@runOnUiThread
+                    }
+                    if (finalBitmap != null) {
+                        val old = pairThumbBitmaps[slot]
+                        target.setImageBitmap(finalBitmap)
+                        pairThumbBitmaps[slot] = finalBitmap
+                        pairThumbShownId[slot] = cameraId
+                        old?.recycle()
+                    } else if (pairThumbTargetId[slot] == cameraId) {
+                        // Cold-start 503 / transient open failure — e.g. the
+                        // other slot's fetch won the daemon's single-flight
+                        // window. Bounded retry on the daemon's Retry-After
+                        // cadence; loadPairThumb re-checks the budget.
+                        pairRetryHandler.postDelayed({
+                            if (!dialogClosed) loadPairThumb(slot, target, cameraId)
+                        }, 2500)
+                    }
+                }
+            }.start()
+        }
+
+        fun renderPairing() {
+            if (pairPanoValue == null && pairDashcamValue == null) return
+            val pano = displayedPanoId()
+            val dash = displayedDashcamId()
+            pairPanoValue?.text = when {
+                selectedPanoId() >= 0 ->
+                    getString(R.string.camera_pair_value_manual, pano)
+                pano >= 0 -> getString(R.string.camera_pair_value_auto, pano)
+                else -> getString(R.string.camera_option_auto)
+            }
+            pairDashcamValue?.text = when {
+                selectedOemId() >= 0 ->
+                    getString(R.string.camera_pair_value_manual, dash)
+                dash >= 0 -> getString(R.string.camera_pair_value_auto, dash)
+                else -> getString(R.string.camera_option_auto)
+            }
+            swapButton?.isEnabled = pano in 0..5 && dash in 0..5 && pano != dash
+            loadPairThumb(0, pairPanoThumb, pano)
+            loadPairThumb(1, pairDashcamThumb, dash)
+        }
+
+        // Live mirror: any radio change (manual tap, coach, or Swap) updates
+        // the pairing card. Neither group had a checked-change listener
+        // before, so this adds behaviour without replacing any.
+        manualCameraGroup.setOnCheckedChangeListener { _, _ -> renderPairing() }
+        oemDashcamGroup.setOnCheckedChangeListener { _, _ -> renderPairing() }
+
+        // Advanced expander around the two manual ID picker cards. Collapsed
+        // by default (the pairing card covers the common cases), but auto-
+        // expanded when a manual override is already saved so configured
+        // devices see their state without hunting. CameraWizardCoach expands
+        // it via btnToggleAdvancedIds.performClick() when the user opts into
+        // manual picking. Null-safe: without these views the pickers are
+        // simply always visible (legacy layout behaviour).
+        val advancedIdSection = dialogView.findViewById<View>(R.id.advancedIdSection)
+        val advancedIdsToggle = dialogView.findViewById<View>(R.id.btnToggleAdvancedIds)
+        val advancedIdsChevron = dialogView.findViewById<ImageView>(R.id.ivAdvancedIdsChevron)
+        fun setAdvancedIdsExpanded(expanded: Boolean) {
+            advancedIdSection?.visibility = if (expanded) View.VISIBLE else View.GONE
+            advancedIdsChevron?.rotation = if (expanded) 180f else 0f
+        }
+        setAdvancedIdsExpanded(state.isManualOverride || state.oemDashcamManualOverride)
+        advancedIdsToggle?.setOnClickListener {
+            setAdvancedIdsExpanded(advancedIdSection?.visibility != View.VISIBLE)
+        }
+
+        swapButton?.setOnClickListener {
+            val pano = displayedPanoId()
+            val dash = displayedDashcamId()
+            if (pano !in 0..5 || dash !in 0..5 || pano == dash) return@setOnClickListener
+            // Cross-assign, then persist through the existing Save buttons —
+            // identical payloads, toasts, and failure recovery as manual
+            // taps. Converting Auto → Manual here is intentional: the user
+            // is explicitly overriding what Auto resolved to.
+            manualCameraGroup.check(radioIdForManualCameraId(dash))
+            oemDashcamGroup.check(radioIdForOemDashcamId(pano))
+            saveManualCameraButton.performClick()
+            saveOemDashcamButton.performClick()
+        }
+
+        renderPairing()
+
         updateCurrentMappingText()
         selectCandidate(mappedCandidateIndexForRole(
             state.roles.getOrNull(currentRoleIndex)?.key ?: ""))
@@ -2488,6 +3166,17 @@ class MainActivity : AppCompatActivity() {
             previewImageView.setImageDrawable(null)
             previousPreviewBitmap?.recycle()
             previousPreviewBitmap = null
+            // Pairing-card thumbnails follow the same manual-recycle
+            // discipline; in-flight fetches see dialogClosed and recycle
+            // their own result. Pending retries are dropped with the
+            // dedicated handler.
+            pairRetryHandler.removeCallbacksAndMessages(null)
+            pairPanoThumb?.setImageDrawable(null)
+            pairDashcamThumb?.setImageDrawable(null)
+            for (i in pairThumbBitmaps.indices) {
+                pairThumbBitmaps[i]?.recycle()
+                pairThumbBitmaps[i] = null
+            }
             try { unregisterReceiver(accDismissReceiver) } catch (_: Throwable) {}
             if (onboardingCoach != null && onboardingDecor != null) onboardingCoach.onDialogDismissed()
         }
@@ -2570,26 +3259,92 @@ class MainActivity : AppCompatActivity() {
             "Camera settings changed — restarting daemon to apply them immediately")
 
         Thread {
-            // Phase 1: graceful flush. Best-effort — failures here are
-            // logged but don't block the restart, since the dialog already
-            // toasted "saved" and the user expects the restart to happen.
-            try {
-                val conn = com.overdrive.app.util.DaemonHttpClient.open(
-                    "/api/surveillance/prepare-restart", "POST", 3000, 5000)
-                conn.doOutput = true
-                conn.outputStream.use { it.write(byteArrayOf()) }
-                val code = conn.responseCode
-                conn.disconnect()
-                logsViewModel.debug("Camera",
-                    "prepare-restart returned HTTP $code")
-            } catch (e: Exception) {
-                logsViewModel.warn("Camera",
-                    "prepare-restart failed (continuing with kill anyway): ${e.message}")
+            // Phase 1: graceful flush. The daemon only returns 2xx after any
+            // active trip is durably checkpointed. Killing after any other
+            // result can discard the in-memory telemetry tail.
+            // Retry a transient refusal. Most 503s here are few-second
+            // conditions (a just-ended trip still draining to disk, trip
+            // analytics still starting on its own thread), and a single attempt
+            // meant saving camera settings shortly after parking failed with the
+            // settings written but never applied.
+            var prepared = false
+            for (attempt in 1..6) {
+                var retryable = false
+                prepared = try {
+                    val conn = com.overdrive.app.util.DaemonHttpClient.open(
+                        "/api/surveillance/prepare-restart", "POST", 3000, 10000)
+                    conn.doOutput = true
+                    conn.outputStream.use { it.write(byteArrayOf()) }
+                    val code = conn.responseCode
+                    val detail = try {
+                        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                        stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    conn.disconnect()
+                    if (code in 200..299) {
+                        logsViewModel.debug("Camera",
+                            "prepare-restart returned HTTP $code")
+                        true
+                    } else {
+                        // The daemon's own verdict decides whether waiting can
+                        // clear this; a failed teardown answers 503 too but is
+                        // not fixable by retrying. Unreadable body ⇒ retry.
+                        retryable = code == 503 && try {
+                            if (detail.isBlank()) true
+                            else org.json.JSONObject(detail)
+                                .optBoolean("retryable", true)
+                        } catch (_: Exception) {
+                            true
+                        }
+                        logsViewModel.warn("Camera",
+                            "prepare-restart rejected kill with HTTP $code" +
+                                if (detail.isNotBlank()) ": $detail" else "")
+                        false
+                    }
+                } catch (e: Exception) {
+                    // A transport failure can mean the daemon prepared but the
+                    // response was lost, so it is not retried blindly.
+                    logsViewModel.warn("Camera",
+                        "prepare-restart failed; daemon kill aborted: ${e.message}")
+                    false
+                }
+                if (prepared || !retryable || attempt == 6) break
+                try {
+                    Thread.sleep(1000)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+            if (!prepared) {
+                // The response may have been lost after the server set its
+                // shutdown latch. Since no kill will follow, explicitly put
+                // the surviving daemon back into its normal request state.
+                try {
+                    val abort = com.overdrive.app.util.DaemonHttpClient.open(
+                        "/api/surveillance/abort-restart", "POST", 2000, 2000)
+                    abort.doOutput = true
+                    abort.outputStream.use { it.write(byteArrayOf()) }
+                    abort.responseCode
+                    abort.disconnect()
+                } catch (_: Exception) {
+                    // The failure toast below already directs a manual restart.
+                }
             }
 
             // Phase 2: kill + relaunch on the UI thread.
             runOnUiThread {
                 if (!activityAlive()) return@runOnUiThread
+                if (!prepared) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        getString(R.string.toast_camera_settings_restart_failed),
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@runOnUiThread
+                }
                 // Reuse shared adbLauncher (avoids per-call leak).
                 daemonStartupManager.adbLauncher.killDaemon(object : com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback {
                     override fun onLog(message: String) {
@@ -2697,42 +3452,11 @@ class MainActivity : AppCompatActivity() {
                 
                 runOnUiThread {
                     logsViewModel.info("Camera", "Camera config cleared — restarting daemon")
-                    Toast.makeText(this, getString(R.string.toast_restarting_camera_daemon), Toast.LENGTH_SHORT).show()
+                    // Reuse the guarded settings flow: it checkpoints the open
+                    // trip and aborts on any prepare-restart failure before the
+                    // launcher is allowed to SIGKILL the daemon.
+                    restartCameraDaemonForCameraSettings()
                 }
-                
-                // Kill the camera daemon — DaemonLauncher's watchdog will auto-restart it.
-                // Reuse shared adbLauncher (avoids per-call leak).
-                daemonStartupManager.adbLauncher.killDaemon(object : com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback {
-                    override fun onLog(message: String) {
-                        logsViewModel.debug("Camera", message)
-                    }
-                    
-                    override fun onLaunched() {
-                        runOnUiThread {
-                            logsViewModel.info("Camera", "Camera daemon stopped — will auto-restart with full probe")
-                            Toast.makeText(this@MainActivity,
-                                getString(R.string.toast_camera_daemon_restarting), Toast.LENGTH_LONG).show()
-                            
-                            // Re-launch the daemon after a brief delay
-                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                daemonStartupManager.initializeOnAppLaunch()
-                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                    daemonStartupManager.checkAllDaemonStatuses()
-                                }, 5000)
-                            }, 3000)
-                        }
-                    }
-                    
-                    override fun onError(error: String) {
-                        runOnUiThread {
-                            logsViewModel.error("Camera", "Failed to stop daemon: $error")
-                            Toast.makeText(this@MainActivity,
-                                getString(R.string.toast_camera_restart_failed),
-                                Toast.LENGTH_LONG).show()
-                        }
-                    }
-                })
-                
             } catch (e: Exception) {
                 runOnUiThread {
                     logsViewModel.error("Camera", "Reconfigure failed: ${e.message}")
@@ -3422,13 +4146,30 @@ class MainActivity : AppCompatActivity() {
     
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
-        // MainActivity uses android:configChanges (no recreate on rotation), so the
-        // onboarding overlay's launch-orientation card width + spotlight cutout would go
-        // stale. Forward so it re-measures + re-resolves the anchor for the new orientation.
+        // Orientation and screen-size changes recreate this Activity so Android
+        // reinflates the correct layout/layout-land hierarchy. Re-assert the
+        // rail only for configuration changes the Activity explicitly handles.
+        if (::navigationRailScroll.isInitialized) {
+            setNavigationRailExpanded(navigationRailExpanded, animate = false)
+        }
+        // Keep the onboarding overlay aligned for handled configuration changes.
         onboardingHost?.onConfigChanged()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(KEY_RAIL_EXPANDED, navigationRailExpanded)
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
+        navigationRailAnimator?.cancel()
+        navigationRailAnimator = null
+        if (::navigationRailScroll.isInitialized) {
+            navigationRailScroll.onRailSwipe = null
+            // The label cross-fade posts a delayed animation; the chevron runs one
+            // too. Cancel both so nothing stays queued against a destroyed view.
+            cancelRailViewAnimations()
+        }
         // Remove log listener
         LogManager.setLogListener(null)
         // Tear down the onboarding overlay + its ACC receiver (mirrors the auth-callback
@@ -3460,6 +4201,23 @@ class MainActivity : AppCompatActivity() {
             }
             daemonStartupCoordinator.pendingWatchdog = null
             daemonStartupCoordinator.watchdogHandler = null
+        }
+        // Stop the Activity-scoped DaemonStartupManager's health-check loop and quit
+        // its dedicated "DaemonHealthCheck" HandlerThread. Without this it leaks one
+        // live OS thread per Activity recreate (theme switch, language change, any
+        // config change outside the manifest's configChanges set), each pinning the
+        // destroyed Activity via the Context it was constructed with.
+        //
+        // Deliberately NOT the full cleanup(): that also calls
+        // adbLauncher.releasePerInstanceResources() and shuts down the zrok
+        // launcher/executor, and this Activity's adbLauncher is shared with other
+        // components (AdbConsoleFragment, AppUpdater, the update-APK rm at ~line 231).
+        // Releasing those here would be a behaviour change beyond fixing the thread
+        // leak I introduced, so this stops only what I added.
+        if (::daemonStartupManager.isInitialized) {
+            try { daemonStartupManager.stopHealthCheckThread() } catch (t: Throwable) {
+                android.util.Log.w("MainActivity", "stopHealthCheckThread failed: ${t.message}")
+            }
         }
         // Note: We intentionally do NOT call cleanupAll() here
         // Daemons should persist after app closure
@@ -3622,6 +4380,12 @@ class MainActivity : AppCompatActivity() {
 
     private var navPollRunnable: Runnable? = null
 
+    // A rail tap that arrived while FragmentManager state was saved (config transition
+    // settling / backgrounding) is stashed here and re-driven from onResume, so the tap is
+    // deferred rather than silently dropped. Cleared once consumed or when a later navigation
+    // supersedes it.
+    private var pendingRailDestination: Int? = null
+
     /**
      * Orientation-agnostic Settings anchor for the Expert tour (portrait card vs landscape
      * sub-rail row). The live SettingsFragment resolves it and, in landscape, selects the
@@ -3656,5 +4420,10 @@ class MainActivity : AppCompatActivity() {
         // reset boundary. Best-effort + retrying; the replay pick's own POST is ungated.
         com.overdrive.app.onboarding.OnboardingHost.clearOperatingModeUserFlag()
         ensureOnboardingHost().startReplay()
+    }
+
+    companion object {
+        /** Deep-link extra consumed by [handleNavigateExtra] (launcher glance widgets). */
+        const val EXTRA_NAVIGATE_TO = "navigate_to"
     }
 }

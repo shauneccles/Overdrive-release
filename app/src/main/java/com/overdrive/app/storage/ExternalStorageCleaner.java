@@ -78,6 +78,29 @@ public class ExternalStorageCleaner {
         }
     }
 
+    private static final int PROCESS_WAIT_FAILED = -1;
+    private static final long GETPROP_TIMEOUT_MS = 1_000L;
+    private static final long DELETE_TIMEOUT_MS = 4_000L;
+
+    static int waitForBounded(Process process, long timeoutMs) {
+        try {
+            if (process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                return process.exitValue();
+            }
+            process.destroyForcibly();
+            try {
+                process.waitFor(500L, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return PROCESS_WAIT_FAILED;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            try { process.destroyForcibly(); } catch (Throwable ignored) {}
+            return PROCESS_WAIT_FAILED;
+        }
+    }
+
     // ==================== Constants ====================
     
     // Known BYD CDR (dashcam) recording directories
@@ -293,15 +316,33 @@ public class ExternalStorageCleaner {
             return (String) get.invoke(null, key, "");
         } catch (Exception e) {
             // Fall back to shell
+            Process p = null;
             try {
-                Process p = Runtime.getRuntime().exec(new String[]{"getprop", key});
-                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                String line = reader.readLine();
-                reader.close();
-                p.waitFor();
-                return line != null ? line.trim() : "";
+                p = Runtime.getRuntime().exec(new String[]{"getprop", key});
+                int exitCode = waitForBounded(p, GETPROP_TIMEOUT_MS);
+                if (exitCode != 0) {
+                    if (exitCode == PROCESS_WAIT_FAILED) {
+                        logWarn("getprop " + key + " timed out or was interrupted");
+                    }
+                    return "";
+                }
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(p.getInputStream()))) {
+                    String line = reader.readLine();
+                    return line != null ? line.trim() : "";
+                }
             } catch (Exception e2) {
                 return "";
+            } finally {
+                // destroyForcibly() does not close the child's stdio, and the
+                // non-zero-exit path returns before the reader is opened — so
+                // without this the pipe FDs leak on every 60s discovery retry.
+                if (p != null) {
+                    try { p.getInputStream().close(); } catch (Exception ignored) {}
+                    try { p.getErrorStream().close(); } catch (Exception ignored) {}
+                    try { p.getOutputStream().close(); } catch (Exception ignored) {}
+                    try { p.destroyForcibly(); } catch (Throwable ignored) {}
+                }
             }
         }
     }
@@ -663,20 +704,62 @@ public class ExternalStorageCleaner {
         return false;
     }
     
+    /**
+     * Shell {@code ls} fallback for FUSE-mounted dirs where
+     * {@code File.listFiles()} returns null under the daemon UID.
+     *
+     * <p>Hard-bounded, deliberately. This used to be a bare {@code readLine()}
+     * loop plus an unbounded {@code p.waitFor()} — and it is called from inside
+     * {@link #refreshWalkIfStale()}, which holds the instance monitor and runs
+     * on the HTTP request thread serving /api/storage/external. An `ls` that
+     * hangs mid-write on a sick SD card (a real fault on these head-units)
+     * therefore wedged that request thread AND every concurrent
+     * saveConfig()/cleanup caller behind the monitor, permanently. Mirrors the
+     * bounded drain in StorageManager.listFilesViaShell: read on a daemon
+     * thread with a deadline, destroyForcibly() on timeout, and return whatever
+     * was drained. Under-counting self-corrects on the next walk — and since
+     * callers only ever REPORT these numbers (deletion decisions re-walk), a
+     * short list can't cause a wrong deletion.
+     */
     private File[] listFilesViaShell(File dir) {
+        Process p = null;
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"ls", "-1", dir.getAbsolutePath()});
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            List<File> files = new ArrayList<>();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                files.add(new File(dir, line.trim()));
+            p = Runtime.getRuntime().exec(new String[]{"ls", "-1", dir.getAbsolutePath()});
+            final Process proc = p;
+            final List<File> files = java.util.Collections.synchronizedList(new ArrayList<File>());
+
+            Thread drain = new Thread(() -> {
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(proc.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        String name = line.trim();
+                        if (!name.isEmpty()) files.add(new File(dir, name));
+                    }
+                } catch (Exception ignored) {
+                    // Stream closed by destroyForcibly on timeout, or read error
+                    // — return whatever we have.
+                }
+            }, "cdrListViaShell-drain");
+            drain.setDaemon(true);
+            drain.start();
+            drain.join(4_000);
+            if (drain.isAlive()) {
+                p.destroyForcibly();
+                // Let the kernel close the stream so the drain thread stops
+                // touching `files` before we snapshot it.
+                drain.join(500);
             }
-            reader.close();
-            p.waitFor();
-            return files.toArray(new File[0]);
+
+            synchronized (files) {
+                return files.toArray(new File[0]);
+            }
         } catch (Exception e) {
             return new File[0];
+        } finally {
+            if (p != null) {
+                try { p.destroyForcibly(); } catch (Exception ignored) {}
+            }
         }
     }
 
@@ -848,13 +931,29 @@ public class ExternalStorageCleaner {
         }
         
         // Try shell rm
+        Process p = null;
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"rm", "-f", file.getAbsolutePath()});
-            int exitCode = p.waitFor();
+            p = Runtime.getRuntime().exec(new String[]{"rm", "-f", file.getAbsolutePath()});
+            int exitCode = waitForBounded(p, DELETE_TIMEOUT_MS);
+            if (exitCode == PROCESS_WAIT_FAILED) {
+                logWarn("Shell delete timed out or was interrupted: " + file.getAbsolutePath());
+                // The unlink may still have landed before we killed the process. Ask
+                // the filesystem instead of reporting a false failure — the caller
+                // sums freed bytes from this return, so a wrong `false` makes it
+                // keep deleting while reporting "0 files deleted".
+                return !file.exists();
+            }
             return exitCode == 0 && !file.exists();
         } catch (Exception e) {
             logWarn("Shell delete failed: " + e.getMessage());
             return false;
+        } finally {
+            if (p != null) {
+                try { p.getInputStream().close(); } catch (Exception ignored) {}
+                try { p.getErrorStream().close(); } catch (Exception ignored) {}
+                try { p.getOutputStream().close(); } catch (Exception ignored) {}
+                try { p.destroyForcibly(); } catch (Throwable ignored) {}
+            }
         }
     }
     

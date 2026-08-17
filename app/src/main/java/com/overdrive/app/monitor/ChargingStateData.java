@@ -30,6 +30,14 @@ public class ChargingStateData {
         DISCHARGING, SCHEDULED, TIMEOUT, ERROR,
         IDLE, UNKNOWN
     }
+
+    /** How strongly the resolved power value is supported by its source. */
+    public enum PowerQuality {
+        UNKNOWN,
+        MEASURED,
+        ESTIMATED,
+        UNVERIFIED
+    }
     
     public final int stateCode;          // Raw state code
     public final String stateName;       // Human-readable name
@@ -39,6 +47,26 @@ public class ChargingStateData {
     public double chargingPowerKW;       // Current charging power in KW (negative = discharging)
     public boolean isDischarging;        // true if power < 0
     public boolean isEstimated;          // true if power is computed from SOC rate (not from BYD API)
+    public String powerSource;           // Stable resolver source name, or "none"
+    public long powerObservedAtMs;        // Source observation time; 0 when unavailable
+    public PowerQuality powerQuality;     // Measurement quality for API consumers
+    public double powerConfidence;        // Normalized confidence in [0, 1]
+    /**
+     * True when the BMS reports CHARG_FINISH but the pack is still drawing a real CV-taper
+     * current through a connected gun, so a charging POWER is legitimately available even though
+     * the session state is "finished".
+     *
+     * <p>Deliberately a SEPARATE flag rather than rewriting {@link #stateCode} to CHARGING:
+     * {@code stateName}/{@code status}/{@code isError} are all derived from the code, so
+     * overwriting it destroys the FINISHED signal — which collapses the {@code full} and
+     * {@code plugged} flags in the HTTP/API layer (a fully-charged plugged-in car reported
+     * "Idle") and, worse, makes {@code SocHistoryDatabase}'s session-close test
+     * ({@code !isCharging && wasCharging}) never fire, leaving the session row open and its
+     * peak/avg advancing indefinitely. It is also exactly the state-code inconsistency
+     * {@code ChargingDetector} explicitly refused to create. Consumers that want the power
+     * during a taper opt in by reading this flag; every state consumer keeps seeing the truth.
+     */
+    public boolean isTaperCharging;
     public final long timestamp;
     
     /**
@@ -54,6 +82,10 @@ public class ChargingStateData {
         this.errorType = getErrorType(stateCode);
         this.chargingPowerKW = 0.0;
         this.isDischarging = false;
+        this.powerSource = "none";
+        this.powerObservedAtMs = 0L;
+        this.powerQuality = PowerQuality.UNKNOWN;
+        this.powerConfidence = 0.0;
         this.timestamp = System.currentTimeMillis();
     }
     
@@ -65,6 +97,32 @@ public class ChargingStateData {
     public void updateChargingPower(double powerKW) {
         this.chargingPowerKW = powerKW;
         updateDischargingFlag();
+    }
+
+    /** Update charging power together with the provenance that produced it. */
+    public void updateChargingPower(double powerKW, String source,
+                                    long observedAtMs, PowerQuality quality,
+                                    double confidence) {
+        updateChargingPower(powerKW);
+        this.powerSource = source != null && !source.isEmpty() ? source : "none";
+        this.powerObservedAtMs = Math.max(0L, observedAtMs);
+        updatePowerQuality(quality, confidence);
+    }
+
+    public void updatePowerQuality(PowerQuality quality, double confidence) {
+        this.powerQuality = quality != null ? quality : PowerQuality.UNKNOWN;
+        this.powerConfidence = Math.max(0.0, Math.min(1.0, confidence));
+    }
+
+    /** Clear a value and all provenance when charging is no longer active. */
+    public void clearChargingPower() {
+        chargingPowerKW = 0.0;
+        isDischarging = false;
+        isEstimated = false;
+        powerSource = "none";
+        powerObservedAtMs = 0L;
+        powerQuality = PowerQuality.UNKNOWN;
+        powerConfidence = 0.0;
     }
     
     /**
@@ -183,6 +241,10 @@ public class ChargingStateData {
                 ", errorType='" + errorType + '\'' +
                 ", chargingPowerKW=" + chargingPowerKW +
                 ", isDischarging=" + isDischarging +
+                ", powerSource='" + powerSource + '\'' +
+                ", powerObservedAtMs=" + powerObservedAtMs +
+                ", powerQuality=" + powerQuality +
+                ", powerConfidence=" + powerConfidence +
                 ", timestamp=" + timestamp +
                 '}';
     }
